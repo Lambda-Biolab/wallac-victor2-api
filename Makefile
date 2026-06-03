@@ -1,0 +1,24 @@
+# Quality gates for the maintained agent stack (docs/102).
+# Tools are run via uv so no global installs are required.
+GATED := vm-agent/agent.py vm-agent/lid_watcher.py vm-agent/launch_as_user.py
+
+.PHONY: validate format test complexity setup_dev
+
+validate:  ## lint + format-check + complexity + tests
+	ruff check .
+	ruff format --check .
+	complexipy $(GATED) -mx 15
+	pytest -q
+
+format:  ## auto-fix lint + format
+	ruff check . --fix
+	ruff format .
+
+test:  ## run the unit tests
+	pytest -q
+
+complexity:  ## cognitive complexity gate on the agent stack
+	complexipy $(GATED) -mx 15
+
+setup_dev:  ## install the pre-commit hooks
+	uvx pre-commit install --hook-type pre-commit --hook-type commit-msg

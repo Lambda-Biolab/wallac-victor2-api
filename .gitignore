@@ -1,0 +1,18 @@
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Editor cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Never commit private keys / tokens
+*.pem
+*_key
+*_key.*
+id_ed25519*
+id_rsa*
+agent_token.txt
+*.token

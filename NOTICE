@@ -1,0 +1,9 @@
+wallac-victor2-api
+Copyright 2026 Lambda Biolab
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This software controls, but does not include or redistribute, PerkinElmer /
+Wallac Oy instrument software, firmware, or installation media. "Wallac",
+"Victor2", and "1420" are trademarks of their respective owners and are used
+here only to identify the hardware this software interoperates with.

@@ -1,0 +1,32 @@
+# Tooling config only -- this repo is a Windows-only Python agent (the Wallac
+# 1420 instrument microservice), NOT an installable Python package.
+# Quality gates apply to the maintained agent stack:
+#   vm-agent/{agent,lid_watcher,launch_as_user}.py
+# The COM-introspection diagnostics (vm-agent/probe.py, dump_*.py) are research
+# tools and are excluded. pyright is intentionally not run: the agent is
+# Windows/comtypes-only, so it false-positives on a Linux host/CI.
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"  # the agent runs on Python 3.8 (Windows 7)
+extend-exclude = [
+    "vm-agent/probe.py",
+    "vm-agent/dump_tlb.py",
+    "vm-agent/dump_methods.py",
+    "vm-agent/dump_protocols.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]  # line length handled by the formatter
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.complexipy]
+max_complexity_allowed = 15
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = ["-ra", "--strict-markers"]
