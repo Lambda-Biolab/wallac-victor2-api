@@ -49,20 +49,30 @@ OEM MlrServ / MlrMgr ──► Victor2 / 1420 reader
 
 | Method & path | Purpose |
 |---|---|
-| `GET /health` | liveness + instrument connection state |
+| `POST /measure` | **one call: run a protocol by name, wait, return the OD table** |
+| `GET /docs` | self-describing catalog of every endpoint |
+| `GET /health` | liveness + `ready` flag + instrument connection state |
 | `GET /status` | latest cached instrument snapshot (from the monitor) |
 | `GET /monitor` | **SSE** real-time state stream (~1 Hz) |
 | `GET /instrument` | model, serial, technologies, temperature |
-| `GET /protocols` | assay protocols from the instrument DB (`?refresh=1` to reload) |
-| `POST /runs` | start an assay (`{"protocol_id": …}`; `"dry_run": true` to validate) |
+| `GET /protocols` | assay protocols (`?q=` to search, `?refresh=1` to reload) |
+| `GET /protocols/{name\|id}` | resolve one protocol by **name** or id |
+| `POST /runs` | start an assay (`{"protocol": "<name\|id>"}`; `"dry_run": true`) |
 | `GET /runs` / `GET /runs/{id}` | run list / single run state |
-| `GET /runs/{id}/results` | live per-well counts for the active run |
-| `GET /runs/{id}/export` | live results as CSV |
+| `GET /runs/{id}/results` | results — **live while running, persisted once measured** |
+| `GET /runs/{id}/export` | results as CSV (`?shape=grid`, `?value=od\|raw`) |
 | `POST /runs/{id}/abort` | cancel a run (guarded: only ≥60 s in) |
+| `DELETE /runs/{id}` | drop a finished/failed/stuck run record (`?force=1`) |
 | `GET /jobs` / `GET /jobs/{id}` | completed assays |
-| `GET /jobs/{id}/results` | per-well results (JSON, incl. computed OD) |
+| `GET /jobs/{id}/results` | per-well results (JSON, deduped; `?dedup=0` for raw rows) |
 | `GET /jobs/{id}/export` | CSV — `?format=long\|grid`, `?value=raw\|od` |
 | `POST /admin/reconnect` | re-establish the COM link |
+
+The friendly entrypoint is **`POST /measure`**: give it a protocol **name**, it
+resolves the id, starts the run, waits for the plate read, and returns the
+deduped per-well OD table (optionally an 8×12 grid). Errors are actionable —
+e.g. `409 instrument_not_ready` with a `hint` telling you to close the lid —
+rather than raw COM tracebacks.
 
 **Auth:** optional `Authorization: Bearer <token>`. The token is read at
 startup from a file on the VM (`TOKEN_FILE` in `agent.py`); if that file is
@@ -101,16 +111,21 @@ H='Authorization: Bearer <token>'
 VM=192.168.122.203:8420        # your Windows 7 guest on the libvirt NAT
 
 curl -H "$H" "http://$VM/health"
-curl -H "$H" "http://$VM/protocols"
+curl -H "$H" "http://$VM/protocols?q=absorb"          # search protocols by name
 
-# start an assay, then poll it:
+# the easy path — run a protocol by NAME, wait, get the OD table back:
 curl -H "$H" -H 'Content-Type: application/json' \
-     -d '{"protocol_id":1000003}' "http://$VM/runs"
+     -d '{"protocol":"Absorbance @ 600"}' "http://$VM/measure"
+
+# ...or drive it yourself: start without waiting, poll, then fetch results:
+curl -H "$H" -H 'Content-Type: application/json' \
+     -d '{"protocol":"Absorbance @ 600","wait":false}' "http://$VM/measure"
 curl -H "$H" "http://$VM/runs/<run_id>"
+curl -H "$H" "http://$VM/runs/<run_id>/results?shape=grid&value=od"
 
 curl -N -H "$H" "http://$VM/monitor"     # live state (SSE)
 
-# results as an 8x12 grid of computed absorbance:
+# any past run's results as an 8x12 grid of computed absorbance:
 curl -H "$H" "http://$VM/jobs/<id>/export?format=grid&value=od"
 ```
 
