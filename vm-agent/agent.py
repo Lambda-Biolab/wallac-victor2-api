@@ -1,7 +1,9 @@
-"""Wallac 1420 instrument microservice -- Phase A (read-only).
+"""Wallac 1420 instrument microservice.
 
-Exposes the OEM MlrServ COM automation server as a REST/JSON API over the
-libvirt NAT (doc 93/95). Read-only: /health, /instrument, /protocols.
+Exposes the OEM MlrServ COM automation server as a friendly REST/JSON API over
+the libvirt NAT (doc 93/95). Highlights: POST /measure runs a protocol by name
+and returns the deduped OD table; GET /docs lists every route. See also
+/health, /instrument, /protocols, /runs, /jobs.
 
 Lifecycle (doc 95): this agent MUST run as the interactive user 'lambda',
 launched via launch_as_user.py, AND the OEM GUI (MlrMgr) must already be
@@ -28,6 +30,7 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote
 
 PROGID = "Wallac1420.Server"
 RUNDEF_PROGID = "Wallac1420.Server.AssayRunDefinition"
@@ -44,7 +47,9 @@ TOKEN_FILE = r"C:\Users\Public\agent_token.txt"  # readable by lambda token
 CALL_TIMEOUT = 20.0
 
 # Protocols are not in the COM API -- read from the Jet DB (doc 95).
-MDB_SRC = r"C:\Program Files\Wallac1420\Data\Mlr3.mdb"
+MDB_SRC = (
+    r"C:\Users\lambda\AppData\Local\VirtualStore\Program Files\Wallac\Wallac1420\Data\Mlr3.mdb"
+)
 MDB_COPY = r"C:\Users\Public\mlr3_agent_copy.mdb"
 _PROT_SQL = (
     "SELECT p.AssayProtID, p.ProtName, p.ProtNumber, p.ProtVersion, "
@@ -81,6 +86,98 @@ _DISCONNECT_HR = {
     -2147023174,  # 0x800706BA RPC server unavailable
     -2146959355,  # 0x80080005 CO_E_SERVER_EXEC_FAILURE
 }
+
+
+class ApiError(Exception):
+    """An error with an HTTP status, a machine-readable code, and a human hint.
+
+    Handlers raise this; the dispatcher turns it into a uniform JSON body
+    ``{"error": code, "hint": ..., "detail": ...}``.
+    """
+
+    def __init__(self, status, code, hint, detail=None, extra=None):
+        super().__init__(code)
+        self.status = status
+        self.code = code
+        self.hint = hint
+        self.detail = detail
+        self.extra = extra or {}
+
+    def payload(self):
+        out = {"error": self.code, "hint": self.hint}
+        if self.detail:
+            out["detail"] = self.detail
+        out.update(self.extra)
+        return out
+
+
+def _classify_exc(exc):
+    """Translate a raw worker/COM exception into a friendly ``ApiError``.
+
+    The OEM stack signals "not ready to measure" by returning a null assay
+    object, which surfaces downstream as an AttributeError on ``None`` -- the
+    opaque traceback users were seeing. We turn the common cases into an
+    actionable hint and keep the raw text under ``detail``.
+    """
+    if isinstance(exc, ApiError):
+        return exc
+    if isinstance(exc, TimeoutError):
+        return ApiError(
+            504,
+            "com_timeout",
+            "the instrument did not respond in time; check MlrMgr is running, "
+            "then POST /admin/reconnect and retry",
+        )
+    msg = f"{type(exc).__name__}: {exc}"
+    low = msg.lower()
+    if "nonetype" in low and ("getjobid" in low or "getassayid" in low or "newassay" in low):
+        return ApiError(
+            409,
+            "instrument_not_ready",
+            "the reader refused to start the measurement -- close the lid, load "
+            "a plate, clear any error shown in MlrMgr, then retry",
+            detail=msg,
+        )
+    if "not connected" in low:
+        return ApiError(
+            503,
+            "instrument_not_connected",
+            "MlrMgr is not connected to the reader; start the OEM GUI and wait "
+            "for it to connect, then retry",
+            detail=msg,
+        )
+    if "already running" in low:
+        return ApiError(
+            409,
+            "instrument_busy",
+            "the reader is already running a measurement; wait for it to finish",
+            detail=msg,
+        )
+    hr = getattr(exc, "hresult", None)
+    if hr is None:
+        hr = getattr(exc, "winerror", None)
+    if hr in _DISCONNECT_HR:
+        return ApiError(
+            503,
+            "instrument_link_lost",
+            "the COM link to the reader dropped; POST /admin/reconnect, then retry",
+            detail=msg,
+        )
+    if hr is None:
+        # Not a COM error at all (e.g. a bug or a bad-request value) -- don't
+        # mislabel it as a 503 instrument fault.
+        return ApiError(
+            500,
+            "internal_error",
+            "unexpected server error -- see detail/trace",
+            detail=msg,
+        )
+    return ApiError(
+        503,
+        "com_error",
+        "unexpected instrument/COM error -- see detail (and the agent stderr log)",
+        detail=msg,
+    )
 
 
 class ComWorker(threading.Thread):
@@ -221,6 +318,7 @@ def op_health(srv):
         "state_code": int(st.GetStateCode),
         "is_running": bool(st.IsRunning),
         "is_error": bool(st.IsError),
+        "is_idle": bool(st.IsIdle),
     }
 
 
@@ -294,6 +392,49 @@ def op_protocols(refresh):
     return _op
 
 
+def _resolve_protocol(spec, worker):
+    """Resolve a protocol given as numeric id OR name (case-insensitive: exact
+    match, then unique substring). Returns the full protocol record
+    (``{id, name, group, factory_preset, ...}``).
+
+    Raises ``ApiError`` (404 not found / 409 ambiguous) with candidates, so the
+    caller never has to memorize the magic integer ids.
+    """
+    protos = worker.call(op_protocols(False), timeout=40)
+    s = str(spec).strip()
+    if s.isdigit():
+        pid = int(s)
+        for p in protos:
+            if p["id"] == pid:
+                return p
+        raise ApiError(
+            404,
+            "protocol_not_found",
+            "no protocol has that id; GET /protocols to list them",
+            extra={"requested": spec},
+        )
+    low = s.lower()
+    exact = [p for p in protos if p["name"].lower() == low]
+    if len(exact) == 1:
+        return exact[0]
+    cands = exact if len(exact) > 1 else [p for p in protos if low in p["name"].lower()]
+    if len(cands) == 1:
+        return cands[0]
+    if cands:
+        raise ApiError(
+            409,
+            "protocol_ambiguous",
+            "that name matches several protocols; use a more specific name or the numeric id",
+            extra={"candidates": [{"id": p["id"], "name": p["name"]} for p in cands[:12]]},
+        )
+    raise ApiError(
+        404,
+        "protocol_not_found",
+        "no protocol matches that name; GET /protocols?q=... to search",
+        extra={"requested": spec},
+    )
+
+
 # --------------------------------------------------------------------------
 # Run management (Phase B). IAssay COM objects live ONLY on the worker
 # thread (_assays); HTTP-visible metadata lives in _runs (guarded by lock).
@@ -318,8 +459,13 @@ def op_start_run(run_id, protocol_id, dry_run):
     def _op(srv):
         import comtypes.client
 
-        if not bool(srv.GetState.IsConnected):
+        st = srv.GetState
+        if not bool(st.IsConnected):
             raise RuntimeError("instrument not connected")
+        # Defense-in-depth: refuse to start if the reader is physically already
+        # measuring, even if the agent's _runs map was cleared (e.g. force-delete).
+        if not dry_run and bool(st.IsRunning):
+            raise RuntimeError("instrument is already running a measurement")
         try:
             from comtypes.gen import MlrServ as _M
 
@@ -363,6 +509,12 @@ def op_run_state(run_id):
             if r and r["state"] == "running" and measured:
                 r["state"] = "measured"
                 r["ended_at"] = now_iso()
+                # The OEM app assigns the real AssayID once it saves the row;
+                # capture it so results resolve to the right persisted job.
+                with contextlib.suppress(Exception):
+                    aid = int(assay.GetAssayID)
+                    if aid:
+                        r["assay_id"] = aid
         return info
 
     return _op
@@ -625,11 +777,163 @@ def _grid_csv(wells, value):
     return "\n".join(lines) + "\n"
 
 
+def _normalize_well(w):
+    """Collapse a live OR persisted well row to a uniform {well, od, counts}.
+
+    Live rows carry ``counts`` (and no od); persisted rows carry ``meas_a``
+    (raw A/D) plus a computed ``od``.
+    """
+    counts = w.get("counts")
+    if counts is None:
+        counts = w.get("meas_a")
+    return {"well": w.get("well"), "od": w.get("od"), "counts": counts}
+
+
+def _dedup_wells(wells):
+    """One row per well address (OEM stores two ResultType rows per well).
+    Prefer the row that carries a non-null od; preserve first-seen order."""
+    best = {}
+    order = []
+    for w in wells:
+        nw = _normalize_well(w)
+        addr = nw["well"]
+        if addr is None:
+            continue
+        if addr not in best:
+            best[addr] = nw
+            order.append(addr)
+        elif best[addr].get("od") is None and nw.get("od") is not None:
+            best[addr] = nw
+    return [best[a] for a in order]
+
+
+def _grid_dict(wells, value):
+    """Flat {well_address: value} map for shape=grid (value 'od' or 'raw')."""
+    key = "od" if value == "od" else "counts"
+    out = {}
+    for w in wells:
+        a = w.get("well")
+        if a and a not in out:
+            out[a] = w.get(key)
+    return out
+
+
+def _norm_grid_csv(wells, value):
+    """8x12 plate-grid CSV from normalized {well,od,counts} rows."""
+    key = "od" if value == "od" else "counts"
+    cell = {}
+    for w in wells:
+        a = w.get("well") or ""
+        if len(a) >= 2 and a[0].isalpha():
+            try:
+                col = int(a[1:])
+            except ValueError:
+                continue
+            cell[(a[0].upper(), col)] = w.get(key)
+    rows = ["row," + ",".join(str(c) for c in range(1, 13))]
+    for row in "ABCDEFGH":
+        rows.append(
+            row
+            + ","
+            + ",".join(
+                "" if cell.get((row, c)) is None else str(cell.get((row, c))) for c in range(1, 13)
+            )
+        )
+    return "\n".join(rows) + "\n"
+
+
+def _format_results(wells_raw, source, shape="list", value="od", dedup=True):
+    """Shape a raw well list into the API response: deduped {well,od,counts}
+    plus an optional flat grid map."""
+    wells = _dedup_wells(wells_raw) if dedup else [_normalize_well(w) for w in wells_raw]
+    out = {"source": source, "well_count": len(wells), "wells": wells}
+    if shape == "grid":
+        out["grid"] = _grid_dict(wells, value)
+    return out
+
+
+def _latest_assay_for(protocol_id, worker):
+    """Persisted AssayID of the newest saved run of this protocol.
+
+    The in-memory IAssay reports id 0 until the OEM app writes the row, so to
+    fetch a just-finished run's results we look up the highest saved AssayID
+    for the same protocol.
+    """
+    jobs = worker.call(op_jobs, timeout=40)
+    mine = [
+        j
+        for j in jobs
+        if j.get("protocol_id") == int(protocol_id) and j.get("assay_id") is not None
+    ]
+    return max((j["assay_id"] for j in mine), default=None)
+
+
 # --------------------------------------------------------------------------
 # HTTP layer.
 # --------------------------------------------------------------------------
+_DOCS = {
+    "service": "Wallac 1420 agent",
+    "version": "0.2",
+    "auth": "Authorization: Bearer <token>  (token file: C:\\Users\\Public\\agent_token.txt)",
+    "quickstart": 'POST /measure {"protocol":"Absorbance @ 600"} -> waits, returns the OD table',
+    "well_object": {"well": "A01", "od": 0.07, "counts": 360671},
+    "endpoints": [
+        {"method": "GET", "path": "/health", "desc": "liveness + 'ready' flag"},
+        {
+            "method": "GET",
+            "path": "/instrument",
+            "desc": "serial, model, technologies, temperature",
+        },
+        {"method": "GET", "path": "/status", "desc": "latest monitor snapshot"},
+        {"method": "GET", "path": "/monitor", "desc": "SSE stream of state (~1 Hz)"},
+        {"method": "GET", "path": "/protocols?q=<text>", "desc": "list/search protocols"},
+        {"method": "GET", "path": "/protocols/<name|id>", "desc": "resolve one protocol"},
+        {
+            "method": "POST",
+            "path": "/measure",
+            "desc": "run a protocol by name and (by default) wait for the OD table",
+            "body": {
+                "protocol": "<name|id>",
+                "wait": True,
+                "timeout": 600,
+                "shape": "list|grid",
+                "value": "od|raw",
+                "dry_run": False,
+            },
+        },
+        {
+            "method": "POST",
+            "path": "/runs",
+            "desc": "start a run (no wait)",
+            "body": {"protocol": "<name|id>", "dry_run": False},
+        },
+        {"method": "GET", "path": "/runs", "desc": "list run records"},
+        {
+            "method": "GET",
+            "path": "/runs/<id>",
+            "desc": "status; state in starting|running|measured|aborted|failed",
+        },
+        {
+            "method": "GET",
+            "path": "/runs/<id>/results?shape=&value=&dedup=",
+            "desc": "results (live while running, persisted once measured)",
+        },
+        {"method": "GET", "path": "/runs/<id>/export?...", "desc": "results as CSV"},
+        {"method": "POST", "path": "/runs/<id>/abort", "desc": "abort (only >=60s into a run)"},
+        {
+            "method": "DELETE",
+            "path": "/runs/<id>?force=",
+            "desc": "forget a finished/failed/stuck run record",
+        },
+        {"method": "GET", "path": "/jobs", "desc": "saved measurement history"},
+        {"method": "GET", "path": "/jobs/<assay_id>/results", "desc": "persisted per-well results"},
+        {"method": "POST", "path": "/admin/reconnect", "desc": "drop + recreate the COM link"},
+    ],
+}
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "WallacAgent/0.1"
+    server_version = "WallacAgent/0.2"
 
     def _send(self, code, payload):
         body = json.dumps(payload).encode("utf-8")
@@ -663,7 +967,12 @@ class Handler(BaseHTTPRequestHandler):
         if "?" not in self.path:
             return {}
         qs = self.path.split("?", 1)[1]
-        return dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+        out = {}
+        for p in qs.split("&"):
+            if "=" in p:
+                k, v = p.split("=", 1)
+                out[unquote(k)] = unquote(v)
+        return out
 
     def _run_view(self, run_id, refresh=True):
         with _runs_lock:
@@ -675,7 +984,11 @@ class Handler(BaseHTTPRequestHandler):
             if live:
                 meta["live"] = live
                 with _runs_lock:
-                    meta["state"] = _runs[run_id]["state"]
+                    current = _runs.get(run_id)
+                    if current:  # may have been DELETEd concurrently
+                        meta["state"] = current["state"]
+                        meta["assay_id"] = current.get("assay_id")
+        meta["protocol"] = {"id": meta.get("protocol_id"), "name": meta.get("protocol_name")}
         return meta
 
     def log_message(self, fmt, *args):  # quieter logging
@@ -703,19 +1016,19 @@ class Handler(BaseHTTPRequestHandler):
             pass  # client disconnected
 
     def _com_error(self, exc):
-        self._send(
-            503,
-            {
-                "error": "com_error",
-                "detail": f"{type(exc).__name__}: {exc}",
-                "trace": traceback.format_exc(),
-            },
-        )
+        err = _classify_exc(exc)
+        body = err.payload()
+        if not isinstance(exc, ApiError):
+            body["trace"] = traceback.format_exc()
+        self._send(err.status, body)
 
     def _get_simple(self, path):
         w = self.server.worker
         if path == "/health":
             data = w.call(op_health)
+            data["ready"] = bool(
+                data["instrument_connected"] and not data["is_error"] and data.get("is_idle")
+            )
             data["ok"] = data["instrument_connected"]
             data["ts"] = now_iso()
             self._send(200 if data["ok"] else 503, data)
@@ -729,6 +1042,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, w.call(op_instrument))
         else:  # /protocols
             protos = w.call(op_protocols("refresh=1" in self.path), timeout=40)
+            q = self._query().get("q")
+            if q:
+                ql = unquote(q).lower()
+                protos = [p for p in protos if ql in p["name"].lower()]
             self._send(200, {"count": len(protos), "protocols": protos})
 
     def _job_csv(self, wells):
@@ -765,16 +1082,29 @@ class Handler(BaseHTTPRequestHandler):
                 match[0] if match else {"error": "no such job", "job": parts[1]},
             )
         elif len(parts) == 3 and parts[2] in ("results", "export"):
-            wells = w.call(op_job_results(parts[1]), timeout=40)
-            if parts[2] == "export":
-                self._send_csv(200, self._job_csv(wells))
-            else:
-                self._send(200, {"assay_id": parts[1], "count": len(wells), "wells": wells})
+            q = self._query()
+            shape = "grid" if q.get("format") == "grid" else q.get("shape", "list")
+            value = q.get("value", "od")
+            dedup = q.get("dedup", "1") != "0"
+            export = parts[2] == "export"
+            wells_raw = w.call(op_job_results(parts[1]), timeout=40)
+            if not dedup:  # full raw rows (all ResultType rows + meas fields)
+                if export:
+                    self._send_csv(200, self._job_csv(wells_raw))
+                else:
+                    self._send(
+                        200, {"assay_id": parts[1], "count": len(wells_raw), "wells": wells_raw}
+                    )
+                return
+            out = _format_results(wells_raw, "persisted", shape=shape, value=value, dedup=True)
+            out["assay_id"] = parts[1]
+            self._send_results(out, export, shape, value)
         else:
-            self._send(404, {"error": "not found", "path": "/" + "/".join(parts)})
+            self._send(
+                404, {"error": "not_found", "hint": "see GET /docs", "path": "/" + "/".join(parts)}
+            )
 
     def _get_runs(self, parts):
-        w = self.server.worker
         if parts == ["runs"]:
             with _runs_lock:
                 runs = list(_runs.values())
@@ -786,17 +1116,66 @@ class Handler(BaseHTTPRequestHandler):
                 view or {"error": "no such run", "run": parts[1]},
             )
         elif len(parts) == 3 and parts[2] in ("results", "export"):
-            res = w.call(op_results, timeout=40)
-            if parts[2] == "export":
-                rows = ["well,counts,result_type,plate,plate_repeat"]
-                for x in res.get("wells", []):
-                    rows.append("{well},{counts},{result_type},{plate},{plate_repeat}".format(**x))
-                self._send_csv(200, "\n".join(rows) + "\n")
-            else:
-                res["run"] = parts[1]
-                self._send(200, res)
+            self._run_results(parts[1], export=(parts[2] == "export"))
         else:
             self._send(404, {"error": "not found", "path": "/" + "/".join(parts)})
+
+    def _persisted_wells(self, protocol_id, assay_id):
+        """(wells, source) from the persisted DB by assay id, falling back to
+        the newest saved run of the protocol; or the live buffer if none."""
+        w = self.server.worker
+        aid = assay_id or (_latest_assay_for(protocol_id, w) or 0)
+        if aid:
+            return w.call(op_job_results(aid), timeout=40), "persisted"
+        return w.call(op_results, timeout=40).get("wells", []), "live"
+
+    def _run_wells(self, run_id, meta):
+        """Resolve (wells_raw, source) for a run: persisted DB rows once
+        measured/aborted, else the live buffer (re-resolving if it just
+        transitioned and the live buffer is already cleared)."""
+        w = self.server.worker
+        if meta.get("state") in ("measured", "aborted"):
+            return self._persisted_wells(meta["protocol_id"], meta.get("assay_id") or 0)
+        wells = w.call(op_results, timeout=40).get("wells", [])
+        if wells:
+            return wells, "live"
+        with _runs_lock:  # may have flipped to measured since the snapshot
+            cur = _runs.get(run_id) or {}
+            st2, aid2 = cur.get("state"), (cur.get("assay_id") or 0)
+        if st2 in ("measured", "aborted"):
+            return self._persisted_wells(meta["protocol_id"], aid2)
+        return wells, "live"
+
+    def _run_results(self, run_id, export=False):
+        """Results for a run. Streams the live buffer while running; once the
+        run is measured/aborted, serves the authoritative persisted DB rows.
+        Query: shape=list|grid, value=od|raw, dedup=1|0, format=grid (alias)."""
+        q = self._query()
+        shape = "grid" if q.get("format") == "grid" else q.get("shape", "list")
+        value = q.get("value", "od")
+        dedup = q.get("dedup", "1") != "0"
+        with _runs_lock:
+            meta = dict(_runs.get(run_id, {}))
+        if not meta:
+            raise ApiError(404, "run_not_found", "no run with that id; GET /runs to list")
+        wells_raw, source = self._run_wells(run_id, meta)
+        out = _format_results(wells_raw, source, shape=shape, value=value, dedup=dedup)
+        out["run_id"] = run_id
+        self._send_results(out, export, shape, value)
+
+    def _send_results(self, out, export, shape, value):
+        """Emit a formatted results dict as JSON, or CSV (flat or 8x12 grid)."""
+        if not export:
+            self._send(200, out)
+        elif shape == "grid":
+            self._send_csv(200, _norm_grid_csv(out["wells"], value))
+        else:
+            rows = ["well,od,counts"]
+            for wl in out["wells"]:
+                od = "" if wl.get("od") is None else wl["od"]
+                ct = "" if wl.get("counts") is None else wl["counts"]
+                rows.append("{},{},{}".format(wl.get("well"), od, ct))
+            self._send_csv(200, "\n".join(rows) + "\n")
 
     def do_GET(self):
         if not self._authorized():
@@ -805,45 +1184,151 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         parts = path.strip("/").split("/")
         try:
-            if path in ("/health", "/status", "/monitor", "/instrument", "/protocols"):
+            if path in ("/", "/docs"):
+                self._send(200, _DOCS)
+            elif path in ("/health", "/status", "/monitor", "/instrument", "/protocols"):
                 self._get_simple(path)
+            elif parts[0] == "protocols" and len(parts) == 2:
+                self._send(200, _resolve_protocol(unquote(parts[1]), self.server.worker))
             elif parts[0] == "jobs":
                 self._get_jobs(parts)
             elif parts[0] == "runs":
                 self._get_runs(parts)
             else:
-                self._send(404, {"error": "not found", "path": path})
+                self._send(404, {"error": "not_found", "hint": "see GET /docs", "path": path})
         except Exception as exc:  # noqa: BLE001
             self._com_error(exc)
 
-    def _post_run(self):
-        body = self._read_json()
-        pid = body.get("protocol_id")
-        if pid is None:
-            self._send(400, {"error": "protocol_id required"})
-            return
-        dry = bool(body.get("dry_run", False))
-        if not dry:
-            active = _active_run_id()
-            if active:
-                self._send(409, {"error": "instrument busy", "active_run": active})
-                return
+    def _begin_run(self, proto_spec, dry=False, plate_id=None):
+        """Resolve the protocol (name or id), start the run, return
+        (proto, run_id, res). On a non-dry start failure the run is marked
+        'failed' (not left as 'starting') so it never blocks future runs.
+        Raises ApiError on any problem."""
+        w = self.server.worker
+        proto = _resolve_protocol(proto_spec, w)
         run_id = "r-" + uuid.uuid4().hex[:12]
         if not dry:
+            # Atomically re-check "busy" and reserve the slot under one lock so
+            # two concurrent /measure calls cannot both pass the guard (TOCTOU).
             with _runs_lock:
+                for rid, r in _runs.items():
+                    if r["state"] in ("starting", "running"):
+                        raise ApiError(
+                            409,
+                            "instrument_busy",
+                            "a run is already in progress; wait for it, or abort/DELETE it first",
+                            extra={"active_run": rid},
+                        )
                 _runs[run_id] = {
                     "run_id": run_id,
-                    "protocol_id": int(pid),
-                    "plate_id": body.get("plate_id"),
+                    "protocol_id": proto["id"],
+                    "protocol_name": proto["name"],
+                    "plate_id": plate_id,
+                    "assay_id": None,
                     "state": "starting",
                     "started_at": now_iso(),
                     "ended_at": None,
                 }
-        res = self.server.worker.call(op_start_run(run_id, pid, dry), timeout=60)
+        try:
+            res = w.call(op_start_run(run_id, proto["id"], dry), timeout=60)
+        except Exception as exc:  # noqa: BLE001
+            if not dry:
+                with _runs_lock:
+                    if run_id in _runs:
+                        _runs[run_id]["state"] = "failed"
+                        _runs[run_id]["ended_at"] = now_iso()
+            raise _classify_exc(exc) from exc
+        return proto, run_id, res
+
+    def _post_run(self):
+        body = self._read_json()
+        proto_spec = body.get("protocol", body.get("protocol_id"))
+        if proto_spec is None:
+            raise ApiError(
+                400, "protocol_required", "provide 'protocol' (name or id) in the JSON body"
+            )
+        dry = bool(body.get("dry_run", False))
+        proto, run_id, res = self._begin_run(proto_spec, dry, body.get("plate_id"))
         if dry:
-            self._send(200, res)
+            self._send(200, dict(res, protocol=proto))
         else:
-            self._send(202, {"run_id": run_id, "state": "running", **res})
+            self._send(202, dict(res, run_id=run_id, state="running", protocol=proto))
+
+    def _await_measured(self, run_id, timeout):
+        """Block until the run reports measured; raise measure_timeout if not."""
+        w = self.server.worker
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            live = w.call(op_run_state(run_id), timeout=CALL_TIMEOUT)
+            if live and live.get("is_measured"):
+                return
+            time.sleep(2.0)
+        raise ApiError(
+            504,
+            "measure_timeout",
+            "the run did not finish within the timeout; poll GET /runs/" + run_id + " for status",
+            extra={"run_id": run_id},
+        )
+
+    def _resolve_run_assay(self, run_id, protocol_id):
+        """This run's authoritative AssayID. The OEM updates the in-memory
+        assay's GetAssayID shortly after IsMeasured, so poll for it before
+        falling back to 'latest for protocol' (which could be a PRIOR run)."""
+        w = self.server.worker
+        for _ in range(8):
+            with _runs_lock:
+                aid = (_runs.get(run_id) or {}).get("assay_id") or 0
+            if aid:
+                return aid
+            w.call(op_run_state(run_id), timeout=CALL_TIMEOUT)  # nudge GetAssayID
+            time.sleep(1.0)
+        return _latest_assay_for(protocol_id, w) or 0
+
+    def _await_persisted_wells(self, aid):
+        """Retry the persisted read until the OEM flushes the result rows
+        (IsMeasured can flip a beat before the Jet DB write completes)."""
+        if not aid:
+            return []
+        w = self.server.worker
+        for _ in range(8):
+            wells = w.call(op_job_results(aid), timeout=40)
+            if wells:
+                return wells
+            time.sleep(2.0)
+        return []
+
+    def _post_measure(self):
+        """One-shot: resolve protocol by name, start, (optionally) wait for the
+        measurement to finish, and return the deduped, persisted OD table."""
+        body = self._read_json()
+        proto_spec = body.get("protocol", body.get("protocol_id"))
+        if proto_spec is None:
+            raise ApiError(
+                400, "protocol_required", "provide 'protocol' (name or id) in the JSON body"
+            )
+        dry = bool(body.get("dry_run", False))
+        wait = bool(body.get("wait", True))
+        timeout = float(body.get("timeout", 600))
+        shape = body.get("shape", "list")
+        value = body.get("value", "od")
+        proto, run_id, res = self._begin_run(proto_spec, dry, body.get("plate_id"))
+        if dry:
+            self._send(200, dict(res, protocol=proto))
+            return
+        if not wait:
+            self._send(202, dict(res, run_id=run_id, state="running", protocol=proto))
+            return
+        self._await_measured(run_id, timeout)
+        aid = self._resolve_run_assay(run_id, proto["id"])
+        wells_raw = self._await_persisted_wells(aid)
+        out = _format_results(wells_raw, "persisted", shape=shape, value=value, dedup=True)
+        out.update(run_id=run_id, assay_id=(aid or None), protocol=proto, state="measured")
+        if not wells_raw:
+            out["note"] = (
+                "measurement finished but results not flushed yet; "
+                "GET /runs/" + run_id + "/results in a moment"
+            )
+        self._send(200, out)
 
     def _post_abort(self, run_id):
         with _runs_lock:
@@ -871,21 +1356,59 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not self._authorized():
-            self._send(401, {"error": "unauthorized"})
+            self._send(
+                401, {"error": "unauthorized", "hint": "send 'Authorization: Bearer <token>'"}
+            )
             return
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         parts = path.strip("/").split("/")
         try:
-            if parts == ["runs"]:
+            if path == "/measure":
+                self._post_measure()
+            elif parts == ["runs"]:
                 self._post_run()
             elif len(parts) == 3 and parts[0] == "runs" and parts[2] == "abort":
                 self._post_abort(parts[1])
             elif path == "/admin/reconnect":
                 self._send(200, self.server.worker.reconnect())
             else:
-                self._send(404, {"error": "not found", "path": path})
+                self._send(404, {"error": "not_found", "hint": "see GET /docs", "path": path})
         except Exception as exc:  # noqa: BLE001
             self._com_error(exc)
+
+    def do_DELETE(self):
+        if not self._authorized():
+            self._send(
+                401, {"error": "unauthorized", "hint": "send 'Authorization: Bearer <token>'"}
+            )
+            return
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        parts = path.strip("/").split("/")
+        try:
+            if len(parts) == 2 and parts[0] == "runs":
+                self._delete_run(parts[1])
+            else:
+                self._send(404, {"error": "not_found", "hint": "see GET /docs", "path": path})
+        except Exception as exc:  # noqa: BLE001
+            self._com_error(exc)
+
+    def _delete_run(self, run_id):
+        """Forget a finished/failed/stuck run record (frees the 'busy' guard).
+        Refuses a still-running run unless ?force=1."""
+        force = self._query().get("force", "0") not in ("0", "", "false")
+        with _runs_lock:
+            meta = _runs.get(run_id)
+            if not meta:
+                raise ApiError(404, "run_not_found", "no run with that id")
+            if meta.get("state") in ("starting", "running") and not force:
+                raise ApiError(
+                    409,
+                    "run_active",
+                    "run is active; abort it first, or pass ?force=1 to drop the record anyway",
+                )
+            _runs.pop(run_id, None)
+            _assays.pop(run_id, None)
+        self._send(200, {"deleted": run_id})
 
 
 def main():
