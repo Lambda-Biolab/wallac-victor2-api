@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallac Victor2 — Live Monitor</title>
+<style>
+:root {
+  --bg: #0f1419; --panel: #1a2332; --border: #2a3f5f;
+  --text: #e0e6ed; --muted: #7a8a9a; --accent: #17a2b8;
+  --green: #28a745; --yellow: #ffc107; --red: #dc3545; --blue: #007bff;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, system-ui, sans-serif; font-size: 14px; }
+.container { max-width: 1400px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 1.4rem; margin-bottom: 12px; }
+h2 { font-size: 1.1rem; color: var(--accent); margin-bottom: 8px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.grid-full { grid-column: 1 / -1; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+.banner { display: flex; align-items: center; gap: 24px; padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; }
+.banner.running { background: #1a3a2a; }
+.banner.completed { background: #1a2a3a; }
+.banner.failed, .banner.aborted { background: #3a1a1a; }
+.banner.unknown_requires_operator_review { background: #3a2a1a; }
+.banner.terminal { opacity: 0.85; }
+.state-badge { font-size: 1.2rem; font-weight: bold; text-transform: uppercase; padding: 4px 12px; border-radius: 4px; }
+.state-badge.running { background: var(--blue); }
+.state-badge.completed { background: var(--green); }
+.state-badge.failed, .banner.aborted .state-badge { background: var(--red); }
+.state-badge.aborted { background: var(--red); }
+.state-badge.unknown_requires_operator_review { background: var(--yellow); color: #000; }
+.progress-bar { flex: 1; height: 20px; background: var(--bg); border-radius: 10px; overflow: hidden; }
+.progress-fill { height: 100%; background: var(--accent); transition: width 0.3s; }
+table { width: 100%; border-collapse: collapse; }
+td, th { padding: 4px 8px; text-align: left; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); font-weight: normal; font-size: 0.85rem; text-transform: uppercase; }
+.plate { display: grid; grid-template-columns: 30px repeat(12, 1fr); gap: 2px; }
+.plate-label { color: var(--muted); text-align: center; font-size: 0.75rem; padding: 4px 0; }
+.well { aspect-ratio: 1; border-radius: 3px; background: var(--bg); display: flex; align-items: center; justify-content: center; font-size: 0.65rem; color: var(--muted); cursor: default; }
+.well.has-value { background: var(--accent); color: #fff; }
+.event-log { max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 0.8rem; }
+.event-log div { padding: 2px 0; border-bottom: 1px solid var(--border); }
+.btn { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9rem; }
+.btn-abort { background: var(--red); color: #fff; }
+.btn-abort:hover { background: #c82333; }
+.btn-abort:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-refresh { background: var(--blue); color: #fff; }
+.btn-refresh:hover { background: #0056b3; }
+.status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+.status-dot.pending { background: var(--yellow); }
+.status-dot.succeeded { background: var(--green); }
+.status-dot.failed { background: var(--red); }
+.conn-status { font-size: 0.8rem; color: var(--muted); }
+.conn-status.connected { color: var(--green); }
+.conn-status.disconnected { color: var(--red); }
+.checklist-item { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+.check-icon { width: 16px; text-align: center; }
+.check-passed { color: var(--green); }
+.check-failed { color: var(--red); }
+.check-pending { color: var(--yellow); }
+.artifact-link { color: var(--accent); text-decoration: none; }
+.artifact-link:hover { text-decoration: underline; }
+.muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Wallac Victor2 — Live Monitor</h1>
+
+  <!-- Connection status -->
+  <div id="conn-status" class="conn-status disconnected">
+    <span class="status-dot failed"></span> Connecting...
+  </div>
+
+  <!-- 1. State banner -->
+  <div id="state-banner" class="banner running" style="display:none;">
+    <span id="state-badge" class="state-badge running">—</span>
+    <div class="progress-bar"><div id="progress-fill" class="progress-fill" style="width:0%"></div></div>
+    <span id="progress-text" class="muted">0%</span>
+    <span id="elapsed" class="muted">—</span>
+    <span id="heartbeat" class="muted">—</span>
+  </div>
+
+  <div class="grid">
+    <!-- 2. Job header -->
+    <div class="panel">
+      <h2>Job Header</h2>
+      <table>
+        <tr><th>Experiment</th><td id="hdr-experiment">—</td></tr>
+        <tr><th>Automation Job</th><td id="hdr-job">—</td></tr>
+        <tr><th>Wallac Run ID</th><td id="hdr-runid">—</td></tr>
+        <tr><th>Requester</th><td id="hdr-requester">—</td></tr>
+        <tr><th>Operator</th><td id="hdr-operator">—</td></tr>
+        <tr><th>Device</th><td id="hdr-device">—</td></tr>
+        <tr><th>Service Version</th><td id="hdr-version">—</td></tr>
+      </table>
+    </div>
+
+    <!-- 3. Preflight checklist -->
+    <div class="panel">
+      <h2>Preflight Checklist</h2>
+      <div id="preflight"><span class="muted">Waiting for preflight...</span></div>
+    </div>
+
+    <!-- 4. Request snapshot -->
+    <div class="panel">
+      <h2>Request Snapshot (Signed)</h2>
+      <table>
+        <tr><th>Protocol</th><td id="req-protocol">—</td></tr>
+        <tr><th>Plate Layout</th><td id="req-layout">—</td></tr>
+        <tr><th>Expected Outputs</th><td id="req-outputs">—</td></tr>
+        <tr><th>Request Checksum</th><td id="req-checksum" class="muted">—</td></tr>
+      </table>
+    </div>
+
+    <!-- 9. eLabFTW write-back status -->
+    <div class="panel">
+      <h2>eLabFTW Write-back</h2>
+      <table>
+        <tr><th>Status</th><td><span id="wb-status-dot" class="status-dot pending"></span><span id="wb-status">pending</span></td></tr>
+        <tr><th>Last Retry</th><td id="wb-retry">—</td></tr>
+        <tr><th>Operator Hint</th><td id="wb-hint">—</td></tr>
+      </table>
+    </div>
+
+    <!-- 5. Plate view -->
+    <div class="panel grid-full">
+      <h2>Plate View (96-well)</h2>
+      <div id="plate" class="plate"></div>
+    </div>
+
+    <!-- 6. Timeline / event log -->
+    <div class="panel">
+      <h2>Timeline / Event Log</h2>
+      <div id="event-log" class="event-log"><span class="muted">No events yet.</span></div>
+    </div>
+
+    <!-- 7. Controls -->
+    <div class="panel">
+      <h2>Controls</h2>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button class="btn btn-refresh" onclick="reconnect()">Reconnect</button>
+        <button id="btn-abort" class="btn btn-abort" onclick="requestAbort()" disabled>Request Controlled Abort</button>
+      </div>
+      <p class="muted" style="margin-top:8px; font-size:0.8rem;">
+        Controlled abort is a software cancel, not an emergency stop.
+        Emergency stop: use the physical button on the instrument.
+      </p>
+    </div>
+
+    <!-- 8. Results / artifacts -->
+    <div class="panel grid-full">
+      <h2>Results &amp; Artifacts</h2>
+      <div id="results"><span class="muted">No results yet.</span></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const PLATE_ROWS = ['A','B','C','D','E','F','G','H'];
+const PLATE_COLS = 12;
+let jobId = null;
+let eventSource = null;
+
+function getJobId() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get('id') || params.get('job') || window.location.pathname.split('/').pop();
+}
+
+function init() {
+  jobId = getJobId();
+  if (!jobId) {
+    document.getElementById('conn-status').innerHTML = '<span class="status-dot failed"></span> No job ID specified.';
+    return;
+  }
+  fetchState();
+  connectSSE();
+}
+
+function fetchState() {
+  fetch(`/api/jobs/${jobId}`)
+    .then(r => r.ok ? r.json() : null)
+    .then(data => { if (data) updateUI(data); })
+    .catch(() => {});
+}
+
+function connectSSE() {
+  if (eventSource) eventSource.close();
+  setConnStatus(false);
+  eventSource = new EventSource(`/api/jobs/${jobId}/stream`);
+  eventSource.onopen = () => setConnStatus(true);
+  eventSource.onmessage = (e) => {
+    try { updateUI(JSON.parse(e.data)); } catch(err) {}
+  };
+  eventSource.onerror = () => {
+    setConnStatus(false);
+    // EventSource auto-reconnects; just update the UI
+  };
+}
+
+function setConnStatus(connected) {
+  const el = document.getElementById('conn-status');
+  if (connected) {
+    el.className = 'conn-status connected';
+    el.innerHTML = '<span class="status-dot succeeded"></span> Connected';
+  } else {
+    el.className = 'conn-status disconnected';
+    el.innerHTML = '<span class="status-dot failed"></span> Reconnecting...';
+  }
+}
+
+function reconnect() { fetchState(); connectSSE(); }
+
+function updateUI(s) {
+  // State banner
+  const banner = document.getElementById('state-banner');
+  banner.style.display = 'flex';
+  banner.className = `banner ${s.state}`;
+  const badge = document.getElementById('state-badge');
+  badge.textContent = s.state.replace(/_/g, ' ');
+  badge.className = `state-badge ${s.state}`;
+  document.getElementById('progress-fill').style.width = (s.progress_percent || 0) + '%';
+  document.getElementById('progress-text').textContent = Math.round(s.progress_percent || 0) + '%';
+  document.getElementById('elapsed').textContent = s.elapsed_seconds ? Math.round(s.elapsed_seconds) + 's' : '—';
+  document.getElementById('heartbeat').textContent = s.last_heartbeat ? '♥ ' + s.last_heartbeat.slice(11,19) : '—';
+
+  // Job header
+  document.getElementById('hdr-experiment').textContent = s.experiment_id || '—';
+  document.getElementById('hdr-job').textContent = s.item_id || '—';
+  document.getElementById('hdr-runid').textContent = s.wallac_run_id || '—';
+  document.getElementById('hdr-requester').textContent = s.requester || '—';
+  document.getElementById('hdr-operator').textContent = s.operator || '—';
+  document.getElementById('hdr-device').textContent = s.device_identity || '—';
+  document.getElementById('hdr-version').textContent = s.service_version || '—';
+
+  // Request snapshot
+  document.getElementById('req-protocol').textContent = s.protocol_name || '—';
+  document.getElementById('req-layout').textContent = s.plate_layout_reference || '—';
+  document.getElementById('req-outputs').textContent = s.expected_outputs || '—';
+  document.getElementById('req-checksum').textContent = s.request_checksum ? s.request_checksum.slice(0,16) + '…' : '—';
+
+  // Preflight
+  if (s.preflight && s.preflight.length > 0) {
+    document.getElementById('preflight').innerHTML = s.preflight.map(p => {
+      const cls = p.passed ? 'check-passed' : 'check-pending';
+      const icon = p.passed ? '✓' : '○';
+      return `<div class="checklist-item"><span class="check-icon ${cls}">${icon}</span><span>${p.name}</span><span class="muted">${p.detail || ''}</span></div>`;
+    }).join('');
+  }
+
+  // Plate view
+  renderPlate(s.plate_wells || {});
+
+  // Event log
+  if (s.event_log && s.event_log.length > 0) {
+    document.getElementById('event-log').innerHTML = s.event_log.map(e => `<div>${e}</div>`).join('');
+  }
+
+  // Results / artifacts
+  if (s.artifacts && s.artifacts.length > 0) {
+    document.getElementById('results').innerHTML = '<table><thead><tr><th>File</th><th>Checksum</th><th>Size</th></tr></thead><tbody>' +
+      s.artifacts.map(a => `<tr><td><a class="artifact-link" href="/api/jobs/${jobId}/artifacts/${a.filename}">${a.filename}</a></td><td class="muted">${a.checksum ? a.checksum.slice(0,16) + '…' : '—'}</td><td>${a.size || '—'}</td></tr>`).join('') +
+      '</tbody></table>' + (s.result_summary ? `<p style="margin-top:8px;">${s.result_summary}</p>` : '');
+  } else if (s.result_summary) {
+    document.getElementById('results').innerHTML = `<p>${s.result_summary}</p>`;
+  }
+
+  // Write-back status
+  document.getElementById('wb-status').textContent = s.writeback_status || 'pending';
+  const wbDot = document.getElementById('wb-status-dot');
+  wbDot.className = `status-dot ${s.writeback_status || 'pending'}`;
+  document.getElementById('wb-retry').textContent = s.writeback_last_retry || '—';
+  document.getElementById('wb-hint').textContent = s.writeback_operator_hint || '—';
+
+  // Controls
+  const abortBtn = document.getElementById('btn-abort');
+  const isTerminal = ['completed','failed','aborted','unknown_requires_operator_review'].includes(s.state);
+  abortBtn.disabled = isTerminal;
+
+  // Error display
+  if (s.last_error_code) {
+    badge.title = s.operator_hint || '';
+  }
+}
+
+function renderPlate(wells) {
+  const plate = document.getElementById('plate');
+  let html = '<div></div>'; // top-left corner
+  for (let c = 1; c <= PLATE_COLS; c++) {
+    html += `<div class="plate-label">${c}</div>`;
+  }
+  for (const row of PLATE_ROWS) {
+    html += `<div class="plate-label">${row}</div>`;
+    for (let c = 1; c <= PLATE_COLS; c++) {
+      const wellId = row + String(c).padStart(2, '0');
+      const val = wells[wellId];
+      const cls = val !== undefined && val !== null ? 'well has-value' : 'well';
+      const display = val !== undefined && val !== null ? (typeof val === 'number' ? val.toFixed(3) : val) : '';
+      html += `<div class="${cls}" title="${wellId}">${display}</div>`;
+    }
+  }
+  plate.innerHTML = html;
+}
+
+function requestAbort() {
+  if (!confirm('Request a controlled abort? This is a software cancel, not an emergency stop.')) return;
+  fetch(`/api/jobs/${jobId}/abort`, { method: 'POST' })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) alert('Abort failed: ' + data.error);
+    })
+    .catch(() => alert('Abort request failed — check connection.'));
+}
+
+init();
+</script>
+</body>
+</html>
