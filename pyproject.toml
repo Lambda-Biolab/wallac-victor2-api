@@ -1,7 +1,9 @@
-# Tooling config only -- this repo is a Windows-only Python agent (the Wallac
-# 1420 instrument microservice), NOT an installable Python package.
-# Quality gates apply to the maintained agent stack:
+# Tooling config only -- this repo contains the Wallac 1420 instrument
+# microservice (vm-agent/, Windows-only) and the eLabFTW bridge (bridge/,
+# Linux-side).  NOT an installable Python package.
+# Quality gates apply to the maintained stacks:
 #   vm-agent/{agent,lid_watcher,launch_as_user}.py
+#   bridge/{elabftw,signature,intake,models,errors}.py
 # The COM-introspection diagnostics (vm-agent/probe.py, dump_*.py) are research
 # tools and are excluded. pyright is intentionally not run: the agent is
 # Windows/comtypes-only, so it false-positives on a Linux host/CI.
