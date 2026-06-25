@@ -1,6 +1,9 @@
-# Quality gates for the maintained agent stack (docs/102).
+# Quality gates for the maintained stacks (docs/102).
 # Tools are run via uv so no global installs are required.
-GATED := vm-agent/agent.py vm-agent/lid_watcher.py vm-agent/launch_as_user.py
+GATED := vm-agent/agent.py vm-agent/lid_watcher.py vm-agent/launch_as_user.py \
+         bridge/elabftw.py bridge/signature.py bridge/intake.py \
+         bridge/models.py bridge/errors.py bridge/lifecycle.py bridge/abort.py \
+         bridge/writeback.py bridge/dashboard.py bridge/config.py bridge/secrets_check.py
 
 .PHONY: validate format test complexity setup_dev
 
