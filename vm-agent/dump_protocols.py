@@ -9,7 +9,7 @@ Read-only discovery tool. Output -> C:\\Users\\Public\\protocols.txt.
 import shutil
 import traceback
 
-SRC = r"C:\Program Files\Wallac1420\Data\Mlr3.mdb"
+SRC = r"C:\Program Files\Wallac\Wallac1420\Data\Mlr3.mdb"
 TMP = r"C:\Users\Public\mlr3_copy.mdb"
 OUT = r"C:\Users\Public\protocols.txt"
 HINTS = ("prot", "assay", "meas", "label", "method")
