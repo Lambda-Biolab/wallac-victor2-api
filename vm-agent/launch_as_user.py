@@ -23,9 +23,9 @@ if len(sys.argv) > 1:
     ARGS = sys.argv[2:]
     CWD = None
 else:
-    APP = r"C:\Program Files\Wallac1420\Program\MlrMgr.exe"
+    APP = r"C:\Program Files\Wallac\Wallac1420\Program\MlrMgr.exe"
     ARGS = []
-    CWD = r"C:\Program Files\Wallac1420\Program"
+    CWD = r"C:\Program Files\Wallac\Wallac1420\Program"
 OUT = r"C:\install\launch_out.txt"
 
 TOKEN_PRIMARY = 1

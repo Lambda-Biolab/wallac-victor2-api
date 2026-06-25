@@ -8,7 +8,7 @@ rem 2) wait for it to connect, 3) run the agent in a relaunch (watchdog) loop.
 set PY=C:\Users\lambda\AppData\Local\Programs\Python\Python38-32\python.exe
 set PYW=C:\Users\lambda\AppData\Local\Programs\Python\Python38-32\pythonw.exe
 
-cd /d "C:\Program Files\Wallac1420\Program"
+cd /d "C:\Program Files\Wallac\Wallac1420\Program"
 start "" MlrMgr.exe
 
 rem give MlrMgr time to connect the instrument (~45s); ping as a portable sleep
