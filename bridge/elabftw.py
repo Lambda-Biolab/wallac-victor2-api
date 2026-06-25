@@ -89,6 +89,20 @@ class ElabftwInterface(Protocol):
         """
         ...
 
+    def upload_file(
+        self, item_id: int, filename: str, content: bytes, comment: str = ""
+    ) -> dict[str, Any]:
+        """Upload a file attachment to an item.
+
+        Returns the upload metadata dict (with at least ``id`` and
+        ``real_name``).
+        """
+        ...
+
+    def post_comment(self, item_id: int, comment: str) -> None:
+        """Append a comment to an item (used for event log entries)."""
+        ...
+
 
 # --- HTTP client ------------------------------------------------------------
 
@@ -189,4 +203,51 @@ class ElabftwClient:
                 "action": "update",
                 "metadata": json.dumps(meta, ensure_ascii=False),
             },
+        )
+
+    def upload_file(
+        self, item_id: int, filename: str, content: bytes, comment: str = ""
+    ) -> dict[str, Any]:
+        """Upload a file attachment via multipart/form-data."""
+        import uuid
+
+        boundary = uuid.uuid4().hex
+        body_parts = []
+        body_parts.append(f"--{boundary}\r\n".encode())
+        body_parts.append(
+            f'Content-Disposition: form-data; name="file"; '
+            f'filename="{filename}"\r\n'
+            f"Content-Type: application/octet-stream\r\n\r\n"
+        ).encode()
+        body_parts.append(content)
+        body_parts.append(f"\r\n--{boundary}\r\n".encode())
+        body_parts.append(
+            f'Content-Disposition: form-data; name="comment"\r\n\r\n{comment}\r\n'
+        ).encode()
+        body_parts.append(f"--{boundary}--\r\n".encode())
+        data = b"".join(body_parts)
+
+        url = f"{self.base}/items/{item_id}/uploads"
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Authorization", self.api_key)
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        try:
+            with urllib.request.urlopen(req, context=self._ssl_ctx) as resp:
+                content_resp = resp.read()
+                if content_resp:
+                    return json.loads(content_resp)
+                return {}
+        except urllib.error.HTTPError as e:
+            detail = ""
+            with contextlib.suppress(Exception):
+                detail = e.read().decode()[:200]
+            logger.error("eLabFTW upload %s -> %s: %s", url, e.code, detail)
+            raise
+
+    def post_comment(self, item_id: int, comment: str) -> None:
+        """Append a comment to an item."""
+        self._request(
+            "POST",
+            f"/items/{item_id}/comments",
+            body={"comment": comment},
         )

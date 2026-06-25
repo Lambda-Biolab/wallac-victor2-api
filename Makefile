@@ -2,7 +2,8 @@
 # Tools are run via uv so no global installs are required.
 GATED := vm-agent/agent.py vm-agent/lid_watcher.py vm-agent/launch_as_user.py \
          bridge/elabftw.py bridge/signature.py bridge/intake.py \
-         bridge/models.py bridge/errors.py bridge/lifecycle.py bridge/abort.py
+         bridge/models.py bridge/errors.py bridge/lifecycle.py bridge/abort.py \
+         bridge/writeback.py
 
 .PHONY: validate format test complexity setup_dev
 

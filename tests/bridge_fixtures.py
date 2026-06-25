@@ -179,7 +179,11 @@ class MockElabftwClient:
         self._uploads: dict[int, list[dict[str, Any]]] = {}
         # (item_id, upload_id) -> bytes
         self._upload_data: dict[tuple[int, int], bytes] = {}
+        # item_id -> list of comment strings
+        self._comments: dict[int, list[str]] = {}
         self._next_upload_id = 1
+        # If set, patch_metadata raises this to simulate transient failures
+        self._patch_fail_countdown: int = 0
 
     # --- Setup helpers (for tests) ---
 
@@ -195,7 +199,15 @@ class MockElabftwClient:
             "metadata": {"extra_fields": extra_fields or {}},
         }
         self._uploads.setdefault(item_id, [])
+        self._comments.setdefault(item_id, [])
         return item_id
+
+    def set_patch_fail_countdown(self, count: int) -> None:
+        """Configure the mock to fail the next N patch_metadata calls.
+
+        Used to test write-back retry behavior.
+        """
+        self._patch_fail_countdown = count
 
     def add_signature_upload(
         self, item_id: int, archive_bytes: bytes, comment: str = "Signature archive"
@@ -243,6 +255,11 @@ class MockElabftwClient:
         if item_id not in self._items:
             raise KeyError(f"item {item_id} not found")
 
+        # Simulate transient failures for retry testing
+        if self._patch_fail_countdown > 0:
+            self._patch_fail_countdown -= 1
+            raise ConnectionError("simulated transient eLabFTW failure")
+
         item = self._items[item_id]
         current_ef = item["metadata"].get("extra_fields") or {}
 
@@ -268,6 +285,27 @@ class MockElabftwClient:
         current_ef.update(extra_fields)
         item["metadata"]["extra_fields"] = current_ef
 
+    def upload_file(
+        self, item_id: int, filename: str, content: bytes, comment: str = ""
+    ) -> dict[str, Any]:
+        upload_id = self._next_upload_id
+        self._next_upload_id += 1
+        upload = {
+            "id": upload_id,
+            "real_name": filename,
+            "comment": comment,
+            "immutable": 0,
+            "state": 1,
+            "item_id": item_id,
+            "filesize": len(content),
+        }
+        self._uploads.setdefault(item_id, []).append(upload)
+        self._upload_data[(item_id, upload_id)] = content
+        return upload
+
+    def post_comment(self, item_id: int, comment: str) -> None:
+        self._comments.setdefault(item_id, []).append(comment)
+
     # --- Inspection helpers (for test assertions) ---
 
     def get_item_state(self, item_id: int) -> str:
@@ -280,3 +318,12 @@ class MockElabftwClient:
 
     def get_item_extra_fields(self, item_id: int) -> dict[str, Any]:
         return extract_extra_fields(self._items[item_id].get("metadata"))
+
+    def get_comments(self, item_id: int) -> list[str]:
+        return self._comments.get(item_id, [])
+
+    def get_uploads(self, item_id: int) -> list[dict[str, Any]]:
+        return self._uploads.get(item_id, [])
+
+    def get_upload_data(self, item_id: int, upload_id: int) -> bytes:
+        return self._upload_data[(item_id, upload_id)]
