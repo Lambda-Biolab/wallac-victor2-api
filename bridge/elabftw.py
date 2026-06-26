@@ -187,7 +187,11 @@ class ElabftwClient:
         return self._request("GET", f"/items/{item_id}/uploads") or []
 
     def download_upload(self, item_id: int, upload_id: int) -> bytes:
-        url = f"{self.base}/items/{item_id}/uploads/{upload_id}"
+        """Download the raw bytes of an upload attachment.
+
+        Uses ``?format=binary`` because the default response is JSON metadata.
+        """
+        url = f"{self.base}/items/{item_id}/uploads/{upload_id}?format=binary"
         req = urllib.request.Request(url)
         req.add_header("Authorization", self.api_key)
         with urllib.request.urlopen(req, context=self._ssl_ctx) as resp:
