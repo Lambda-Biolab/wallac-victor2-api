@@ -251,3 +251,29 @@ class ElabftwClient:
             f"/items/{item_id}/comments",
             body={"comment": comment},
         )
+
+    # --- Designer methods (Stage 3: protocol authoring) ---
+
+    def list_items(self, category_id: int) -> list[dict[str, Any]]:
+        """List all items in a resource category."""
+        return self._request("GET", f"/items?cat={category_id}") or []
+
+    def get_item(self, item_id: int) -> dict[str, Any]:
+        """Get a single item by ID."""
+        return self._request("GET", f"/items/{item_id}")
+
+    def create_item(self, category_id: int, title: str, body: str = "") -> int:
+        """Create a new item in a resource category. Returns the new item ID."""
+        result = self._request(
+            "POST",
+            "/items",
+            body={"category": category_id, "title": title, "body": body},
+        )
+        if isinstance(result, dict) and "id" in result:
+            return int(result["id"])
+        # Try Location header from the raw response
+        raise RuntimeError(f"Could not parse new item ID from response: {result}")
+
+    def patch_item(self, item_id: int, fields: dict[str, Any]) -> None:
+        """Patch fields on an item (title, body, etc.)."""
+        self._request("PATCH", f"/items/{item_id}", body=fields)
