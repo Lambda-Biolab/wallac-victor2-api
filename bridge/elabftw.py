@@ -242,6 +242,14 @@ class ElabftwClient:
                 content_resp = resp.read()
                 if content_resp:
                     return json.loads(content_resp)
+                # 201 with Location header but empty body
+                loc = resp.headers.get("Location") or resp.headers.get("location") or ""
+                if loc:
+                    try:
+                        upload_id = int(loc.rstrip("/").rsplit("/", 1)[-1])
+                        return {"id": upload_id, "real_name": filename}
+                    except ValueError:
+                        pass
                 return {}
         except urllib.error.HTTPError as e:
             detail = ""
