@@ -3,7 +3,9 @@
 GATED := vm-agent/agent.py vm-agent/lid_watcher.py vm-agent/launch_as_user.py \
          bridge/elabftw.py bridge/signature.py bridge/intake.py \
          bridge/models.py bridge/errors.py bridge/lifecycle.py bridge/abort.py \
-         bridge/writeback.py bridge/dashboard.py bridge/config.py bridge/secrets_check.py
+         bridge/writeback.py bridge/dashboard.py bridge/config.py bridge/secrets_check.py \
+         bridge/canonical.py bridge/schemas.py bridge/designer.py bridge/designer_app.py \
+         bridge/validation.py bridge/generated_protocols.py bridge/analysis.py
 
 .PHONY: validate format test complexity setup_dev
 
