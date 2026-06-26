@@ -388,7 +388,7 @@ class DesignerService:
         self._validate_kind(kind)
         item_id = int(item["id"])
         title = str(item.get("title", ""))
-        cat_id = int(item.get("category", self.categories[kind]))
+        cat_id = int(item.get("category") or self.categories[kind])
 
         # Parse metadata
         from .elabftw import extract_extra_fields, get_field_value
