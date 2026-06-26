@@ -287,11 +287,10 @@ class ElabftwClient:
     def create_item(self, category_id: int, title: str, body: str = "") -> int:
         """Create a new item from a resource template. Returns the new item ID.
 
-        Uses ``type`` (not ``category``) because eLabFTW's ``items_types`` API
-        creates templates but doesn't always create corresponding
-        ``items_categories`` entries. The ``type`` field tells eLabFTW to
-        create the item from the template, which handles the category linkage
-        internally.
+        Uses ``type`` (the items_types template ID) to create the item from
+        the template, then PATCHes the ``category`` field to link it to the
+        correct items_categories entry. This is needed because eLabFTW's API
+        creates the item from the template but doesn't set the category field.
         """
         result = self._request(
             "POST",
@@ -299,14 +298,23 @@ class ElabftwClient:
             body={"type": category_id, "title": title, "body": body},
         )
         if isinstance(result, dict):
+            item_id = None
             if "id" in result:
-                return int(result["id"])
-            if "_location" in result:
+                item_id = int(result["id"])
+            elif "_location" in result:
                 loc = result["_location"]
                 try:
-                    return int(loc.rstrip("/").rsplit("/", 1)[-1])
+                    item_id = int(loc.rstrip("/").rsplit("/", 1)[-1])
                 except ValueError:
                     pass
+            if item_id is not None:
+                # Set the category field so the item appears in the UI
+                self._request(
+                    "PATCH",
+                    f"/items/{item_id}",
+                    body={"category": category_id},
+                )
+                return item_id
         raise RuntimeError(f"Could not parse new item ID from response: {result}")
 
     def patch_item(self, item_id: int, fields: dict[str, Any]) -> None:
