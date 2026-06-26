@@ -205,7 +205,6 @@ class ElabftwClient:
             "PATCH",
             f"/items/{item_id}",
             body={
-                "action": "update",
                 "metadata": json.dumps(meta, ensure_ascii=False),
             },
         )
