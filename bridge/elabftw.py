@@ -228,9 +228,7 @@ class ElabftwClient:
         body_parts.append(content)
         body_parts.append(f"\r\n--{boundary}\r\n".encode())
         body_parts.append(
-            (
-                f'Content-Disposition: form-data; name="comment"\r\n\r\n{comment}\r\n'
-            ).encode()
+            (f'Content-Disposition: form-data; name="comment"\r\n\r\n{comment}\r\n').encode()
         )
         body_parts.append(f"--{boundary}--\r\n".encode())
         data = b"".join(body_parts)
