@@ -303,10 +303,8 @@ class ElabftwClient:
                 item_id = int(result["id"])
             elif "_location" in result:
                 loc = result["_location"]
-                try:
+                with contextlib.suppress(ValueError):
                     item_id = int(loc.rstrip("/").rsplit("/", 1)[-1])
-                except ValueError:
-                    pass
             if item_id is not None:
                 # Set the category field so the item appears in the UI
                 self._request(
