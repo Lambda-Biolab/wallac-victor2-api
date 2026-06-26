@@ -216,18 +216,22 @@ class ElabftwClient:
         import uuid
 
         boundary = uuid.uuid4().hex
-        body_parts = []
+        body_parts: list[bytes] = []
         body_parts.append(f"--{boundary}\r\n".encode())
         body_parts.append(
-            f'Content-Disposition: form-data; name="file"; '
-            f'filename="{filename}"\r\n'
-            f"Content-Type: application/octet-stream\r\n\r\n"
-        ).encode()
+            (
+                f'Content-Disposition: form-data; name="file"; '
+                f'filename="{filename}"\r\n'
+                f"Content-Type: application/octet-stream\r\n\r\n"
+            ).encode()
+        )
         body_parts.append(content)
         body_parts.append(f"\r\n--{boundary}\r\n".encode())
         body_parts.append(
-            f'Content-Disposition: form-data; name="comment"\r\n\r\n{comment}\r\n'
-        ).encode()
+            (
+                f'Content-Disposition: form-data; name="comment"\r\n\r\n{comment}\r\n'
+            ).encode()
+        )
         body_parts.append(f"--{boundary}--\r\n".encode())
         data = b"".join(body_parts)
 
