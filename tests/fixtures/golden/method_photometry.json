@@ -1,0 +1,1 @@
+{"mode":"photometry","name":"OD600 Absorbance","photometry":{"filter_id":"P610","filter_name":"600nm","read_time_seconds":1.0},"plate_type":"96-well","schema_name":"wallac.method","schema_version":1}
