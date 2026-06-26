@@ -149,6 +149,11 @@ class ElabftwClient:
             with urllib.request.urlopen(req, context=self._ssl_ctx) as resp:
                 content = resp.read()
                 if not content:
+                    # POST may return 201 with Location header but empty body.
+                    # Return a dict with the Location so callers can parse the ID.
+                    loc = resp.headers.get("Location") or resp.headers.get("location") or ""
+                    if loc:
+                        return {"_location": loc}
                     return None
                 return json.loads(content)
         except urllib.error.HTTPError as e:
@@ -255,23 +260,40 @@ class ElabftwClient:
     # --- Designer methods (Stage 3: protocol authoring) ---
 
     def list_items(self, category_id: int) -> list[dict[str, Any]]:
-        """List all items in a resource category."""
-        return self._request("GET", f"/items?cat={category_id}") or []
+        """List all items created from a resource template.
+
+        Uses ``?type=`` because items created via the API with ``type`` may
+        not have ``category`` set in the ``items_categories`` table.
+        """
+        return self._request("GET", f"/items?type={category_id}") or []
 
     def get_item(self, item_id: int) -> dict[str, Any]:
         """Get a single item by ID."""
         return self._request("GET", f"/items/{item_id}")
 
     def create_item(self, category_id: int, title: str, body: str = "") -> int:
-        """Create a new item in a resource category. Returns the new item ID."""
+        """Create a new item from a resource template. Returns the new item ID.
+
+        Uses ``type`` (not ``category``) because eLabFTW's ``items_types`` API
+        creates templates but doesn't always create corresponding
+        ``items_categories`` entries. The ``type`` field tells eLabFTW to
+        create the item from the template, which handles the category linkage
+        internally.
+        """
         result = self._request(
             "POST",
             "/items",
-            body={"category": category_id, "title": title, "body": body},
+            body={"type": category_id, "title": title, "body": body},
         )
-        if isinstance(result, dict) and "id" in result:
-            return int(result["id"])
-        # Try Location header from the raw response
+        if isinstance(result, dict):
+            if "id" in result:
+                return int(result["id"])
+            if "_location" in result:
+                loc = result["_location"]
+                try:
+                    return int(loc.rstrip("/").rsplit("/", 1)[-1])
+                except ValueError:
+                    pass
         raise RuntimeError(f"Could not parse new item ID from response: {result}")
 
     def patch_item(self, item_id: int, fields: dict[str, Any]) -> None:
