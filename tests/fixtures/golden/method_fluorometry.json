@@ -1,0 +1,1 @@
+{"fluorometry":{"emission_filter_id":"F535","emission_filter_name":"535nm","excitation_filter_id":"F485","excitation_filter_name":"485nm","read_time_seconds":0.5},"mode":"fluorometry","name":"GFP Fluorescence","plate_type":"96-well","schema_name":"wallac.method","schema_version":1}
