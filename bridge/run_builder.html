@@ -100,8 +100,9 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
 
   <!-- Auth -->
   <div class="auth-bar">
-    <input type="password" id="authToken" placeholder="Designer token (leave empty if none)" />
-    <button class="btn btn-secondary" onclick="saveToken()">Save</button>
+    <input type="text" id="elabftwUrl" placeholder="eLabFTW URL (e.g. https://100.119.135.27:3148)" style="flex:2;" />
+    <input type="password" id="authToken" placeholder="Designer token (leave empty if none)" style="flex:1;" />
+    <button class="btn btn-secondary" onclick="saveSettings()">Save</button>
   </div>
 
   <!-- Stepper -->
@@ -332,6 +333,18 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
 
     <div id="finalizeResults" style="margin-top:16px;"></div>
 
+    <div id="nextSteps" class="hidden" style="margin-top:16px;">
+      <h2>Next Steps — Sign & Submit in eLabFTW</h2>
+      <p class="hint">The Run Builder has created draft resources and attached canonical JSON. You now need to sign them in eLabFTW and submit the job for execution.</p>
+      <ol style="margin-left:20px; line-height:1.8;">
+        <li>Open each resource in eLabFTW (links above) and click <strong>Sign</strong>.</li>
+        <li>Set <strong>Lifecycle state</strong> to <code>signed/active</code> on the Method, Plate Layout, and Analysis Plan.</li>
+        <li>On the <strong>Automation Job</strong>: sign it, set <strong>Lifecycle state</strong> to <code>signed/active</code>, set <strong>Requested action</strong> to <code>submit</code>, and set <strong>Automation state</strong> to <code>requested</code>.</li>
+        <li>The bridge will pick up the job automatically within a few seconds.</li>
+      </ol>
+      <p class="hint">You can monitor progress on the Automation Job's <strong>Live Monitor</strong> URL field once the bridge claims it.</p>
+    </div>
+
     <div class="btn-row">
       <button class="btn btn-secondary" onclick="goToStep(4)">Back</button>
     </div>
@@ -341,6 +354,7 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
 <script>
 // --- State ---
 let token = localStorage.getItem('wallacDesignerToken') || '';
+let elabftwUrl = localStorage.getItem('wallacElabftwUrl') || '';
 let savedMethod = null;
 let savedLayout = null;
 let savedAnalysis = null;
@@ -359,10 +373,13 @@ for (const r of ROWS) {
 
 // --- Auth ---
 document.getElementById('authToken').value = token;
-function saveToken() {
+document.getElementById('elabftwUrl').value = elabftwUrl;
+function saveSettings() {
   token = document.getElementById('authToken').value;
+  elabftwUrl = document.getElementById('elabftwUrl').value.replace(/\/+$/, '');
   localStorage.setItem('wallacDesignerToken', token);
-  showStatus('Token saved', 'success');
+  localStorage.setItem('wallacElabftwUrl', elabftwUrl);
+  showStatus('Settings saved', 'success');
 }
 
 function authHeaders() {
@@ -804,6 +821,11 @@ async function saveJob() {
 }
 
 // --- Step 5: Review ---
+function elabftwItemUrl(itemId) {
+  if (!elabftwUrl) return null;
+  return `${elabftwUrl}/database.php?mode=view&id=${itemId}`;
+}
+
 function renderReview() {
   const summary = document.getElementById('reviewSummary');
   const items = [];
@@ -812,15 +834,21 @@ function renderReview() {
   if (savedAnalysis) items.push(['Analysis Plan', savedAnalysis]);
   if (savedJob) items.push(['Automation Job', savedJob]);
 
-  summary.innerHTML = items.map(([label, obj]) => `
+  summary.innerHTML = items.map(([label, obj]) => {
+    const url = elabftwItemUrl(obj.item_id);
+    const link = url
+      ? `<a href="${url}" target="_blank" style="color:var(--accent); font-size:0.8rem; text-decoration:none;">Open in eLabFTW →</a>`
+      : '<span class="hint">Set eLabFTW URL above to enable links</span>';
+    return `
     <div class="summary-item">
       <div class="summary-label">${label}</div>
       <div class="summary-value">${obj.title}</div>
       <div class="resource-meta">id=${obj.item_id}, lifecycle=${obj.lifecycle}</div>
       <div class="resource-meta">hash=${obj.hash ? obj.hash.slice(0,16)+'...' : '(not finalized)'}</div>
       <div class="resource-meta">attachment=${obj.json_attachment_id || '(none)'}</div>
-    </div>
-  `).join('');
+      <div style="margin-top:4px;">${link}</div>
+    </div>`;
+  }).join('');
 }
 
 async function finalizeAll() {
@@ -832,6 +860,7 @@ async function finalizeAll() {
     ['Analysis Plan', savedAnalysis, 'analyses'],
     ['Automation Job', savedJob, 'jobs'],
   ];
+  let allOk = true;
   for (const [label, obj, prefix] of items) {
     if (!obj) continue;
     try {
@@ -840,8 +869,12 @@ async function finalizeAll() {
       obj.json_attachment_id = result.json_attachment_id;
       results.innerHTML += `<div class="status-msg success">${label} finalized: hash=${result.hash.slice(0,16)}..., attachment=${result.json_attachment_id}</div>`;
     } catch (e) {
+      allOk = false;
       results.innerHTML += `<div class="status-msg error">${label} finalize failed: ${e.message}</div>`;
     }
+  }
+  if (allOk) {
+    document.getElementById('nextSteps').classList.remove('hidden');
   }
   renderReview();
 }
