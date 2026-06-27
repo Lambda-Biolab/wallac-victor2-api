@@ -138,6 +138,7 @@ def create_orchestrator(config: BridgeConfig) -> ExecutionOrchestrator:
         protocol_manager=protocols,
         analysis_pipeline=AnalysisPipeline(),
         spool=spool,
+        dry_run=config.dry_run,
     )
 
 

@@ -648,3 +648,132 @@ class TestExecutionOrchestratorSpool:
 
         # Restore for cleanup
         elabftw.upload_file = original_upload  # type: ignore[method-assign]
+
+
+class TestExecutionOrchestratorDryRun:
+    """Dry-run mode: validate signed bundles without touching the instrument."""
+
+    def test_dry_run_existing_protocol(
+        self,
+        orchestrator: ExecutionOrchestrator,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """Dry-run validates and returns without executing the run."""
+        orchestrator.dry_run = True
+        elabftw.add_item(
+            200,
+            {
+                "Execution mode": {"value": "existing_protocol"},
+                "Protocol name": {"value": "Absorbance 600"},
+            },
+        )
+
+        result = orchestrator.execute_job(
+            job_item_id=200,
+            execution_mode="existing_protocol",
+            protocol_name="Absorbance 600",
+        )
+
+        assert result.success is True
+        assert result.final_state == "completed"
+        assert result.run_id == ""  # no run was started
+        assert any(e["event"] == "dry_run_validation_passed" for e in result.events)
+        # Dry-run report should be uploaded
+        uploads = elabftw.list_uploads(200)
+        assert any(u["real_name"] == "dry_run_report.json" for u in uploads)
+        # vm-agent should NOT have been contacted for a run
+        assert len(vm_agent._run_results) == 0
+
+    def test_dry_run_generated_protocol(
+        self,
+        orchestrator: ExecutionOrchestrator,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """Dry-run validates canonical specs without executing."""
+        from bridge.canonical import canonicalize_and_hash
+        from bridge.schemas import (
+            AnalysisSpec,
+            BlankSubtractionConfig,
+            LayoutSpec,
+            MethodSpec,
+            PhotometrySettings,
+            WellSpec,
+        )
+
+        orchestrator.dry_run = True
+
+        # Build canonical specs
+        method = MethodSpec(
+            name="OD600 Photometry",
+            mode="photometry",
+            plate_type="96-well",
+            photometry=PhotometrySettings(
+                filter_id="P610",
+                filter_name="610nm",
+                read_time_seconds=0.1,
+            ),
+        )
+        method_bytes, method_hash = canonicalize_and_hash(method.to_dict())
+
+        layout = LayoutSpec(
+            plate_type="96-well",
+            wells=[WellSpec(well_name="A1", role="measured")],
+        )
+        layout_bytes, layout_hash = canonicalize_and_hash(layout.to_dict())
+
+        analysis = AnalysisSpec(
+            blank_subtraction=BlankSubtractionConfig(enabled=False),
+        )
+        analysis_bytes, analysis_hash = canonicalize_and_hash(analysis.to_dict())
+
+        job_spec_dict = {
+            "schema_name": "wallac.job",
+            "schema_version": 1,
+            "execution_mode": "generated_protocol",
+            "method": {"object_id": 301, "hash": method_hash, "json_attachment_id": 5001},
+            "layout": {
+                "source": "reusable",
+                "hash": layout_hash,
+                "json_attachment_id": 5002,
+                "object_id": 302,
+            },
+            "analysis": {"object_id": 303, "hash": analysis_hash, "json_attachment_id": 5003},
+        }
+        job_bytes, job_hash = canonicalize_and_hash(job_spec_dict)
+
+        # Set up job item in eLabFTW
+        elabftw.add_item(
+            300,
+            {
+                "Execution mode": {"value": "generated_protocol"},
+                "Job hash": {"value": job_hash},
+                "Job JSON attachment ID": {"value": "5000"},
+            },
+        )
+        for item_id in (301, 302, 303):
+            elabftw.add_item(item_id, {"Lifecycle state": {"value": "signed/active"}})
+
+        # Wire download_upload
+        upload_map: dict[tuple[int, int], bytes] = {
+            (300, 5000): job_bytes,
+            (301, 5001): method_bytes,
+            (302, 5002): layout_bytes,
+            (303, 5003): analysis_bytes,
+        }
+        elabftw.download_upload = lambda iid, uid: upload_map.get((iid, uid), b"{}")  # type: ignore[method-assign]
+
+        result = orchestrator.execute_job(
+            job_item_id=300,
+            execution_mode="generated_protocol",
+        )
+
+        assert result.success is True
+        assert result.final_state == "completed"
+        assert result.run_id == ""
+        assert any(e["event"] == "dry_run_validation_passed" for e in result.events)
+        uploads = elabftw.list_uploads(300)
+        assert any(u["real_name"] == "dry_run_report.json" for u in uploads)
+        # No protocol should have been generated
+        assert len(vm_agent._run_results) == 0

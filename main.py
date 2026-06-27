@@ -85,11 +85,12 @@ class BridgeDaemon:
         self._drain_spool()
 
         logger.info(
-            "Bridge daemon started (identity=%s, eLabFTW=%s, vm-agent=%s, poll=%ss)",
+            "Bridge daemon started (identity=%s, eLabFTW=%s, vm-agent=%s, poll=%ss%s)",
             self.config.bridge_identity,
             self.config.elabftw_url,
             self.config.vm_agent_url,
             self.config.poll_interval,
+            ", DRY-RUN MODE" if self.config.dry_run else "",
         )
 
         while self._running:
