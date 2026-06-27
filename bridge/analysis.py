@@ -260,7 +260,10 @@ class AnalysisPipeline:
         result: AnalysisResult,
     ) -> None:
         """Steps 1-2: Load raw values, mark skipped wells, merge layout info."""
-        raw_by_name = {w["well_name"]: w for w in raw_wells}
+        # vm-agent returns 'well', layout/analysis specs use 'well_name'
+        raw_by_name = {
+            (w.get("well_name") or w.get("well") or ""): w for w in raw_wells
+        }
 
         # Include all 96 wells from the layout
         for well_name, layout_def in layout_wells.items():

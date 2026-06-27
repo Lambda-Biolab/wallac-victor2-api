@@ -108,6 +108,14 @@ class ExecutionResult:
 # --- Result completeness checker -------------------------------------------
 
 
+def _well_key(w: dict[str, Any]) -> str:
+    """Extract the well address from a raw result dict.
+
+    The vm-agent uses 'well', layout/analysis specs use 'well_name'.
+    """
+    return w.get("well_name") or w.get("well") or ""
+
+
 def check_result_completeness(
     raw_wells: list[dict[str, Any]],
     layout_wells: dict[str, dict[str, Any]],
@@ -118,7 +126,7 @@ def check_result_completeness(
         (is_complete, list_of_issues)
     """
     issues: list[str] = []
-    raw_by_name = {w["well_name"] for w in raw_wells}
+    raw_by_name = {_well_key(w) for w in raw_wells}
 
     for well_name, layout_def in layout_wells.items():
         role = layout_def.get("role", "measured")
