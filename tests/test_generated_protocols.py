@@ -498,6 +498,112 @@ class TestCleanup:
         result = mgr.delete_protocol(999, confirm=True)
         assert len(result.errors) == 1
 
+    def test_cleanup_finds_protocols_after_restart(
+        self,
+        mdb: MockMdbClient,
+    ) -> None:
+        """Cleanup must find MDB protocols even when _generated is empty
+        (simulates a bridge restart)."""
+        mgr = GeneratedProtocolManager(mdb, env={})
+
+        # Simulate protocols left in the MDB from a prior session
+        # (NOT registered in _generated via generate_protocol())
+        mdb.add_protocol(2000002, "ELAB-Job-337-ecbf0c77", group="eLabFTW Generated")
+        mdb.add_protocol(2000003, "ELAB-Job-338-deadbeef", group="eLabFTW Generated")
+
+        result = mgr.cleanup_terminal(confirm=False)
+
+        assert result.dry_run is True
+        assert len(result.deleted) == 0
+        assert len(result.skipped) == 2
+        skipped_ids = {e["job_id"] for e in result.skipped}
+        assert skipped_ids == {337, 338}
+
+    def test_cleanup_confirm_deletes_after_restart(
+        self,
+        mdb: MockMdbClient,
+    ) -> None:
+        """Confirm cleanup deletes MDB protocols after restart."""
+        mgr = GeneratedProtocolManager(mdb, env={})
+
+        mdb.add_protocol(2000002, "ELAB-Job-337-ecbf0c77", group="eLabFTW Generated")
+
+        result = mgr.cleanup_terminal(confirm=True)
+
+        assert result.dry_run is False
+        assert len(result.deleted) == 1
+        assert result.deleted[0]["job_id"] == 337
+        # Verify it was actually deleted from the MDB
+        assert mdb.get_protocol(2000002) is None
+
+    def test_cleanup_excludes_factory_presets(
+        self,
+        mdb: MockMdbClient,
+    ) -> None:
+        """Defense-in-depth: factory presets must NEVER be cleaned up,
+        even if the MDB query returns them."""
+        mgr = GeneratedProtocolManager(mdb, env={})
+
+        # A factory preset and a user protocol alongside the generated one
+        mdb.add_protocol(1000003, "Absorbance @ 405 (1.0s)", group="Photometry")
+        mdb.add_protocol(2000000, "Absorbance @ 600 (1.0s)", group="Photometry")
+        mdb.add_protocol(2000002, "ELAB-Job-337-ecbf0c77", group="eLabFTW Generated")
+
+        result = mgr.cleanup_terminal(confirm=True)
+
+        assert len(result.deleted) == 1
+        assert result.deleted[0]["name"] == "ELAB-Job-337-ecbf0c77"
+        # Factory preset and user protocol must still exist
+        assert mdb.get_protocol(1000003) is not None
+        assert mdb.get_protocol(2000000) is not None
+
+    def test_delete_specific_job_after_restart(
+        self,
+        mdb: MockMdbClient,
+    ) -> None:
+        """delete_protocol() must find the protocol in the MDB when
+        _generated is empty (bridge restart scenario)."""
+        mgr = GeneratedProtocolManager(mdb, env={})
+
+        mdb.add_protocol(2000002, "ELAB-Job-337-ecbf0c77", group="eLabFTW Generated")
+
+        result = mgr.delete_protocol(337, confirm=True)
+
+        assert result.dry_run is False
+        assert len(result.deleted) == 1
+        assert result.deleted[0]["job_id"] == 337
+        assert mdb.get_protocol(2000002) is None
+
+    def test_delete_specific_job_dry_run_after_restart(
+        self,
+        mdb: MockMdbClient,
+    ) -> None:
+        """delete_protocol() dry-run finds the protocol in the MDB
+        after restart and reports it as skipped."""
+        mgr = GeneratedProtocolManager(mdb, env={})
+
+        mdb.add_protocol(2000002, "ELAB-Job-337-ecbf0c77", group="eLabFTW Generated")
+
+        result = mgr.delete_protocol(337, confirm=False)
+
+        assert result.dry_run is True
+        assert len(result.skipped) == 1
+        assert result.skipped[0]["job_id"] == 337
+        # Protocol must still exist (dry-run)
+        assert mdb.get_protocol(2000002) is not None
+
+    def test_parse_job_id(self) -> None:
+        """_parse_job_id extracts the job_id from a protocol name."""
+        assert GeneratedProtocolManager._parse_job_id("ELAB-Job-337-ecbf0c77") == 337
+        assert GeneratedProtocolManager._parse_job_id("ELAB-Job-1-abc12345") == 1
+        assert GeneratedProtocolManager._parse_job_id("ELAB-Job-99999-deadbeef") == 99999
+
+    def test_parse_job_id_invalid(self) -> None:
+        """_parse_job_id returns 0 for non-generated names."""
+        assert GeneratedProtocolManager._parse_job_id("Absorbance @ 600") == 0
+        assert GeneratedProtocolManager._parse_job_id("") == 0
+        assert GeneratedProtocolManager._parse_job_id("ELAB-Job-notanumber-hash") == 0
+
 
 # --- Fixtures ---
 
