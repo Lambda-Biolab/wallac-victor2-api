@@ -59,9 +59,42 @@ def create_protocol_manager(config: BridgeConfig) -> GeneratedProtocolManager:
     The protocol manager is only functional when the vm-agent has
     ``WALLAC_ENABLE_PROTOCOL_AUTHORING=true`` set. The manager itself
     checks this flag via its env dict.
+
+    Template fingerprints are configured via env vars:
+    - ``WALLAC_PHOTOMETRY_TEMPLATE_ID``: AssayProtID of photometry template
+    - ``WALLAC_PHOTOMETRY_TEMPLATE_NAME``: expected ProtName
+    - ``WALLAC_FLUOROMETRY_TEMPLATE_ID`` / ``_NAME``: fluorometry template
+    - ``WALLAC_LUMINESCENCE_TEMPLATE_ID`` / ``_NAME``: luminescence template
+
+    The env vars ``WALLAC_ENABLE_PROTOCOL_AUTHORING`` and per-mode flags
+    (``WALLAC_ENABLE_PHOTOMETRY`` etc.) must also be set.
     """
+    import os
+
+    from .generated_protocols import TemplateFingerprint
+
     mdb_client = create_remote_mdb_client(config)
-    return GeneratedProtocolManager(mdb_client=mdb_client)
+
+    templates: dict[str, TemplateFingerprint] = {}
+    for mode, prefix in [
+        ("photometry", "WALLAC_PHOTOMETRY"),
+        ("fluorometry", "WALLAC_FLUOROMETRY"),
+        ("luminescence", "WALLAC_LUMINESCENCE"),
+    ]:
+        tpl_id = os.environ.get(f"{prefix}_TEMPLATE_ID", "")
+        if tpl_id:
+            tpl_name = os.environ.get(f"{prefix}_TEMPLATE_NAME", "")
+            templates[mode] = TemplateFingerprint(
+                assay_prot_id=int(tpl_id),
+                mode=mode,
+                expected_name=tpl_name,
+                expected_group="eLabFTW Generated",
+            )
+
+    return GeneratedProtocolManager(
+        mdb_client=mdb_client,
+        templates=templates or None,
+    )
 
 
 def create_validation_service(
