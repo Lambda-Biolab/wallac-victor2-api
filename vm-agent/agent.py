@@ -407,6 +407,12 @@ def _resolve_protocol(spec, worker):
         for p in protos:
             if p["id"] == pid:
                 return p
+        # Protocol not in cache — may be a newly-generated protocol.
+        # Refresh the cache from the MDB and try once more.
+        protos = worker.call(op_protocols(True), timeout=40)
+        for p in protos:
+            if p["id"] == pid:
+                return p
         raise ApiError(
             404,
             "protocol_not_found",
