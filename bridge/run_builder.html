@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Wallac Victor2 Run Builder</title>
+<style>
+:root {
+  --bg: #1a1a2e; --card: #16213e; --accent: #0f3460; --text: #e0e0e0;
+  --border: #30475e; --green: #4ecca3; --red: #e94560; --yellow: #f0a500;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+.container { max-width: 900px; margin: 0 auto; padding: 20px; }
+h1 { text-align: center; margin-bottom: 10px; color: var(--green); }
+.subtitle { text-align: center; color: var(--text); opacity: 0.7; margin-bottom: 30px; }
+.steps { display: flex; justify-content: space-between; margin-bottom: 30px; }
+.step { flex: 1; text-align: center; padding: 10px; border-radius: 8px; background: var(--card); margin: 0 5px; border: 2px solid transparent; }
+.step.active { border-color: var(--green); }
+.step.done { border-color: var(--accent); }
+.step-num { font-size: 24px; font-weight: bold; }
+.step-label { font-size: 12px; opacity: 0.8; }
+.card { background: var(--card); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+.card h2 { color: var(--green); margin-bottom: 15px; font-size: 18px; }
+.form-group { margin-bottom: 15px; }
+.form-group label { display: block; margin-bottom: 5px; font-size: 14px; }
+.form-group input, .form-group select, .form-group textarea {
+  width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text); font-size: 14px;
+}
+.form-group textarea { min-height: 80px; font-family: monospace; }
+.btn {
+  padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px;
+  font-weight: 600; transition: opacity 0.2s;
+}
+.btn:hover { opacity: 0.85; }
+.btn-primary { background: var(--green); color: var(--bg); }
+.btn-secondary { background: var(--accent); color: var(--text); }
+.btn-danger { background: var(--red); color: var(--text); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.actions { display: flex; gap: 10px; justify-content: flex-end; }
+.list { list-style: none; }
+.list li { padding: 10px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+.list li:last-child { border-bottom: none; }
+.badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+.badge-signed { background: var(--green); color: var(--bg); }
+.badge-draft { background: var(--yellow); color: var(--bg); }
+.hidden { display: none; }
+.alert { padding: 12px; border-radius: 6px; margin-bottom: 15px; }
+.alert-success { background: rgba(78, 204, 163, 0.15); border: 1px solid var(--green); }
+.alert-error { background: rgba(233, 69, 96, 0.15); border: 1px solid var(--red); }
+.alert-info { background: rgba(15, 52, 96, 0.3); border: 1px solid var(--accent); }
+#step-content { min-height: 300px; }
+.summary { background: var(--bg); border-radius: 8px; padding: 15px; margin: 10px 0; }
+.summary-row { display: flex; justify-content: space-between; padding: 5px 0; }
+.summary-label { opacity: 0.7; }
+.summary-value { font-weight: 600; }
+.elabftw-link { display: inline-block; padding: 10px 20px; background: var(--accent); color: var(--text); border-radius: 6px; text-decoration: none; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Wallac Victor2 Run Builder</h1>
+  <p class="subtitle">Author signed protocol bundles for the plate reader</p>
+
+  <div class="steps">
+    <div class="step active" id="step-indicator-1"><div class="step-num">1</div><div class="step-label">Method</div></div>
+    <div class="step" id="step-indicator-2"><div class="step-num">2</div><div class="step-label">Layout</div></div>
+    <div class="step" id="step-indicator-3"><div class="step-num">3</div><div class="step-label">Analysis</div></div>
+    <div class="step" id="step-indicator-4"><div class="step-num">4</div><div class="step-label">Job</div></div>
+  </div>
+
+  <div id="alerts"></div>
+  <div id="step-content"></div>
+
+  <div class="actions" id="nav-actions" style="margin-top: 20px;">
+    <button class="btn btn-secondary hidden" id="btn-prev" onclick="prevStep()">Previous</button>
+    <button class="btn btn-primary" id="btn-next" onclick="nextStep()">Next</button>
+  </div>
+</div>
+
+<script>
+// --- Configuration ---
+const ELABFTW_URL = window.location.origin.replace(/:\d+$/, ':3148'); // eLabFTW on same host
+
+// --- State ---
+let currentStep = 1;
+const selections = { method: null, layout: null, analysis: null, job: null };
+const drafts = { method: [], layout: [], analysis: [], job: [] };
+
+// --- API helpers ---
+async function api(method, path, body) {
+  const opts = { method, headers: {} };
+  if (body) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const resp = await fetch('/api/' + path, opts);
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+    throw new Error(err.detail?.human_message || err.detail || resp.statusText);
+  }
+  return resp.json();
+}
+
+function showAlert(type, msg) {
+  const el = document.getElementById('alerts');
+  el.innerHTML = `<div class="alert alert-${type}">${msg}</div>`;
+  setTimeout(() => el.innerHTML = '', 5000);
+}
+
+// --- Step rendering ---
+function renderStep(step) {
+  const content = document.getElementById('step-content');
+  const kinds = { 1: 'method', 2: 'layout', 3: 'analysis', 4: 'job' };
+  const kind = kinds[step];
+  const titles = { 1: 'Method', 2: 'Plate Layout', 3: 'Analysis Plan', 4: 'Automation Job' };
+
+  // Update indicators
+  for (let i = 1; i <= 4; i++) {
+    const el = document.getElementById('step-indicator-' + i);
+    el.classList.remove('active', 'done');
+    if (i < step) el.classList.add('done');
+    if (i === step) el.classList.add('active');
+  }
+
+  // Update nav buttons
+  document.getElementById('btn-prev').classList.toggle('hidden', step === 1);
+  document.getElementById('btn-next').textContent = step === 4 ? 'Create Job' : 'Next';
+
+  if (step === 4) {
+    renderJobStep(content);
+  } else {
+    renderObjectStep(content, kind, titles[step]);
+  }
+}
+
+function renderObjectStep(content, kind, title) {
+  content.innerHTML = `
+    <div class="card">
+      <h2>Select ${title}</h2>
+      <div class="form-group">
+        <label>Existing ${title}</label>
+        <select id="select-${kind}" onchange="selections.${kind} = this.value || null">
+          <option value="">-- Create new --</option>
+        </select>
+      </div>
+      <button class="btn btn-secondary" onclick="loadList('${kind}')">Refresh list</button>
+    </div>
+    <div class="card">
+      <h2>Create New ${title} Draft</h2>
+      <div class="form-group">
+        <label>Title</label>
+        <input type="text" id="new-${kind}-title" placeholder="${title} name">
+      </div>
+      <div class="form-group">
+        <label>Spec (JSON)</label>
+        <textarea id="new-${kind}-spec" placeholder='{"mode": "photometry", ...}'>${kind === 'method' ? '{"mode":"photometry","filter":"P610","read_time_s":0.1}' : kind === 'layout' ? '{"wells":[{"well_name":"A1","role":"measured"}]}' : '{"blank_subtraction":true,"replicate_groups":["A"]}'}</textarea>
+      </div>
+      <button class="btn btn-primary" onclick="createDraft('${kind}')">Create Draft</button>
+      <button class="btn btn-secondary" onclick="finalizeDraft('${kind}')">Finalize Selected</button>
+    </div>
+  `;
+  loadList(kind);
+}
+
+function renderJobStep(content) {
+  const methodId = selections.method || '(none)';
+  const layoutId = selections.layout || '(none)';
+  const analysisId = selections.analysis || '(none)';
+
+  content.innerHTML = `
+    <div class="card">
+      <h2>Automation Job Summary</h2>
+      <div class="summary">
+        <div class="summary-row"><span class="summary-label">Method:</span><span class="summary-value">${methodId}</span></div>
+        <div class="summary-row"><span class="summary-label">Layout:</span><span class="summary-value">${layoutId}</span></div>
+        <div class="summary-row"><span class="summary-label">Analysis:</span><span class="summary-value">${analysisId}</span></div>
+      </div>
+      <div class="form-group">
+        <label>Job Title</label>
+        <input type="text" id="job-title" placeholder="Automation Job title" value="Run ${new Date().toISOString().slice(0,10)}">
+      </div>
+      <div class="form-group">
+        <label>Execution Mode</label>
+        <select id="job-mode">
+          <option value="generated_protocol">generated_protocol (signed bundle)</option>
+          <option value="existing_protocol">existing_protocol (by name)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Protocol Name (existing_protocol only)</label>
+        <input type="text" id="job-protocol-name" placeholder="Absorbance @ 600 (0.1s)">
+      </div>
+      <div class="form-group">
+        <label>Linked Experiment ID (optional)</label>
+        <input type="text" id="job-exp-id" placeholder="">
+      </div>
+      <button class="btn btn-primary" onclick="createJob()">Create & Finalize Job</button>
+    </div>
+    <div id="job-result"></div>
+  `;
+}
+
+// --- Actions ---
+async function loadList(kind) {
+  const select = document.getElementById('select-' + kind);
+  if (!select) return;
+  select.innerHTML = '<option value="">-- Create new --</option>';
+  try {
+    const items = await api('GET', kind + 's');
+    drafts[kind] = items;
+    for (const item of items) {
+      const opt = document.createElement('option');
+      opt.value = item.item_id;
+      const badge = item.hash ? ' [signed]' : ' [draft]';
+      opt.textContent = `#${item.item_id}: ${item.title}${badge}`;
+      select.appendChild(opt);
+    }
+  } catch (e) {
+    showAlert('error', 'Failed to load ' + kind + ' list: ' + e.message);
+  }
+}
+
+async function createDraft(kind) {
+  const title = document.getElementById('new-' + kind + '-title').value.trim();
+  const specText = document.getElementById('new-' + kind + '-spec').value.trim();
+  if (!title) { showAlert('error', 'Title is required'); return; }
+  let spec = {};
+  try { spec = JSON.parse(specText || '{}'); } catch { showAlert('error', 'Invalid JSON spec'); return; }
+
+  try {
+    const result = await api('POST', kind + 's', { title, spec });
+    showAlert('success', `Created ${kind} draft #${result.item_id}`);
+    selections[kind] = result.item_id;
+    await loadList(kind);
+    document.getElementById('select-' + kind).value = result.item_id;
+  } catch (e) {
+    showAlert('error', 'Create failed: ' + e.message);
+  }
+}
+
+async function finalizeDraft(kind) {
+  const itemId = selections[kind];
+  if (!itemId) { showAlert('error', 'Select a ' + kind + ' first'); return; }
+  try {
+    const result = await api('POST', kind + 's/' + itemId + '/finalize');
+    showAlert('success', `Finalized ${kind} #${itemId}. Hash: ${result.hash.slice(0,12)}...`);
+    showAlert('info', `Sign this object in eLabFTW, then proceed to the next step.`);
+  } catch (e) {
+    showAlert('error', 'Finalize failed: ' + e.message);
+  }
+}
+
+async function createJob() {
+  const title = document.getElementById('job-title').value.trim();
+  const mode = document.getElementById('job-mode').value;
+  const protocolName = document.getElementById('job-protocol-name').value.trim();
+  const expId = document.getElementById('job-exp-id').value.trim();
+
+  if (!title) { showAlert('error', 'Job title is required'); return; }
+
+  const spec = {
+    execution_mode: mode,
+    method: { object_id: parseInt(selections.method) || 0 },
+    layout: { object_id: parseInt(selections.layout) || 0 },
+    analysis: { object_id: parseInt(selections.analysis) || 0 },
+  };
+  if (protocolName) spec.protocol_name = protocolName;
+  if (expId) spec.linked_experiment_id = expId;
+
+  try {
+    // Create the job draft
+    const job = await api('POST', 'jobs', { title, spec });
+    showAlert('success', `Created job draft #${job.item_id}`);
+
+    // Finalize the job
+    const finalized = await api('POST', 'jobs/' + job.item_id + '/finalize');
+    showAlert('info', `Finalized job #${job.item_id}. Hash: ${finalized.hash.slice(0,12)}...`);
+
+    // Show result with eLabFTW link
+    document.getElementById('job-result').innerHTML = `
+      <div class="card">
+        <h2>Job Created</h2>
+        <div class="summary">
+          <div class="summary-row"><span class="summary-label">Job ID:</span><span class="summary-value">#${job.item_id}</span></div>
+          <div class="summary-row"><span class="summary-label">Hash:</span><span class="summary-value">${finalized.hash}</span></div>
+        </div>
+        <div class="alert alert-info">
+          <strong>Next steps:</strong>
+          <ol>
+            <li>Sign the Automation Job in eLabFTW (an authorized operator must sign)</li>
+            <li>Set <code>Requested action = submit</code> in eLabFTW</li>
+            <li>The bridge will automatically pick up and execute the job</li>
+          </ol>
+        </div>
+        <a class="elabftw-link" href="${ELABFTW_URL}/database.php?mode=view&id=${job.item_id}" target="_blank">Open in eLabFTW</a>
+      </div>
+    `;
+  } catch (e) {
+    showAlert('error', 'Job creation failed: ' + e.message);
+  }
+}
+
+// --- Navigation ---
+function nextStep() {
+  if (currentStep < 4) {
+    currentStep++;
+    renderStep(currentStep);
+  }
+}
+
+function prevStep() {
+  if (currentStep > 1) {
+    currentStep--;
+    renderStep(currentStep);
+  }
+}
+
+// --- Init ---
+renderStep(1);
+</script>
+</body>
+</html>

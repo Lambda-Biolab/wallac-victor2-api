@@ -269,6 +269,18 @@ def create_designer_app(
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/run-builder")
+    def run_builder() -> Any:
+        """Serve the Run Builder single-page app."""
+        from pathlib import Path
+
+        html_path = Path(__file__).parent / "run_builder.html"
+        if not html_path.exists():
+            raise HTTPException(status_code=404, detail="run_builder.html not found")
+        from fastapi.responses import HTMLResponse
+
+        return HTMLResponse(html_path.read_text(encoding="utf-8"))
+
     # Register CRUD endpoints for all four object kinds
     for kind, prefix in [
         ("method", "/api/methods"),
