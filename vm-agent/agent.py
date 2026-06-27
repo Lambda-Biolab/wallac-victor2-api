@@ -1127,8 +1127,9 @@ def op_mdb_ensure_group(group_name, group_id):
             rs.Fields("LeftMostChild").Value = 0
             rs.Fields("RightSibling").Value = 0
             rs.Fields("Parent").Value = 1  # child of "Protocols" (GroupID=1)
-            rs.Fields("FactoryPreset").Value = False
+            rs.Fields("FactoryPreset").Value = 0  # Jet boolean: 0=False, -1=True
             rs.Fields("UserLevel").Value = 1
+            rs.Fields("Notes").Value = "eLabFTW generated protocols"
             rs.Update()
             rs.Close()
             return int(group_id)
