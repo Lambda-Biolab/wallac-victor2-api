@@ -185,11 +185,18 @@ class BridgeDaemon:
 
             logger.info("Job %d: abort requested, aborting run %s", job.item_id, run_id)
             try:
-                self.vm_agent.abort_run(run_id)
-                self.elabftw.patch_metadata(
-                    job.item_id,
-                    {"Automation state": {"value": JobState.ABORTING.value}},
-                )
+                abort_resp = self.vm_agent.abort_run(run_id)
+                # Only write 'aborting' if the run is still running.
+                # If the vm-agent already reports 'aborted', the main
+                # thread's _poll_run_completion will write the terminal
+                # state — don't overwrite it with 'aborting'.
+                if abort_resp.get("state") == "running":
+                    self.elabftw.patch_metadata(
+                        job.item_id,
+                        {"Automation state": {"value": JobState.ABORTING.value}},
+                    )
+                else:
+                    logger.info("Job %d: abort succeeded immediately", job.item_id)
             except VmAgentError as e:
                 if e.status_code == 425:
                     # Too early to abort — the Victor2 requires ~60s before
