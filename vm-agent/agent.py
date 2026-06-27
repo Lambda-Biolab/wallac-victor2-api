@@ -790,12 +790,20 @@ def _normalize_well(w):
     counts = w.get("counts")
     if counts is None:
         counts = w.get("meas_a")
-    return {"well": w.get("well"), "od": w.get("od"), "counts": counts}
+    return {
+        "well": w.get("well"),
+        "od": w.get("od"),
+        "counts": counts,
+        "result_type": w.get("result_type"),
+    }
 
 
 def _dedup_wells(wells):
     """One row per well address (OEM stores two ResultType rows per well).
-    Prefer the row that carries a non-null od; preserve first-seen order."""
+
+    Prefer the primary measurement (ResultType 0) when available; fall back
+    to the first row with a non-null od. Preserve first-seen order.
+    """
     best = {}
     order = []
     for w in wells:
@@ -803,10 +811,15 @@ def _dedup_wells(wells):
         addr = nw["well"]
         if addr is None:
             continue
-        if addr not in best:
+        rtype = nw.get("result_type")
+        cur = best.get(addr)
+        if cur is None:
             best[addr] = nw
             order.append(addr)
-        elif best[addr].get("od") is None and nw.get("od") is not None:
+        elif rtype == 0 and cur.get("result_type") != 0:
+            # Prefer ResultType 0 (primary measurement) over secondary
+            best[addr] = nw
+        elif cur.get("od") is None and nw.get("od") is not None:
             best[addr] = nw
     return [best[a] for a in order]
 
