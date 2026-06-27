@@ -49,7 +49,7 @@ ENV_POLL_INTERVAL = "WALLAC_POLL_INTERVAL"
 # --- Defaults ---------------------------------------------------------------
 
 DEFAULT_ELABFTW_URL = "https://localhost:3148"
-DEFAULT_ELABFTW_CATEGORY = 9  # Automation Job resource category
+DEFAULT_ELABFTW_CATEGORY = 21  # items_categories ID for Automation Job (NOT items_types ID)
 DEFAULT_VM_AGENT_URL = "http://192.168.122.203:8420"
 DEFAULT_DASHBOARD_HOST = "0.0.0.0"
 DEFAULT_DASHBOARD_PORT = 8421
