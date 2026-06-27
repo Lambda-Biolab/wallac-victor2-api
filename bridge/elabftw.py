@@ -318,3 +318,83 @@ class ElabftwClient:
     def patch_item(self, item_id: int, fields: dict[str, Any]) -> None:
         """Patch fields on an item (title, body, etc.)."""
         self._request("PATCH", f"/items/{item_id}", body=fields)
+
+    # --- Experiment methods (Stage 6: Assay summary write-back) ---
+
+    def create_experiment(self, title: str, body: str = "") -> int:
+        """Create a new experiment. Returns the new experiment ID.
+
+        If ``body`` is provided, it is set as the experiment body (HTML).
+        """
+        result = self._request("POST", "/experiments", body={"title": title, "body": body})
+        if isinstance(result, dict):
+            if "id" in result:
+                return int(result["id"])
+            if "_location" in result:
+                loc = result["_location"]
+                with contextlib.suppress(ValueError):
+                    return int(loc.rstrip("/").rsplit("/", 1)[-1])
+        raise RuntimeError(f"Could not parse new experiment ID from response: {result}")
+
+    def patch_experiment(self, experiment_id: int, fields: dict[str, Any]) -> None:
+        """Patch fields on an experiment (title, body, etc.)."""
+        self._request("PATCH", f"/experiments/{experiment_id}", body=fields)
+
+    def upload_experiment_file(
+        self, experiment_id: int, filename: str, content: bytes, comment: str = ""
+    ) -> dict[str, Any]:
+        """Upload a file attachment to an experiment."""
+        import uuid
+
+        boundary = uuid.uuid4().hex
+        body_parts: list[bytes] = []
+        body_parts.append(f"--{boundary}\r\n".encode())
+        body_parts.append(
+            (
+                f'Content-Disposition: form-data; name="file"; '
+                f'filename="{filename}"\r\n'
+                f"Content-Type: application/octet-stream\r\n\r\n"
+            ).encode()
+        )
+        body_parts.append(content)
+        body_parts.append(f"\r\n--{boundary}\r\n".encode())
+        body_parts.append(
+            (f'Content-Disposition: form-data; name="comment"\r\n\r\n{comment}\r\n').encode()
+        )
+        body_parts.append(f"--{boundary}--\r\n".encode())
+        data = b"".join(body_parts)
+
+        url = f"{self.base}/experiments/{experiment_id}/uploads"
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Authorization", self.api_key)
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        try:
+            with urllib.request.urlopen(req, context=self._ssl_ctx) as resp:
+                content_resp = resp.read()
+                if content_resp:
+                    return json.loads(content_resp)
+                loc = resp.headers.get("Location") or resp.headers.get("location") or ""
+                if loc:
+                    try:
+                        upload_id = int(loc.rstrip("/").rsplit("/", 1)[-1])
+                        return {"id": upload_id, "real_name": filename}
+                    except ValueError:
+                        pass
+                return {}
+        except urllib.error.HTTPError as e:
+            detail = ""
+            with contextlib.suppress(Exception):
+                detail = e.read().decode()[:200]
+            logger.error("eLabFTW experiment upload %s -> %s: %s", url, e.code, detail)
+            raise
+
+    def link_experiment_to_item(self, experiment_id: int, item_id: int) -> None:
+        """Create a link from an experiment to an item (eLabFTW link).
+
+        Uses the experiments/{id}/items_links endpoint.
+        """
+        self._request(
+            "POST",
+            f"/experiments/{experiment_id}/items_links",
+            body={"item_id": item_id},
+        )
