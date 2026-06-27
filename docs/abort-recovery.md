@@ -12,30 +12,28 @@ semantics, and incident/rollback sequence.
 
 | Source | Path | Latency | Type |
 |---|---|---|---|
-| eLabFTW `Requested action = abort` | Bridge polls eLabFTW every ~5 s | 5-15 s | Non-real-time operator cancel intent |
+| Bridge HTTP API `POST /jobs/{id}/abort` | Direct call to bridge runtime | <1 s | Real-time software abort |
 | Dashboard "Request controlled abort" | Direct call to bridge runtime | <1 s | Lower-latency software abort |
 | Physical emergency stop | Hardware button / Wallac console | Immediate | Emergency stop — **not** handled by the bridge |
 
-**eLabFTW abort is not an emergency stop.** It is operator cancel intent that
-the bridge processes when it next polls. The dashboard abort is faster because
-it talks to the bridge runtime directly, but it is still a software abort — it
-calls `POST /runs/{id}/abort` on the vm-agent, which is subject to the
-instrument's 60-second minimum abort age.
+**All software aborts go through the bridge HTTP API** (`POST /jobs/{id}/abort`).
+There is no eLabFTW polling for abort requests. The abort is forwarded to the
+vm-agent's `POST /runs/{id}/abort`, which is subject to the instrument's
+60-second minimum abort age.
 
 ## State machine: abort lifecycle
 
 ```
-running → abort_requested → aborting → aborted
-                                  ↘ failed (abort itself failed)
-abort_requested → results_ready (run finished before abort took effect)
+running → aborted
+     ↘ failed (abort itself failed)
 ```
 
-- **Abort before run starts** (accepted/queued/validating/ready → aborted):
-  No physical work was done. The job goes directly to `aborted`.
-- **Abort during run** (running → abort_requested → aborting → aborted):
-  The execution loop detects the abort request, calls the vm-agent abort
-  endpoint, and transitions to `aborted` on success or `failed` if the
-  instrument did not respond.
+- **Abort before run starts** (accepted → aborted): No physical work was done.
+  The job goes directly to `aborted`.
+- **Abort during run** (running → aborted): The execution loop detects the
+  abort request via `POST /jobs/{id}/abort`, calls the vm-agent abort endpoint,
+  and transitions to `aborted` on success or `failed` if the instrument did not
+  respond.
 - **Abort after completion** (terminal state): No-op. The abort request is
   logged but does not change the state.
 
@@ -49,10 +47,9 @@ bridge classifies each persisted job state into one of four terminal states:
 | `completed` | — | `completed` |
 | `failed` | — | `failed` |
 | `aborted` | — | `aborted` |
-| `results_ready` / `results_uploaded` | yes | `completed` |
-| `results_ready` / `results_uploaded` | no | `unknown_requires_operator_review` |
-| `running` / `abort_requested` / `aborting` | — | `unknown_requires_operator_review` |
-| `queued` / `validating` / `ready` | — | `unknown_requires_operator_review` |
+| `running` | yes | `unknown_requires_operator_review` (partial results may exist) |
+| `running` | no | `unknown_requires_operator_review` |
+| `accepted` | — | `unknown_requires_operator_review` |
 
 **Never automatically repeat ambiguous physical work.** If the persisted state
 is ambiguous (any active state), the bridge marks the job
@@ -106,8 +103,10 @@ All errors include:
 
 ## Implementation
 
-- State machine: `bridge/lifecycle.py` — `LifecycleManager`
-- Recovery: `bridge/lifecycle.py` — `RecoveryManager`
-- Abort detection: `bridge/abort.py` — `AbortDetector` (eLabFTW polling),
-  `DashboardAbortHandler` (direct)
+- Abort endpoint: bridge HTTP API `POST /jobs/{id}/abort` (forwards to vm-agent `POST /runs/{id}/abort`)
+- State tracking: bridge in-memory job manager
+- Recovery: bridge job manager reconciles state on restart
+- Old modules (deprecated, kept for reference):
+  - `bridge/lifecycle.py` — `LifecycleManager`, `RecoveryManager`
+  - `bridge/abort.py` — `AbortDetector` (eLabFTW polling), `DashboardAbortHandler` (direct)
 - Tests: `tests/test_bridge_lifecycle.py`

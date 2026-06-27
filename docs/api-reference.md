@@ -466,6 +466,101 @@ Body:
 
 ---
 
+## Bridge HTTP API
+
+HTTP API exposed by the bridge daemon for job submission and status queries.
+In the direct-submit model, the Run Builder submits jobs here instead of
+creating eLabFTW Automation Job resources and waiting for polling.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/jobs` | Submit a new job for execution |
+| `GET` | `/jobs` | List all jobs |
+| `GET` | `/jobs/{id}` | Get job status and results |
+| `POST` | `/jobs/{id}/abort` | Abort a running job |
+| `GET` | `/health` | Bridge health check |
+
+Auth: Bearer token in `WALLAC_DESIGNER_TOKEN` env var (disabled if unset).
+
+### `POST /jobs` — submit job
+
+Body:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `title` | string | yes | Human-readable job title |
+| `execution_mode` | string | yes | `existing_protocol` or `generated_protocol` |
+| `protocol_name` | string | yes | Wallac protocol name/id |
+| `elabftw_experiment_id` | int | no | Link results to an existing eLabFTW experiment |
+| `method_ref` | object | no | `{object_id, hash, attachment_id}` — signed Method reference |
+| `layout_ref` | object | no | `{source, object_id, hash, attachment_id}` — signed Layout reference |
+| `analysis_ref` | object | no | `{object_id, hash, attachment_id}` — signed Analysis Plan reference |
+
+Response (`202`):
+
+```json
+{"job_id": "job-abc123", "status": "accepted"}
+```
+
+The bridge executes the job asynchronously. Status can be polled via
+`GET /jobs/{job_id}`.
+
+### `GET /jobs` — list jobs
+
+```json
+{
+  "count": 2,
+  "jobs": [
+    {"job_id": "job-abc123", "status": "accepted", "title": "OD600 run", "created_at": "..."},
+    {"job_id": "job-def456", "status": "completed", "title": "Fluorescence assay", "created_at": "..."}
+  ]
+}
+```
+
+### `GET /jobs/{id}` — job status
+
+```json
+{
+  "job_id": "job-abc123",
+  "status": "running",
+  "title": "OD600 run — E. coli growth",
+  "execution_mode": "existing_protocol",
+  "protocol_name": "Absorbance @ 600 (1.0s)",
+  "wallac_run_id": "r-ab12cd34ef56",
+  "elabftw_experiment_id": 42,
+  "progress_percent": 55.0,
+  "current_step": "Measuring...",
+  "started_at": "2026-06-27T10:12:00+00:00",
+  "elapsed_seconds": 30.0,
+  "error": "",
+  "operator_hint": "",
+  "result_summary": "",
+  "artifacts": []
+}
+```
+
+`404` if the job ID is unknown.
+
+### `POST /jobs/{id}/abort` — abort job
+
+Request a controlled abort of a running job. The bridge forwards the request to
+the vm-agent.
+
+```json
+{"ok": true}
+```
+
+`404` if the job is not active. Subject to the vm-agent's 60-second minimum
+abort age (returns `425` if too early).
+
+### `GET /health` — bridge health
+
+```json
+{"status": "ok", "instrument_connected": true, "uptime_seconds": 3600}
+```
+
+---
+
 ## Designer API
 
 FastAPI application served by the bridge daemon for the Run Builder UI and
@@ -596,19 +691,17 @@ source object is not in `signed_active` lifecycle state.
 ## Bridge daemon
 
 The bridge daemon (`main.py`) runs on the Linux host and orchestrates the
-end-to-end Automation Job lifecycle:
+end-to-end job lifecycle via the direct-submit model:
 
-1. **Poll** eLabFTW for pending Automation Jobs every `WALLAC_POLL_INTERVAL` s
+1. **Accept** jobs via HTTP `POST /jobs` (no eLabFTW polling)
 2. **Verify** cryptographic signatures on job requests
-3. **Claim** jobs (write-back state + identity to eLabFTW)
-4. **Execute** — resolve/measure via the vm-agent (either an existing protocol
+3. **Execute** — resolve/measure via the vm-agent (either an existing protocol
    or a generated protocol written to the MDB)
-5. **Write back** results (CSV exports, artifacts) to eLabFTW
+4. **Write back** results (CSV exports, artifacts) to an eLabFTW experiment
 
 It also runs:
-- A **dashboard server** background thread (default `0.0.0.0:8421`)
-- An **abort poller** background thread (5 s interval) that checks eLabFTW for
-  abort requests and signals the vm-agent
+- A **dashboard server** with SSE live progress (default `0.0.0.0:8421`)
+- The **bridge HTTP API** for job submission and status queries
 
 ### Configuration
 
@@ -617,19 +710,24 @@ All configuration is via environment variables (see `bridge/config.py`).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WALLAC_ELABFTW_URL` | `https://localhost:3148` | eLabFTW server URL |
-| `WALLAC_ELABFTW_API_KEY` | _(required)_ | Dedicated bridge API key |
+| `WALLAC_ELABFTW_API_KEY` | _(required)_ | Dedicated bridge API key (for write-back only; no polling required) |
 | `WALLAC_ELABFTW_CATEGORY` | `9` | Automation Job resource category ID |
 | `WALLAC_VM_AGENT_URL` | `http://192.168.122.203:8420` | vm-agent REST API base |
 | `WALLAC_VM_AGENT_TOKEN` | `""` | vm-agent bearer token |
 | `WALLAC_DASHBOARD_HOST` | `0.0.0.0` | Dashboard listen address |
 | `WALLAC_DASHBOARD_PORT` | `8421` | Dashboard listen port |
 | `WALLAC_DASHBOARD_TOKEN` | `""` | Dashboard auth token (unset = open on LAN) |
-| `WALLAC_BRIDGE_IDENTITY` | `wallac-bridge` | Identity written to "Claimed by" field |
 | `WALLAC_DEVICE_IDENTITY` | `victor2-unknown` | Instrument identity for diagnostics |
 | `WALLAC_SPOOL_DIR` | `/var/lib/wallac-bridge/spool` | Result write-back spool directory |
-| `WALLAC_POLL_INTERVAL` | `5.0` | eLabFTW job poll interval (seconds) |
 | `WALLAC_ENABLE_PROTOCOL_AUTHORING` | `""` | Feature flag: set `true` to enable generated protocols |
 | `WALLAC_DESIGNER_TOKEN` | `""` | Bearer token for the Designer API (unset = no auth) |
+
+Removed variables (no longer needed in direct-submit model):
+
+| Variable | Reason |
+|---|---|
+| `WALLAC_BRIDGE_IDENTITY` | No claiming — jobs are received, not claimed |
+| `WALLAC_POLL_INTERVAL` | No polling — jobs arrive via HTTP POST |
 
 ### Deployment
 
@@ -714,7 +812,8 @@ reaches a terminal state (`completed`, `failed`, `aborted`, or
 #### `POST /api/jobs/{id}/abort` — request abort
 
 Request a controlled abort of a running job. The bridge forwards the request to
-the vm-agent and updates eLabFTW metadata.
+the vm-agent via the bridge HTTP API (`POST /jobs/{id}/abort`). No eLabFTW
+metadata change or polling required.
 
 ```json
 {"ok": true}
@@ -765,7 +864,7 @@ codes produced by `_classify_exc()` and the various endpoint handlers.
 
 ### Bridge error codes
 
-Structured errors raised by the bridge daemon components (intake, execution,
+Structured errors raised by the bridge daemon components (validation, execution,
 designer). These share a uniform JSON shape:
 
 ```json
@@ -779,18 +878,15 @@ designer). These share a uniform JSON shape:
 }
 ```
 
-#### Intake & claim errors
+#### Validation errors (signature & canonical spec)
 
 | Code | Severity | Description | Retryable |
 |------|----------|-------------|-----------|
-| `unsigned_job` | error | Automation Job has no signature archive | no |
+| `unsigned_job` | error | Job has no signature archive | no |
 | `signature_verification_failed` | error | Cryptographic signature is invalid | no |
 | `request_modified_after_signature` | error | Request fields changed after signing | no |
-| `already_claimed` | error | Job is no longer in `requested` state (another bridge claimed it) | no |
-| `claim_failed` | error | Claim write-back to eLabFTW failed | depends |
-| `elabftw_error` | error | eLabFTW API error during intake | depends |
 
-#### Canonical spec & validation errors
+#### Canonical spec errors
 
 | Code | Severity | Description | Retryable |
 |------|----------|-------------|-----------|
