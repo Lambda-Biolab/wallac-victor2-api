@@ -640,11 +640,35 @@ class ExecutionOrchestrator:
         Returns a dict with keys: "job", "method", "layout", "analysis", "hash".
         Sets result.final_state on failure.
         """
-        from .canonical import compute_hash
         from .elabftw import extract_extra_fields, get_field_value
-        from .schemas import (
-            JobSpec,
+        from .schemas import JobSpec
+
+        job_spec_dict, job_hash, job_spec = self._load_job_spec(
+            job_item_id, result, extract_extra_fields, get_field_value, JobSpec
         )
+        if job_spec_dict is None:
+            return None
+
+        specs: dict[str, Any] = {
+            "job": job_spec_dict,
+            "hash": job_hash,
+        }
+
+        if not self._load_referenced_specs(job_item_id, job_spec, specs, result):
+            return None
+
+        return specs
+
+    def _load_job_spec(
+        self,
+        job_item_id: int,
+        result: ExecutionResult,
+        extract_extra_fields: Any,
+        get_field_value: Any,
+        JobSpec: Any,
+    ) -> tuple[dict[str, Any] | None, str, Any | None]:
+        """Download and verify job.json. Returns (spec_dict, hash, JobSpec) or (None, '', None)."""
+        from .canonical import compute_hash
 
         try:
             item = self.elabftw.get_item(job_item_id)
@@ -652,7 +676,7 @@ class ExecutionOrchestrator:
             result.final_state = "failed"
             result.error = f"Failed to load job item: {e}"
             result.add_event("spec_load_failed", str(e))
-            return None
+            return None, "", None
 
         ef = extract_extra_fields(item.get("metadata"))
         job_hash = get_field_value(ef, "Job hash") or ""
@@ -662,80 +686,84 @@ class ExecutionOrchestrator:
             result.final_state = "failed"
             result.error = "Missing Job hash or Job JSON attachment ID in metadata"
             result.add_event("spec_load_failed", "missing hash or attachment ID")
-            return None
+            return None, "", None
 
         try:
             job_attachment_id = int(job_attachment_id_str)
         except ValueError:
             result.final_state = "failed"
             result.error = f"Invalid attachment ID: {job_attachment_id_str}"
-            return None
+            return None, "", None
 
-        # Download and verify job.json
         try:
             job_bytes = self.elabftw.download_upload(job_item_id, job_attachment_id)
         except Exception as e:
             result.final_state = "failed"
             result.error = f"Failed to download job.json: {e}"
             result.add_event("spec_load_failed", str(e))
-            return None
+            return None, "", None
 
         actual_hash = compute_hash(job_bytes)
         if actual_hash != job_hash.lower():
             result.final_state = "failed"
             result.error = f"job.json hash mismatch: expected {job_hash}, got {actual_hash}"
             result.add_event("spec_load_failed", "hash mismatch")
-            return None
+            return None, "", None
 
         job_spec_dict = json.loads(job_bytes)
         result.add_event("job_spec_loaded", f"hash={actual_hash[:8]}")
 
-        # Parse JobSpec to get references
         try:
             job_spec = JobSpec.from_dict(job_spec_dict)
         except Exception as e:
             result.final_state = "failed"
             result.error = f"Failed to parse job.json: {e}"
             result.add_event("spec_load_failed", str(e))
-            return None
+            return None, "", None
 
-        specs: dict[str, Any] = {
-            "job": job_spec_dict,
-            "hash": job_hash,
-        }
+        return job_spec_dict, job_hash, job_spec
 
-        # Download method.json if referenced
+    def _load_referenced_specs(
+        self,
+        job_item_id: int,
+        job_spec: Any,
+        specs: dict[str, Any],
+        result: ExecutionResult,
+    ) -> bool:
+        """Download method/layout/analysis specs referenced by the job. Returns False on failure."""
         if job_spec.method is not None:
             method_spec = self._download_referenced_spec(job_spec.method, "method", result)
-            if method_spec is not None:
-                specs["method"] = method_spec
-                result.add_event("method_spec_loaded", f"mode={method_spec.get('mode', '?')}")
-            else:
-                return None  # result.final_state already set
+            if method_spec is None:
+                return False
+            specs["method"] = method_spec
+            result.add_event("method_spec_loaded", f"mode={method_spec.get('mode', '?')}")
 
-        # Download layout.json if referenced
         if job_spec.layout is not None:
-            if job_spec.layout.source == "reusable" and job_spec.layout.object_id:
-                layout_spec = self._download_referenced_spec(job_spec.layout, "layout", result)
-            else:
-                # one-off: attachment is on the job itself
-                layout_spec = self._download_one_off_layout(job_item_id, job_spec.layout, result)
-            if layout_spec is not None:
-                specs["layout"] = layout_spec
-                result.add_event("layout_spec_loaded", f"wells={len(layout_spec.get('wells', []))}")
-            else:
-                return None
+            layout_spec = self._load_layout_spec(job_item_id, job_spec.layout, result)
+            if layout_spec is None:
+                return False
+            specs["layout"] = layout_spec
+            result.add_event("layout_spec_loaded", f"wells={len(layout_spec.get('wells', []))}")
 
-        # Download analysis.json if referenced
         if job_spec.analysis is not None:
             analysis_spec = self._download_referenced_spec(job_spec.analysis, "analysis", result)
-            if analysis_spec is not None:
-                specs["analysis"] = analysis_spec
-                result.add_event("analysis_spec_loaded")
-            else:
-                return None
+            if analysis_spec is None:
+                return False
+            specs["analysis"] = analysis_spec
+            result.add_event("analysis_spec_loaded")
 
-        return specs
+        return True
+
+    def _load_layout_spec(
+        self,
+        job_item_id: int,
+        layout_ref: Any,
+        result: ExecutionResult,
+    ) -> dict[str, Any] | None:
+        """Download a layout spec: reusable (from a Layout object) or one-off (from the job)."""
+        if getattr(layout_ref, "source", "") == "reusable" and getattr(layout_ref, "object_id", 0):
+            return self._download_referenced_spec(layout_ref, "layout", result)
+        return self._download_one_off_layout(job_item_id, layout_ref, result)
 
     def _download_referenced_spec(
         self,

@@ -755,22 +755,26 @@ def op_job_results(assay_id):
     return _op
 
 
+def _parse_well_addr(addr):
+    """Parse a well address like 'A01' -> ('A', 1). Returns (row, col) or (None, 0)."""
+    if len(addr) < 2 or not addr[0].isalpha():
+        return None, 0
+    try:
+        return addr[0].upper(), int(addr[1:])
+    except ValueError:
+        return None, 0
+
+
 def _grid_csv(wells, value):
     """8x12 plate grid CSV. value 'od' or 'raw' (meas_a). First label/repeat
     per well wins."""
     key = "od" if value == "od" else "meas_a"
     cell = {}
     for w in wells:
-        addr = w.get("well") or ""
-        if len(addr) >= 2 and addr[0].isalpha():
-            row = addr[0].upper()
-            try:
-                col = int(addr[1:])
-            except ValueError:
-                continue
-            if (row, col) not in cell:
-                v = w.get(key)
-                cell[(row, col)] = "" if v is None else v
+        row, col = _parse_well_addr(w.get("well") or "")
+        if row is not None and (row, col) not in cell:
+            v = w.get(key)
+            cell[(row, col)] = "" if v is None else v
     lines = ["row," + ",".join(str(c) for c in range(1, 13))]
     for row in "ABCDEFGH":
         lines.append(row + "," + ",".join(str(cell.get((row, c), "")) for c in range(1, 13)))
@@ -1025,6 +1029,58 @@ def op_mdb_get_max_protocol_id():
     return _op
 
 
+def _mdb_column_names(db, template_id):
+    """Get column names from the template AssayProtocol row."""
+    rs = db.OpenRecordset("SELECT * FROM AssayProtocol WHERE AssayProtID = " + str(template_id))
+    if rs.EOF:
+        raise RuntimeError(f"Template protocol {template_id} not found")
+    names = [rs.Fields.Item(i).Name for i in range(rs.Fields.Count)]
+    rs.Close()
+    return names
+
+
+def _build_clone_sql(col_names, new_id, template_id):
+    """Build INSERT INTO ... SELECT to clone a template row with a new ID."""
+    select_parts = [str(new_id) if cn == "AssayProtID" else cn for cn in col_names]
+    return (
+        "INSERT INTO AssayProtocol ("
+        + ", ".join(col_names)
+        + ") SELECT "
+        + ", ".join(select_parts)
+        + " FROM AssayProtocol WHERE AssayProtID = "
+        + str(template_id)
+    )
+
+
+def _sql_literal(val):
+    """Convert a Python value to a Jet SQL literal."""
+    if isinstance(val, bool):
+        return str(-1 if val else 0)
+    if val is None:
+        return "NULL"
+    if isinstance(val, (int, float)):
+        return str(val)
+    return "'" + str(val).replace("'", "''") + "'"
+
+
+def _build_override_set_clauses(protocol_row, overridable_cols):
+    """Build SET clauses for the UPDATE that overrides cloned fields."""
+    clauses = []
+    for key in overridable_cols:
+        if key not in protocol_row:
+            continue
+        clauses.append(f"{key} = {_sql_literal(protocol_row[key])}")
+    return clauses
+
+
+def _execute_or_raise(db, sql, label):
+    """Execute SQL, wrapping failures in a RuntimeError with context."""
+    try:
+        db.Execute(sql)
+    except Exception as exc:
+        raise RuntimeError(f"{label} failed: {exc}") from exc
+
+
 def op_mdb_insert_protocol(protocol_row):
     """Insert a new AssayProtocol row by cloning a template via SQL.
 
@@ -1067,54 +1123,10 @@ def op_mdb_insert_protocol(protocol_row):
             if template_id <= 0:
                 raise RuntimeError("_template_id is required for protocol cloning")
 
-            # Step 1: Clone the template row via INSERT INTO ... SELECT.
-            # This copies ALL columns including binary PlateMap.
-            # Get column names from the template record.
-            rs_cols = db.OpenRecordset(
-                "SELECT * FROM AssayProtocol WHERE AssayProtID = " + str(template_id)
-            )
-            if rs_cols.EOF:
-                raise RuntimeError(f"Template protocol {template_id} not found")
-            col_names = []
-            for i in range(rs_cols.Fields.Count):
-                col_names.append(rs_cols.Fields.Item(i).Name)
-            rs_cols.Close()
+            col_names = _mdb_column_names(db, template_id)
+            _execute_or_raise(db, _build_clone_sql(col_names, new_id, template_id), "Clone INSERT")
 
-            build_select = []
-            for cn in col_names:
-                if cn == "AssayProtID":
-                    build_select.append(str(new_id))
-                else:
-                    build_select.append(cn)
-            clone_sql = (
-                "INSERT INTO AssayProtocol ("
-                + ", ".join(col_names)
-                + ") SELECT "
-                + ", ".join(build_select)
-                + " FROM AssayProtocol WHERE AssayProtID = "
-                + str(template_id)
-            )
-            try:
-                db.Execute(clone_sql)
-            except Exception as exc:
-                raise RuntimeError(f"Clone INSERT failed: {exc}") from exc
-
-            # Step 2: UPDATE specific fields we want to override
-            set_clauses = []
-            for key in _OVERRIDABLE_COLS:
-                if key not in protocol_row:
-                    continue
-                val = protocol_row[key]
-                if isinstance(val, bool):
-                    val = -1 if val else 0
-                if val is None:
-                    set_clauses.append(f"{key} = NULL")
-                elif isinstance(val, (int, float)):
-                    set_clauses.append(f"{key} = {val}")
-                else:
-                    escaped = str(val).replace("'", "''")
-                    set_clauses.append(f"{key} = '{escaped}'")
-
+            set_clauses = _build_override_set_clauses(protocol_row, _OVERRIDABLE_COLS)
             if set_clauses:
                 update_sql = (
                     "UPDATE AssayProtocol SET "
@@ -1122,10 +1134,7 @@ def op_mdb_insert_protocol(protocol_row):
                     + " WHERE AssayProtID = "
                     + str(new_id)
                 )
-                try:
-                    db.Execute(update_sql)
-                except Exception as exc:
-                    raise RuntimeError(f"Override UPDATE failed: {exc}") from exc
+                _execute_or_raise(db, update_sql, "Override UPDATE")
 
             return new_id
         finally:
@@ -1525,28 +1534,37 @@ class Handler(BaseHTTPRequestHandler):
     def _get_simple(self, path):
         w = self.server.worker
         if path == "/health":
-            data = w.call(op_health)
-            data["ready"] = bool(
-                data["instrument_connected"] and not data["is_error"] and data.get("is_idle")
-            )
-            data["ok"] = data["instrument_connected"]
-            data["ts"] = now_iso()
-            self._send(200 if data["ok"] else 503, data)
+            self._send_health(w)
         elif path == "/status":
-            with _monitor_lock:
-                snap = dict(_monitor)
-            self._send(200 if snap.get("connected") else 503, snap)
+            self._send_status()
         elif path == "/monitor":
             self._stream_monitor()
         elif path == "/instrument":
             self._send(200, w.call(op_instrument))
         else:  # /protocols
-            protos = w.call(op_protocols("refresh=1" in self.path), timeout=40)
-            q = self._query().get("q")
-            if q:
-                ql = unquote(q).lower()
-                protos = [p for p in protos if ql in p["name"].lower()]
-            self._send(200, {"count": len(protos), "protocols": protos})
+            self._send_protocols(w)
+
+    def _send_health(self, w):
+        data = w.call(op_health)
+        data["ready"] = bool(
+            data["instrument_connected"] and not data["is_error"] and data.get("is_idle")
+        )
+        data["ok"] = data["instrument_connected"]
+        data["ts"] = now_iso()
+        self._send(200 if data["ok"] else 503, data)
+
+    def _send_status(self):
+        with _monitor_lock:
+            snap = dict(_monitor)
+        self._send(200 if snap.get("connected") else 503, snap)
+
+    def _send_protocols(self, w):
+        protos = w.call(op_protocols("refresh=1" in self.path), timeout=40)
+        q = self._query().get("q")
+        if q:
+            ql = unquote(q).lower()
+            protos = [p for p in protos if ql in p["name"].lower()]
+        self._send(200, {"count": len(protos), "protocols": protos})
 
     def _job_csv(self, wells):
         q = self._query()
@@ -1582,27 +1600,29 @@ class Handler(BaseHTTPRequestHandler):
                 match[0] if match else {"error": "no such job", "job": parts[1]},
             )
         elif len(parts) == 3 and parts[2] in ("results", "export"):
-            q = self._query()
-            shape = "grid" if q.get("format") == "grid" else q.get("shape", "list")
-            value = q.get("value", "od")
-            dedup = q.get("dedup", "1") != "0"
-            export = parts[2] == "export"
-            wells_raw = w.call(op_job_results(parts[1]), timeout=40)
-            if not dedup:  # full raw rows (all ResultType rows + meas fields)
-                if export:
-                    self._send_csv(200, self._job_csv(wells_raw))
-                else:
-                    self._send(
-                        200, {"assay_id": parts[1], "count": len(wells_raw), "wells": wells_raw}
-                    )
-                return
-            out = _format_results(wells_raw, "persisted", shape=shape, value=value, dedup=True)
-            out["assay_id"] = parts[1]
-            self._send_results(out, export, shape, value)
+            self._get_job_results(parts[1], parts[2] == "export")
         else:
             self._send(
                 404, {"error": "not_found", "hint": "see GET /docs", "path": "/" + "/".join(parts)}
             )
+
+    def _get_job_results(self, assay_id, export):
+        """Serve persisted job results as JSON or CSV."""
+        w = self.server.worker
+        q = self._query()
+        shape = "grid" if q.get("format") == "grid" else q.get("shape", "list")
+        value = q.get("value", "od")
+        dedup = q.get("dedup", "1") != "0"
+        wells_raw = w.call(op_job_results(assay_id), timeout=40)
+        if not dedup:  # full raw rows (all ResultType rows + meas fields)
+            if export:
+                self._send_csv(200, self._job_csv(wells_raw))
+            else:
+                self._send(200, {"assay_id": assay_id, "count": len(wells_raw), "wells": wells_raw})
+            return
+        out = _format_results(wells_raw, "persisted", shape=shape, value=value, dedup=True)
+        out["assay_id"] = assay_id
+        self._send_results(out, export, shape, value)
 
     def _get_runs(self, parts):
         if parts == ["runs"]:
@@ -1684,28 +1704,46 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         parts = path.strip("/").split("/")
         try:
-            if path in ("/", "/docs"):
-                self._send(200, _DOCS)
-            elif path in ("/health", "/status", "/monitor", "/instrument", "/protocols"):
-                self._get_simple(path)
-            elif parts[0] == "protocols" and len(parts) == 2:
-                self._send(200, _resolve_protocol(unquote(parts[1]), self.server.worker))
-            elif parts[0] == "jobs":
-                self._get_jobs(parts)
-            elif parts[0] == "runs":
-                self._get_runs(parts)
-            elif parts[0] == "mdb" and parts[1] == "groups":
-                self._mdb_get_group()
-            elif parts[0] == "mdb" and parts[1] == "protocols" and len(parts) == 2:
-                self._mdb_find_protocol()
-            elif parts[0] == "mdb" and parts[1] == "protocols" and len(parts) == 3:
-                self._mdb_get_protocol(parts[2])
-            elif parts[0] == "mdb" and len(parts) == 2 and parts[1] == "max-protocol-id":
-                self._mdb_get_max_id()
-            else:
-                self._send(404, {"error": "not_found", "hint": "see GET /docs", "path": path})
+            self._route_get(path, parts)
         except Exception as exc:  # noqa: BLE001
             self._com_error(exc)
+
+    def _route_get(self, path, parts):
+        """Dispatch a GET request to the appropriate handler."""
+        if path in ("/", "/docs"):
+            self._send(200, _DOCS)
+        elif path in ("/health", "/status", "/monitor", "/instrument", "/protocols"):
+            self._get_simple(path)
+        elif parts[0] == "protocols" and len(parts) == 2:
+            self._send(200, _resolve_protocol(unquote(parts[1]), self.server.worker))
+        elif parts[0] == "jobs":
+            self._get_jobs(parts)
+        elif parts[0] == "runs":
+            self._get_runs(parts)
+        elif parts[0] == "mdb":
+            self._route_mdb(parts)
+        else:
+            self._send(404, {"error": "not_found", "hint": "see GET /docs", "path": path})
+
+    def _route_mdb(self, parts):
+        """Dispatch /mdb/* GET requests."""
+        if parts[1] == "groups":
+            self._mdb_get_group()
+        elif parts[1] == "protocols" and len(parts) == 2:
+            self._mdb_find_protocol()
+        elif parts[1] == "protocols" and len(parts) == 3:
+            self._mdb_get_protocol(parts[2])
+        elif len(parts) == 2 and parts[1] == "max-protocol-id":
+            self._mdb_get_max_id()
+        else:
+            self._send(
+                404,
+                {
+                    "error": "not_found",
+                    "hint": "see GET /docs",
+                    "path": "/mdb/" + "/".join(parts[1:]),
+                },
+            )
 
     def _begin_run(self, proto_spec, dry=False, plate_id=None):
         """Resolve the protocol (name or id), start the run, return
