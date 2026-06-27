@@ -869,6 +869,220 @@ def _latest_assay_for(protocol_id, worker):
 
 
 # --------------------------------------------------------------------------
+# MDB write operations (Stage 5: generated-protocol support).
+#
+# These endpoints expose raw MDB (Jet database) operations that the bridge's
+# GeneratedProtocolManager calls via RemoteMdbClient. All write operations
+# (backup, insert, delete) are guarded by _mdb_write_lock.
+#
+# Feature flag: WALLAC_ENABLE_PROTOCOL_AUTHORING=true must be set for any
+# write operation. Read operations (GET) are always allowed.
+# --------------------------------------------------------------------------
+
+_mdb_write_lock = threading.Lock()
+ENV_ENABLE_AUTHORING = "WALLAC_ENABLE_PROTOCOL_AUTHORING"
+MDB_BACKUP_DIR = r"C:\Users\Public\mdb_backups"
+
+# Known AssayProtocol columns for insert (extra keys in the dict are ignored).
+_ASSAY_PROTOCOL_COLUMNS = frozenset(
+    {
+        "AssayProtID",
+        "ProtName",
+        "ProtNumber",
+        "ProtVersion",
+        "FactoryPreset",
+        "ProtGroup",
+    }
+)
+
+
+def _is_authoring_enabled():
+    return os.environ.get(ENV_ENABLE_AUTHORING, "").lower() == "true"
+
+
+def _check_authoring():
+    if not _is_authoring_enabled():
+        raise ApiError(
+            403,
+            "authoring_disabled",
+            "set env " + ENV_ENABLE_AUTHORING + "=true on the vm-agent to enable",
+        )
+
+
+def _open_mdb_r():
+    """Open MDB read-only (falls back to copy if locked)."""
+    import comtypes.client
+
+    eng = comtypes.client.CreateObject("DAO.DBEngine.36")
+    try:
+        return eng.OpenDatabase(MDB_SRC, False, True)
+    except Exception:
+        shutil.copy(MDB_SRC, MDB_COPY)
+        return eng.OpenDatabase(MDB_COPY, False, True)
+
+
+def _open_mdb_w():
+    """Open MDB for writing (read-only=False)."""
+    import comtypes.client
+
+    eng = comtypes.client.CreateObject("DAO.DBEngine.36")
+    return eng.OpenDatabase(MDB_SRC, False, False)
+
+
+def _rs_to_dict(rs):
+    """Convert a DAO recordset current row to a dict."""
+    row = {}
+    for i in range(rs.Fields.Count):
+        f = rs.Fields.Item(i)
+        row[f.Name] = f.Value
+    return row
+
+
+def _rs_to_dicts(rs):
+    """Convert an entire DAO recordset to a list of dicts."""
+    rows = []
+    while not rs.EOF:
+        rows.append(_rs_to_dict(rs))
+        rs.MoveNext()
+    return rows
+
+
+def op_mdb_get_group_id(group_name):
+    def _op(_srv):
+        db = _open_mdb_r()
+        try:
+            rs = db.OpenRecordset(
+                "SELECT GroupID FROM ProtocolGroup WHERE GroupName = '"
+                + group_name.replace("'", "''")
+                + "'"
+            )
+            if rs.EOF:
+                return None
+            gid = int(rs.Fields("GroupID").Value)
+            rs.Close()
+            return gid
+        finally:
+            db.Close()
+
+    return _op
+
+
+def op_mdb_get_protocol(assay_prot_id):
+    def _op(_srv):
+        db = _open_mdb_r()
+        try:
+            rs = db.OpenRecordset(
+                "SELECT * FROM AssayProtocol WHERE AssayProtID = " + str(int(assay_prot_id))
+            )
+            if rs.EOF:
+                return None
+            row = _rs_to_dict(rs)
+            rs.Close()
+            return row
+        finally:
+            db.Close()
+
+    return _op
+
+
+def op_mdb_find_protocol_by_name(name):
+    def _op(_srv):
+        db = _open_mdb_r()
+        try:
+            rs = db.OpenRecordset(
+                "SELECT * FROM AssayProtocol WHERE ProtName = '" + name.replace("'", "''") + "'"
+            )
+            if rs.EOF:
+                return None
+            row = _rs_to_dict(rs)
+            rs.Close()
+            return row
+        finally:
+            db.Close()
+
+    return _op
+
+
+def op_mdb_get_max_protocol_id():
+    def _op(_srv):
+        db = _open_mdb_r()
+        try:
+            rs = db.OpenRecordset("SELECT MAX(AssayProtID) AS MaxID FROM AssayProtocol")
+            if rs.EOF:
+                return 0
+            val = rs.Fields("MaxID").Value
+            rs.Close()
+            return int(val) if val is not None else 0
+        finally:
+            db.Close()
+
+    return _op
+
+
+def op_mdb_insert_protocol(protocol_row):
+    def _op(_srv):
+        db = _open_mdb_w()
+        try:
+            rs = db.OpenRecordset("AssayProtocol", 2)  # dbOpenDynaset
+            rs.AddNew()
+            for key, val in protocol_row.items():
+                if key in _ASSAY_PROTOCOL_COLUMNS:
+                    # DAO expects ints for bool fields
+                    if isinstance(val, bool):
+                        val = -1 if val else 0
+                    rs.Fields(key).Value = val
+            rs.Update()
+            rs.Close()
+            return int(protocol_row["AssayProtID"])
+        finally:
+            db.Close()
+
+    return _op
+
+
+def op_mdb_delete_protocol(assay_prot_id):
+    def _op(_srv):
+        db = _open_mdb_w()
+        try:
+            db.Execute("DELETE FROM AssayProtocol WHERE AssayProtID = " + str(int(assay_prot_id)))
+            return True
+        except Exception:
+            return False
+        finally:
+            db.Close()
+
+    return _op
+
+
+def op_mdb_backup(name):
+    def _op(_srv):
+        if not os.path.exists(MDB_BACKUP_DIR):
+            os.makedirs(MDB_BACKUP_DIR)
+        backup_path = os.path.join(MDB_BACKUP_DIR, name)
+        shutil.copy2(MDB_SRC, backup_path)
+        return backup_path
+
+    return _op
+
+
+def op_mdb_query(sql):
+    def _op(_srv):
+        stripped = sql.strip().upper()
+        if not stripped.startswith("SELECT"):
+            raise ApiError(400, "invalid_query", "only SELECT queries are allowed")
+        db = _open_mdb_r()
+        try:
+            rs = db.OpenRecordset(sql)
+            rows = _rs_to_dicts(rs)
+            rs.Close()
+            return rows
+        finally:
+            db.Close()
+
+    return _op
+
+
+# --------------------------------------------------------------------------
 # HTTP layer.
 # --------------------------------------------------------------------------
 _DOCS = {
@@ -928,6 +1142,50 @@ _DOCS = {
         {"method": "GET", "path": "/jobs", "desc": "saved measurement history"},
         {"method": "GET", "path": "/jobs/<assay_id>/results", "desc": "persisted per-well results"},
         {"method": "POST", "path": "/admin/reconnect", "desc": "drop + recreate the COM link"},
+        # --- MDB generated-protocol endpoints (Stage 5) ---
+        {
+            "method": "GET",
+            "path": "/mdb/groups?name=<name>",
+            "desc": "get ProtocolGroup ID by name (read-only)",
+        },
+        {
+            "method": "GET",
+            "path": "/mdb/protocols/<id>",
+            "desc": "get full AssayProtocol row by AssayProtID (read-only)",
+        },
+        {
+            "method": "GET",
+            "path": "/mdb/protocols?name=<name>",
+            "desc": "find AssayProtocol by exact ProtName (read-only)",
+        },
+        {
+            "method": "GET",
+            "path": "/mdb/max-protocol-id",
+            "desc": "highest AssayProtID in the MDB (read-only)",
+        },
+        {
+            "method": "POST",
+            "path": "/mdb/protocols",
+            "desc": "insert a new AssayProtocol row (requires authoring flag)",
+            "body": {"AssayProtID": 2000001, "ProtName": "ELAB-Job-1-abc12345", "...": "..."},
+        },
+        {
+            "method": "DELETE",
+            "path": "/mdb/protocols/<id>",
+            "desc": "delete an AssayProtocol by ID (requires authoring flag)",
+        },
+        {
+            "method": "POST",
+            "path": "/mdb/backup",
+            "desc": "create a timestamped MDB backup (requires authoring flag)",
+            "body": {"name": "mlr3_backup_1_1719400000.mdb"},
+        },
+        {
+            "method": "POST",
+            "path": "/mdb/query",
+            "desc": "execute a SELECT query (read-only)",
+            "body": {"sql": "SELECT * FROM AssayProtocol WHERE FactoryPreset = False"},
+        },
     ],
 }
 
@@ -1021,6 +1279,94 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(exc, ApiError):
             body["trace"] = traceback.format_exc()
         self._send(err.status, body)
+
+    # --- MDB generated-protocol handlers (Stage 5) ---
+
+    def _mdb_get_group(self):
+        q = self._query()
+        name = q.get("name", "")
+        if not name:
+            self._send(400, {"error": "name_required", "hint": "provide ?name=<GroupName>"})
+            return
+        gid = self.server.worker.call(op_mdb_get_group_id(unquote(name)), timeout=40)
+        if gid is None:
+            self._send(404, {"error": "group_not_found", "name": name})
+        else:
+            self._send(200, {"group_id": gid, "name": name})
+
+    def _mdb_get_protocol(self, assay_prot_id):
+        try:
+            pid = int(assay_prot_id)
+        except ValueError:
+            self._send(400, {"error": "invalid_id", "hint": "AssayProtID must be an integer"})
+            return
+        row = self.server.worker.call(op_mdb_get_protocol(pid), timeout=40)
+        if row is None:
+            self._send(404, {"error": "protocol_not_found", "assay_prot_id": pid})
+        else:
+            self._send(200, row)
+
+    def _mdb_find_protocol(self):
+        q = self._query()
+        name = q.get("name", "")
+        if not name:
+            self._send(400, {"error": "name_required", "hint": "provide ?name=<ProtName>"})
+            return
+        row = self.server.worker.call(op_mdb_find_protocol_by_name(unquote(name)), timeout=40)
+        if row is None:
+            self._send(404, {"error": "protocol_not_found", "name": name})
+        else:
+            self._send(200, row)
+
+    def _mdb_get_max_id(self):
+        max_id = self.server.worker.call(op_mdb_get_max_protocol_id(), timeout=40)
+        self._send(200, {"max_assay_prot_id": max_id})
+
+    def _mdb_insert_protocol(self):
+        _check_authoring()
+        body = self._read_json()
+        if "AssayProtID" not in body or "ProtName" not in body:
+            self._send(
+                400, {"error": "missing_fields", "hint": "AssayProtID and ProtName are required"}
+            )
+            return
+        with _mdb_write_lock:
+            new_id = self.server.worker.call(op_mdb_insert_protocol(body), timeout=60)
+        self._send(201, {"assay_prot_id": new_id, "created": True})
+
+    def _mdb_delete_protocol(self, assay_prot_id):
+        _check_authoring()
+        try:
+            pid = int(assay_prot_id)
+        except ValueError:
+            self._send(400, {"error": "invalid_id", "hint": "AssayProtID must be an integer"})
+            return
+        with _mdb_write_lock:
+            deleted = self.server.worker.call(op_mdb_delete_protocol(pid), timeout=60)
+        if deleted:
+            self._send(200, {"assay_prot_id": pid, "deleted": True})
+        else:
+            self._send(404, {"error": "delete_failed", "assay_prot_id": pid})
+
+    def _mdb_backup(self):
+        _check_authoring()
+        body = self._read_json()
+        name = body.get("name", "")
+        if not name:
+            self._send(400, {"error": "name_required", "hint": "provide a backup filename"})
+            return
+        with _mdb_write_lock:
+            backup_path = self.server.worker.call(op_mdb_backup(name), timeout=60)
+        self._send(200, {"backup_path": backup_path, "created": True})
+
+    def _mdb_query(self):
+        body = self._read_json()
+        sql = body.get("sql", "")
+        if not sql:
+            self._send(400, {"error": "sql_required", "hint": "provide a SELECT query"})
+            return
+        rows = self.server.worker.call(op_mdb_query(sql), timeout=40)
+        self._send(200, {"count": len(rows), "rows": rows})
 
     def _get_simple(self, path):
         w = self.server.worker
@@ -1194,6 +1540,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._get_jobs(parts)
             elif parts[0] == "runs":
                 self._get_runs(parts)
+            elif parts[0] == "mdb" and parts[1] == "groups":
+                self._mdb_get_group()
+            elif parts[0] == "mdb" and parts[1] == "protocols" and len(parts) == 2:
+                self._mdb_find_protocol()
+            elif parts[0] == "mdb" and parts[1] == "protocols" and len(parts) == 3:
+                self._mdb_get_protocol(parts[2])
+            elif parts[0] == "mdb" and len(parts) == 2 and parts[1] == "max-protocol-id":
+                self._mdb_get_max_id()
             else:
                 self._send(404, {"error": "not_found", "hint": "see GET /docs", "path": path})
         except Exception as exc:  # noqa: BLE001
@@ -1371,6 +1725,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._post_abort(parts[1])
             elif path == "/admin/reconnect":
                 self._send(200, self.server.worker.reconnect())
+            elif path == "/mdb/protocols":
+                self._mdb_insert_protocol()
+            elif path == "/mdb/backup":
+                self._mdb_backup()
+            elif path == "/mdb/query":
+                self._mdb_query()
             else:
                 self._send(404, {"error": "not_found", "hint": "see GET /docs", "path": path})
         except Exception as exc:  # noqa: BLE001
@@ -1387,6 +1747,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if len(parts) == 2 and parts[0] == "runs":
                 self._delete_run(parts[1])
+            elif len(parts) == 3 and parts[0] == "mdb" and parts[1] == "protocols":
+                self._mdb_delete_protocol(parts[2])
             else:
                 self._send(404, {"error": "not_found", "hint": "see GET /docs", "path": path})
         except Exception as exc:  # noqa: BLE001
