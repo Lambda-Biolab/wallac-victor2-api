@@ -6,7 +6,8 @@ GATED := vm-agent/agent.py vm-agent/lid_watcher.py vm-agent/launch_as_user.py \
          bridge/writeback.py bridge/dashboard.py bridge/config.py bridge/secrets_check.py \
          bridge/canonical.py bridge/schemas.py bridge/designer.py bridge/designer_app.py \
          bridge/validation.py bridge/generated_protocols.py bridge/analysis.py \
-         bridge/vm_agent_client.py bridge/spool.py bridge/execution.py
+         bridge/vm_agent_client.py bridge/spool.py bridge/execution.py \
+         bridge/jobs.py bridge/bridge_app.py
 
 .PHONY: validate format test complexity setup_dev
 
