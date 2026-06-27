@@ -273,7 +273,7 @@ def test_config_defaults():
     assert config.dashboard_host == "0.0.0.0"
     assert config.dashboard_port == DEFAULT_DASHBOARD_PORT
     assert config.bridge_identity == "wallac-bridge"
-    assert config.elabftw_category == 9
+    assert config.elabftw_category == 21  # items_categories ID, not items_types
 
 
 def test_live_monitor_url_base():

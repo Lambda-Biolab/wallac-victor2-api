@@ -392,10 +392,11 @@ class ElabftwClient:
     def link_experiment_to_item(self, experiment_id: int, item_id: int) -> None:
         """Create a link from an experiment to an item (eLabFTW link).
 
-        Uses the experiments/{id}/items_links endpoint.
+        Uses the experiments/{id}/items_links/{item_id} endpoint.
+        The item_id goes in the URL path, not the body.
         """
         self._request(
             "POST",
-            f"/experiments/{experiment_id}/items_links",
-            body={"item_id": item_id},
+            f"/experiments/{experiment_id}/items_links/{item_id}",
+            body={},
         )
