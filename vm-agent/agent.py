@@ -1119,7 +1119,9 @@ def op_mdb_insert_protocol(protocol_row):
                 if not rs.EOF:
                     rs.Edit()
                     for key, val in binary_fields.items():
-                        # comtypes returns PlateMap as a tuple of ints;
+                        if val is None:
+                            continue  # Skip NULL binary fields
+                        # comtypes returns OLE Object fields as tuples of ints;
                         # DAO AppendChunk accepts array.array('B', ...) only.
                         if not isinstance(val, _array.array):
                             val = _array.array("B", list(val))
