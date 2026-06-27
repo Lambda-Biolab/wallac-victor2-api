@@ -1117,21 +1117,20 @@ def op_mdb_ensure_group(group_name, group_id):
         finally:
             db.Close()
 
-        # Insert new group
+        # Insert new group via SQL INSERT (more reliable than AddNew for Jet)
         db = _open_mdb_w()
         try:
-            rs = db.OpenRecordset("ProtocolGroup", 2)
-            rs.AddNew()
-            rs.Fields("GroupID").Value = int(group_id)
-            rs.Fields("GroupName").Value = group_name
-            rs.Fields("LeftMostChild").Value = 0
-            rs.Fields("RightSibling").Value = 0
-            rs.Fields("Parent").Value = 1  # child of "Protocols" (GroupID=1)
-            rs.Fields("FactoryPreset").Value = 0  # Jet boolean: 0=False, -1=True
-            rs.Fields("UserLevel").Value = 1
-            rs.Fields("Notes").Value = "eLabFTW generated protocols"
-            rs.Update()
-            rs.Close()
+            sql = (
+                "INSERT INTO ProtocolGroup (GroupID, GroupName, LeftMostChild, "
+                "RightSibling, Parent, FactoryPreset, UserLevel, Notes) "
+                "VALUES ("
+                + str(int(group_id))
+                + ", '"
+                + group_name.replace("'", "''")
+                + "', 0, 0, 1, 0, 1, "
+                "'eLabFTW generated protocols')"
+            )
+            db.Execute(sql)
             return int(group_id)
         finally:
             db.Close()
