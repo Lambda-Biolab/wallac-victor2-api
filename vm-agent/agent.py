@@ -892,6 +892,34 @@ _ASSAY_PROTOCOL_COLUMNS = frozenset(
         "ProtVersion",
         "FactoryPreset",
         "ProtGroup",
+        "MeasSequence",
+        "MeasHeight",
+        "PlateTypeID",
+        "RepCount",
+        "RepDelta",
+        "PlateMap",
+        "MeasurementMode",
+        "PlateHeating",
+        "Temperature",
+        "PrnOutput",
+        "PrnOutputFormat",
+        "PrnOutputWhen",
+        "FileOutput",
+        "FileOutputWhen",
+        "FileOutputType",
+        "FileOutputOptions",
+        "ApplOutput",
+        "ApplOutputArg",
+        "EditPassword",
+        "Notes",
+        "AssayBeginMacro",
+        "AssayEndMacro",
+        "PlateBeginMacro",
+        "PlateEndMacro",
+        "RepeatBeginMacro",
+        "RepeatEndMacro",
+        "ResultMacro",
+        "NormalizationInfo",
     }
 )
 
@@ -1034,37 +1062,68 @@ def op_mdb_get_max_protocol_id():
 
 
 def op_mdb_insert_protocol(protocol_row):
+    """Insert a new AssayProtocol row.
+
+    Uses SQL INSERT for text/numeric columns, then DAO Edit/Update for
+    binary columns (PlateMap) that can't go through SQL.
+    """
+    # Columns that are binary/OLE Object and need DAO Edit/Update
+    _BINARY_COLS = frozenset({"PlateMap"})
+
     def _op(_srv):
         db = _open_mdb_w()
         try:
-            # Build SQL INSERT (more reliable than AddNew for Jet/comtypes).
-            # Only insert columns that are in _ASSAY_PROTOCOL_COLUMNS and present
-            # in the protocol_row dict.
-            cols = []
-            vals = []
+            # Step 1: SQL INSERT for non-binary columns
+            sql_cols = []
+            sql_vals = []
+            binary_fields = {}
             for key in _ASSAY_PROTOCOL_COLUMNS:
                 if key not in protocol_row:
                     continue
                 val = protocol_row[key]
                 if isinstance(val, bool):
                     val = -1 if val else 0
-                cols.append(key)
+                if key in _BINARY_COLS:
+                    # Defer binary fields to DAO Edit/Update
+                    binary_fields[key] = val
+                    continue
+                sql_cols.append(key)
                 if isinstance(val, (int, float)):
-                    vals.append(str(val))
+                    sql_vals.append(str(val))
+                elif val is None:
+                    sql_vals.append("NULL")
                 else:
-                    # String value — escape single quotes for SQL safety
-                    vals.append("'" + str(val).replace("'", "''") + "'")
-            if not cols:
-                raise RuntimeError("no valid columns to insert")
+                    sql_vals.append("'" + str(val).replace("'", "''") + "'")
+
+            if not sql_cols:
+                raise RuntimeError("no valid non-binary columns to insert")
 
             sql = (
                 "INSERT INTO AssayProtocol ("
-                + ", ".join(cols)
+                + ", ".join(sql_cols)
                 + ") VALUES ("
-                + ", ".join(vals)
+                + ", ".join(sql_vals)
                 + ")"
             )
             db.Execute(sql)
+
+            # Step 2: DAO Edit/Update for binary fields (PlateMap)
+            if binary_fields:
+                new_id = int(protocol_row["AssayProtID"])
+                rs = db.OpenRecordset(
+                    "SELECT * FROM AssayProtocol WHERE AssayProtID = " + str(new_id),
+                    2,  # dbOpenDynaset
+                )
+                if not rs.EOF:
+                    rs.Edit()
+                    for key, val in binary_fields.items():
+                        if isinstance(val, list):
+                            # Byte array as list of ints -> convert to bytes
+                            val = bytes(val)
+                        rs.Fields(key).Value = val
+                    rs.Update()
+                rs.Close()
+
             return int(protocol_row["AssayProtID"])
         finally:
             db.Close()
