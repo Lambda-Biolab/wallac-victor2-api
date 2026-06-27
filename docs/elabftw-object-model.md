@@ -160,7 +160,12 @@ eligibility immediately before MDB generation and again before run start.
 
 ## Signing and authorization
 
-Required signatures before generated-protocol execution:
+Signing is for **audit trail and provenance**, not a runtime gate. In the
+direct-submit model, the Run Builder submits jobs directly to the bridge via
+`POST /jobs` with references to signed specs. The bridge validates signed specs
+before execution, but signing does not block submission.
+
+Required signatures for generated-protocol execution:
 
 1. Method
 2. reusable Plate Layout (if used)
@@ -178,7 +183,6 @@ Signing order:
 4. Create Automation Job referencing exact signed object IDs and hashes.
 5. Include one-off layout hash/attachment directly in `job.json` when applicable.
 6. Require the Automation Job signature last.
-7. Require explicit submit/request execution after signature.
 
 Signature validity is necessary but not sufficient. The bridge must also check
 signer identity against a static configured authorized-signer allowlist for v1.
@@ -274,13 +278,16 @@ category/template. The schemas include:
 
 ### Automation Job metadata
 
-Extends the existing Automation Job schema with generated-authoring fields:
+In the direct-submit model, the Automation Job is an **archive and audit record**,
+not a runtime queue item. The bridge manages runtime state internally and writes
+results to an eLabFTW experiment. The metadata schema is simplified — no
+bridge-managed runtime fields:
 
 | Group | Field | Type | Owner | Description |
 |---|---|---|---|---|
 | Request | Automation service | select | operator | wallac_victor2 |
 | Request | Execution mode | select | operator | generated_protocol, existing_protocol |
-| Request | Linked experiment ID | text | operator | eLabFTW experiment ID |
+| Request | Linked experiment ID | text | operator | eLabFTW experiment ID (where results were written) |
 | Request | Protocol name | text | operator | existing_protocol: Wallac protocol name/id |
 | Request | Method reference | text | operator | generated_protocol: signed Method resource ID |
 | Request | Method hash | text | operator | generated_protocol: signed Method hash |
@@ -289,34 +296,49 @@ Extends the existing Automation Job schema with generated-authoring fields:
 | Request | Analysis reference | text | operator | generated_protocol: signed Analysis Plan resource ID |
 | Request | Analysis hash | text | operator | generated_protocol: signed Analysis Plan hash |
 | Request | Expected outputs | text | operator | Expected measurement outputs |
-| Request | Requested action | select | operator | none, submit, abort |
 | Bundle | Job JSON attachment ID | text | bridge | eLabFTW upload ID of `job.json` |
 | Bundle | Job hash | text | bridge | SHA-256 of canonical `job.json` |
 | Bundle | Generated AssayProtID | text | bridge | Generated MDB protocol ID |
 | Bundle | MDB backup path | text | bridge | Timestamped backup path |
 | Bundle | Validation report | url | bridge | Link to validation report |
-| State | Automation state | select | bridge | Full lifecycle (see below) |
-| State | Claimed by | text | bridge | Bridge instance ID |
-| State | Claimed at | datetime-local | bridge | Claim timestamp |
-| State | Last heartbeat | datetime-local | bridge | Heartbeat timestamp |
 | Wallac | Wallac run ID | text | bridge | Instrument run identifier |
 | Wallac | Device identity | text | bridge | Device name/version |
 | Wallac | Live Monitor | url | bridge | Dashboard URL |
-| Progress | Progress percent | number | bridge | 0-100 |
-| Progress | Current step | text | bridge | Current step description |
 | Results | Final state | select | bridge | completed, failed, aborted, unknown_requires_operator_review |
 | Results | Result summary | text | bridge | Summary of measurement results |
 | Results | Artifact manifest | url | bridge | Link to result artifacts |
 | Errors | Last error code | text | bridge | Stable error code |
 | Errors | Operator hint | text | bridge | Human-readable hint |
 
+Removed fields (managed internally by the bridge, not in eLabFTW metadata):
+
+| Field | Reason |
+|---|---|
+| `Requested action` | Submit/abort are HTTP calls to the bridge, not eLabFTW metadata changes |
+| `Automation state` | Bridge tracks state in-memory |
+| `Claimed by` / `Claimed at` | Bridge doesn't claim — it receives |
+| `Last heartbeat` | Bridge health is independent of eLabFTW metadata |
+| `Progress percent` / `Current step` | Progress is reported via the bridge HTTP API and dashboard, not eLabFTW |
+
 ### Automation Job lifecycle states
 
+In the direct-submit model, the bridge manages runtime state internally.
+eLabFTW records only the terminal outcome and result summary. The simplified
+state set is:
+
 ```
-draft → requested → accepted | rejected → queued → validating → ready →
-running → abort_requested → aborting → aborted | failed → results_ready →
-results_uploaded → completed → unknown_requires_operator_review
+accepted → running → completed | failed | aborted → unknown_requires_operator_review
 ```
+
+- `accepted` — job received and queued
+- `running` — execution in progress
+- `completed` — execution succeeded, results written to experiment
+- `failed` — execution failed before instrument work
+- `aborted` — execution halted by operator
+- `unknown_requires_operator_review` — ambiguous state after restart or partial failure
+
+States are tracked by the bridge in-memory and reconciled with the eLabFTW
+experiment record (not the Automation Job resource metadata) for audit.
 
 ## Generated MDB protocol model
 
@@ -332,8 +354,9 @@ back on the Automation Job.
 ## See also
 
 - `docs/plans/wallac-protocol-authoring.md` — full 7-stage implementation plan
-- `docs/api-reference.md` — vm-agent REST API
+- `docs/api-reference.md` — vm-agent REST API, bridge HTTP API (POST /jobs, GET /jobs, GET /jobs/{id}, POST /jobs/{id}/abort, GET /health)
 - `docs/auth-secrets-policy.md` — auth and secrets policy
 - `docs/abort-recovery.md` — abort and recovery semantics
+- `docs/architecture-direct-submit.md` — architecture decision for direct-submit model
 - eLabFTW repo: `docs/wallac-plate-reader-integration.md` — ELN-facing workflow
 - eLabFTW repo: `tools/elab-seed/seed_wallac.py` — template seeder

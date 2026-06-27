@@ -11,16 +11,18 @@ access controls, and network assumptions for the Wallac bridge.
 ## Service identity
 
 The Wallac bridge uses a **dedicated eLabFTW API key** — never a shared human
-admin key.  The key has minimum permissions to:
+admin key.  In the direct-submit model, the key is used for **write-back only**
+(creating experiments, uploading results). The key has minimum permissions to:
 
-- Read Automation Job resources (items in the Automation Job category)
 - Read uploads (signature archives)
 - Write metadata fields (state, progress, results, errors)
 - Upload result artifacts
 - Post comments (event log)
+- Create experiments from the Wallac Victor2 Assay template
 
-The key does **not** have admin privileges, user management, or system config
-access.  It is scoped to the Automation Job category and linked experiments.
+The bridge does **not** need the key for polling — jobs arrive via the bridge
+HTTP API (`POST /jobs`), not via eLabFTW Automation Job resources. The key does
+**not** have admin privileges, user management, or system config access.
 
 ### Creating the service key
 
@@ -36,7 +38,7 @@ committed to the repository, stored in config files, or written to logs.
 
 | Variable | Purpose | Required |
 |---|---|---|
-| `WALLAC_ELABFTW_API_KEY` | eLabFTW service API key | **yes** |
+| `WALLAC_ELABFTW_API_KEY` | eLabFTW service API key (write-back only) | **yes** |
 | `WALLAC_ELABFTW_URL` | eLabFTW base URL | no (default: `https://localhost:3148`) |
 | `WALLAC_ELABFTW_CATEGORY` | Automation Job category ID | no (default: 9) |
 | `WALLAC_VM_AGENT_URL` | vm-agent REST API URL | no (default: `http://192.168.122.203:8420`) |
@@ -44,8 +46,13 @@ committed to the repository, stored in config files, or written to logs.
 | `WALLAC_DASHBOARD_TOKEN` | Dashboard session token | no (if unset, dashboard is open on LAN) |
 | `WALLAC_DASHBOARD_HOST` | Dashboard bind address | no (default: `0.0.0.0`) |
 | `WALLAC_DASHBOARD_PORT` | Dashboard port | no (default: 8421) |
-| `WALLAC_BRIDGE_IDENTITY` | Bridge instance name (for "Claimed by") | no (default: `wallac-bridge`) |
 | `WALLAC_DEVICE_IDENTITY` | Device identity string | no (default: `victor2-unknown`) |
+
+Removed variables (no longer needed in direct-submit model):
+
+| Variable | Reason |
+|---|---|
+| `WALLAC_BRIDGE_IDENTITY` | No claiming — jobs are received, not claimed |
 
 ### Key storage
 
@@ -62,15 +69,15 @@ committed to the repository, stored in config files, or written to logs.
 2. Generate a new key.
 3. Update the runtime environment variable.
 4. Restart the bridge service.
-5. Verify the bridge can poll eLabFTW and claim jobs.
+5. Verify the bridge can write results to eLabFTW experiments.
 
 ### Audit trail
 
 - eLabFTW logs all API key usage (who, when, what endpoint).
-- The bridge logs its own actions (claim, progress, write-back, abort) with
+- The bridge logs its own actions (submit, progress, write-back, abort) with
   timestamps and job IDs.
-- The dashboard's event log (eLabFTW comments) provides a durable audit
-  trail of job lifecycle events.
+- The bridge HTTP API event log provides a durable audit trail of job lifecycle
+  events.
 
 ## Dashboard access controls
 
@@ -126,4 +133,5 @@ in `tests/test_bridge_hardening.py` enforce this at CI time.
 - Config: `bridge/config.py` — `BridgeConfig.from_env()`
 - Secrets scan: `bridge/secrets_check.py` — `scan_for_secrets()`
 - Dashboard auth: `bridge/dashboard.py` — `DashboardHandler._authorized()`
+- Bridge HTTP API auth: bearer token in `WALLAC_DESIGNER_TOKEN` env var
 - Tests: `tests/test_bridge_hardening.py`
