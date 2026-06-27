@@ -1096,6 +1096,48 @@ def op_mdb_query(sql):
     return _op
 
 
+def op_mdb_ensure_group(group_name, group_id):
+    """Insert a ProtocolGroup row if it doesn't exist. Returns the GroupID."""
+
+    def _op(_srv):
+        # Check if it already exists (by name or ID)
+        db = _open_mdb_r()
+        try:
+            rs = db.OpenRecordset(
+                "SELECT GroupID FROM ProtocolGroup WHERE GroupName = '"
+                + group_name.replace("'", "''")
+                + "' OR GroupID = "
+                + str(int(group_id))
+            )
+            if not rs.EOF:
+                gid = int(rs.Fields("GroupID").Value)
+                rs.Close()
+                return gid  # already exists
+            rs.Close()
+        finally:
+            db.Close()
+
+        # Insert new group
+        db = _open_mdb_w()
+        try:
+            rs = db.OpenRecordset("ProtocolGroup", 2)
+            rs.AddNew()
+            rs.Fields("GroupID").Value = int(group_id)
+            rs.Fields("GroupName").Value = group_name
+            rs.Fields("LeftMostChild").Value = 0
+            rs.Fields("RightSibling").Value = 0
+            rs.Fields("Parent").Value = 1  # child of "Protocols" (GroupID=1)
+            rs.Fields("FactoryPreset").Value = False
+            rs.Fields("UserLevel").Value = 1
+            rs.Update()
+            rs.Close()
+            return int(group_id)
+        finally:
+            db.Close()
+
+    return _op
+
+
 # --------------------------------------------------------------------------
 # HTTP layer.
 # --------------------------------------------------------------------------
@@ -1199,6 +1241,12 @@ _DOCS = {
             "path": "/mdb/query",
             "desc": "execute a SELECT query (read-only)",
             "body": {"sql": "SELECT * FROM AssayProtocol WHERE FactoryPreset = False"},
+        },
+        {
+            "method": "POST",
+            "path": "/mdb/groups",
+            "desc": "create a ProtocolGroup if it doesn't exist (idempotent, requires authoring flag)",
+            "body": {"name": "eLabFTW Generated", "group_id": 10001},
         },
     ],
 }
@@ -1381,6 +1429,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         rows = self.server.worker.call(op_mdb_query(sql), timeout=40)
         self._send(200, {"count": len(rows), "rows": rows})
+
+    def _mdb_ensure_group(self):
+        _check_authoring()
+        body = self._read_json()
+        name = body.get("name", "")
+        group_id = body.get("group_id")
+        if not name or not group_id:
+            self._send(400, {"error": "missing_fields", "hint": "name and group_id are required"})
+            return
+        with _mdb_write_lock:
+            gid = self.server.worker.call(op_mdb_ensure_group(name, group_id), timeout=60)
+        self._send(200, {"group_id": gid, "name": name, "created": True})
 
     def _get_simple(self, path):
         w = self.server.worker
@@ -1745,6 +1805,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._mdb_backup()
             elif path == "/mdb/query":
                 self._mdb_query()
+            elif path == "/mdb/groups":
+                self._mdb_ensure_group()
             else:
                 self._send(404, {"error": "not_found", "hint": "see GET /docs", "path": path})
         except Exception as exc:  # noqa: BLE001
