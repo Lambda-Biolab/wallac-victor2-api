@@ -307,12 +307,23 @@ class ElabftwClient:
                 with contextlib.suppress(ValueError):
                     item_id = int(loc.rstrip("/").rsplit("/", 1)[-1])
             if item_id is not None:
-                # Set the category field so the item appears in the UI
-                self._request(
-                    "PATCH",
-                    f"/items/{item_id}",
-                    body={"category": category_id},
-                )
+                # Set the category field so the item appears in the UI.
+                # This is best-effort: if the PATCH fails (e.g., because the
+                # items_types ID doesn't map to an items_categories ID), the
+                # item is still created and functional — category is only
+                # for UI grouping.
+                try:
+                    self._request(
+                        "PATCH",
+                        f"/items/{item_id}",
+                        body={"category": category_id},
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to set category=%s on item %d (non-fatal)",
+                        category_id,
+                        item_id,
+                    )
                 return item_id
         raise RuntimeError(f"Could not parse new item ID from response: {result}")
 
