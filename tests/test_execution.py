@@ -483,50 +483,127 @@ class TestExecutionOrchestratorGeneratedProtocol:
         elabftw: MockElabftwClient,
         vm_agent: MockVmAgentClient,
     ) -> None:
-        # Set up job with generated_protocol mode
-        # The validation service needs the job to have the right metadata
+        """Full generated_protocol path with proper hash-verified attachments.
+
+        Creates a signed bundle of method.json, layout.json, analysis.json,
+        and job.json with real SHA-256 hashes, wires the mock to return the
+        right bytes for each download, and verifies the orchestrator loads
+        specs, generates a protocol, runs it, and writes back results.
+        """
+        from bridge.canonical import canonicalize_and_hash
+        from bridge.schemas import (
+            AnalysisSpec,
+            BlankSubtractionConfig,
+            LayoutSpec,
+            MethodSpec,
+            PhotometrySettings,
+            WellSpec,
+        )
+
+        # Build canonical specs with real hashes
+        method = MethodSpec(
+            name="OD600 Photometry",
+            mode="photometry",
+            plate_type="96-well",
+            photometry=PhotometrySettings(
+                filter_id="P610",
+                filter_name="610nm",
+                read_time_seconds=0.1,
+            ),
+        )
+        method_bytes, method_hash = canonicalize_and_hash(method.to_dict())
+
+        layout = LayoutSpec(
+            plate_type="96-well",
+            wells=[
+                WellSpec(well_name="A1", role="measured"),
+                WellSpec(well_name="A2", role="measured"),
+            ],
+        )
+        layout_bytes, layout_hash = canonicalize_and_hash(layout.to_dict())
+
+        analysis = AnalysisSpec(
+            blank_subtraction=BlankSubtractionConfig(enabled=False),
+        )
+        analysis_bytes, analysis_hash = canonicalize_and_hash(analysis.to_dict())
+
+        # Build job spec referencing the method/layout/analysis
+        job_spec_dict = {
+            "schema_name": "wallac.job",
+            "schema_version": 1,
+            "execution_mode": "generated_protocol",
+            "method": {
+                "object_id": 42,
+                "hash": method_hash,
+                "json_attachment_id": 5001,
+            },
+            "layout": {
+                "source": "reusable",
+                "hash": layout_hash,
+                "json_attachment_id": 5002,
+                "object_id": 43,
+            },
+            "analysis": {
+                "object_id": 44,
+                "hash": analysis_hash,
+                "json_attachment_id": 5003,
+            },
+        }
+        job_bytes, job_hash = canonicalize_and_hash(job_spec_dict)
+
+        # Set up job item in eLabFTW with metadata
         elabftw.add_item(
             100,
             {
                 "Execution mode": {"value": "generated_protocol"},
-                "Job hash": {"value": "abc123"},
-                "Job JSON attachment ID": {"value": "5001"},
+                "Job hash": {"value": job_hash},
+                "Job JSON attachment ID": {"value": "5000"},
             },
         )
-        # Add the job.json attachment
-        elabftw._uploads[100] = [{"id": 5001, "real_name": "job.json"}]
+        # Set up method, layout, analysis items with lifecycle
+        for item_id in (42, 43, 44):
+            elabftw.add_item(
+                item_id,
+                {"Lifecycle state": {"value": "signed/active"}},
+            )
 
-        # We need to mock the download_upload to return the job spec
-        job_spec = {
-            "schema_name": "wallac.job",
-            "schema_version": 1,
-            "execution_mode": "generated_protocol",
-            "method": {"object_id": 10, "hash": "abc", "json_attachment_id": 5001},
-            "layout": {
-                "source": "reusable",
-                "hash": "def",
-                "json_attachment_id": 5002,
-                "object_id": 11,
-            },
-            "analysis": {"object_id": 12, "hash": "ghi", "json_attachment_id": 5003},
+        # Wire download_upload to return the right bytes per (item_id, upload_id)
+        upload_map: dict[tuple[int, int], bytes] = {
+            (100, 5000): job_bytes,
+            (42, 5001): method_bytes,
+            (43, 5002): layout_bytes,
+            (44, 5003): analysis_bytes,
         }
-        # Override download_upload to return our job spec
-        elabftw.download_upload = lambda item_id, upload_id: json.dumps(job_spec).encode()  # type: ignore
 
-        # Set up mock results
+        def _download(item_id: int, upload_id: int) -> bytes:
+            return upload_map.get((item_id, upload_id), b"{}")
+
+        elabftw.download_upload = _download  # type: ignore[method-assign]
+
+        # Set up mock results — 2 wells matching the layout
         vm_agent._run_results["r-000001"] = [
-            {"well_name": "A1", "primary_value": 0.5},
+            {"well_name": "A1", "primary_value": 0.5, "od": 0.5},
+            {"well_name": "A2", "primary_value": 0.6, "od": 0.6},
         ]
 
         result = orchestrator.execute_job(
             job_item_id=100,
             execution_mode="generated_protocol",
-            spec_dict=job_spec,
         )
 
-        # Should succeed (validation may fail due to missing referenced objects,
-        # but the orchestrator should handle it gracefully)
-        assert result.final_state in ("completed", "failed", "unknown_requires_operator_review")
+        assert result.success is True
+        assert result.final_state == "completed"
+        assert result.assay_prot_id >= 2000000  # generated ID namespace
+        # Artifacts should be uploaded
+        uploads = elabftw.list_uploads(100)
+        assert len(uploads) > 0  # raw_results.json at minimum
+        # Should have events for spec loading
+        event_names = [e["event"] for e in result.events]
+        assert "job_spec_loaded" in event_names
+        assert "method_spec_loaded" in event_names
+        assert "layout_spec_loaded" in event_names
+        assert "analysis_spec_loaded" in event_names
+        assert "protocol_generated" in event_names
 
 
 class TestExecutionOrchestratorSpool:

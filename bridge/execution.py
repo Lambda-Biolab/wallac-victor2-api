@@ -64,7 +64,11 @@ def now_iso() -> str:
 
 
 class ElabftwWritebackClient(Protocol):
-    """eLabFTW client methods needed for write-back."""
+    """eLabFTW client methods needed for execution and write-back."""
+
+    def get_item(self, item_id: int) -> dict[str, Any]: ...
+
+    def download_upload(self, item_id: int, upload_id: int) -> bytes: ...
 
     def patch_metadata(self, item_id: int, extra_fields: dict[str, Any]) -> None: ...
 
@@ -185,7 +189,10 @@ class ExecutionOrchestrator:
             job_item_id: eLabFTW Automation Job item ID.
             execution_mode: "generated_protocol" or "existing_protocol".
             protocol_name: Required for existing_protocol mode.
-            spec_dict: The parsed job spec (for generated_protocol mode).
+            spec_dict: The signed entity snapshot from the signature archive
+                       (used to detect existing_protocol fields). For
+                       generated_protocol, canonical JSON attachments are
+                       downloaded separately.
 
         Returns:
             ExecutionResult with all outcomes.
@@ -197,8 +204,18 @@ class ExecutionOrchestrator:
             if result.final_state:
                 return result
 
+            # For generated_protocol, download and parse the canonical JSON
+            # attachments (job.json, method.json, layout.json, analysis.json)
+            # so the orchestrator has the actual spec data, not just the
+            # signed entity snapshot.
+            parsed_specs: dict[str, Any] | None = None
+            if execution_mode == ExecutionMode.GENERATED_PROTOCOL.value:
+                parsed_specs = self._load_canonical_specs(job_item_id, result)
+                if result.final_state:
+                    return result  # spec loading failed
+
             assay_prot_id = self._prepare_protocol(
-                job_item_id, execution_mode, protocol_name, spec_dict, result
+                job_item_id, execution_mode, protocol_name, parsed_specs, result
             )
 
             self._start_and_poll(job_item_id, execution_mode, assay_prot_id, protocol_name, result)
@@ -207,7 +224,7 @@ class ExecutionOrchestrator:
                 return result
 
             raw_wells = self._retrieve_results(job_item_id, result.run_id, result)
-            self._check_and_analyze(job_item_id, execution_mode, spec_dict, raw_wells, result)
+            self._check_and_analyze(job_item_id, execution_mode, parsed_specs, raw_wells, result)
 
             self._write_progress(job_item_id, 90, "Uploading artifacts")
             self._upload_or_spool(job_item_id, result.run_id, assay_prot_id, raw_wells, result)
@@ -260,7 +277,7 @@ class ExecutionOrchestrator:
         job_item_id: int,
         execution_mode: str,
         protocol_name: str,
-        spec_dict: dict[str, Any] | None,
+        parsed_specs: dict[str, Any] | None,
         result: ExecutionResult,
     ) -> int:
         """Step 2: Generate MDB protocol or validate existing protocol name."""
@@ -273,10 +290,10 @@ class ExecutionOrchestrator:
             result.add_event("protocol_generation_started")
             self._write_state(job_item_id, "ready")
 
-            mode = self._extract_mode(spec_dict)
-            spec_hash = self._extract_hash(spec_dict)
+            mode = self._extract_mode(parsed_specs)
+            spec_hash = self._extract_hash(parsed_specs)
 
-            proto = self.protocols.generate_protocol(job_item_id, mode, spec_hash, spec_dict or {})
+            proto = self.protocols.generate_protocol(job_item_id, mode, spec_hash, parsed_specs or {})
             result.assay_prot_id = proto.assay_prot_id
             result.add_event("protocol_generated", f"AssayProtID={proto.assay_prot_id}")
 
@@ -578,31 +595,224 @@ class ExecutionOrchestrator:
 
         return "\n".join(parts)
 
-    def _extract_mode(self, spec_dict: dict[str, Any] | None) -> str:
-        """Extract measurement mode from job spec."""
-        if not spec_dict:
+    # --- Canonical spec loading (generated_protocol) -------------------------
+
+    def _load_canonical_specs(
+        self,
+        job_item_id: int,
+        result: ExecutionResult,
+    ) -> dict[str, Any] | None:
+        """Download and parse all canonical JSON attachments for a generated_protocol job.
+
+        Reads the Job hash and Job JSON attachment ID from the item metadata,
+        downloads job.json, parses it into a JobSpec, then downloads the
+        referenced method.json, layout.json, and analysis.json.
+
+        Returns a dict with keys: "job", "method", "layout", "analysis", "hash".
+        Sets result.final_state on failure.
+        """
+        from .canonical import compute_hash
+        from .elabftw import extract_extra_fields, get_field_value
+        from .schemas import (
+            JobSpec,
+        )
+
+        try:
+            item = self.elabftw.get_item(job_item_id)
+        except Exception as e:
+            result.final_state = "failed"
+            result.error = f"Failed to load job item: {e}"
+            result.add_event("spec_load_failed", str(e))
+            return None
+
+        ef = extract_extra_fields(item.get("metadata"))
+        job_hash = get_field_value(ef, "Job hash") or ""
+        job_attachment_id_str = get_field_value(ef, "Job JSON attachment ID") or ""
+
+        if not job_hash or not job_attachment_id_str:
+            result.final_state = "failed"
+            result.error = "Missing Job hash or Job JSON attachment ID in metadata"
+            result.add_event("spec_load_failed", "missing hash or attachment ID")
+            return None
+
+        try:
+            job_attachment_id = int(job_attachment_id_str)
+        except ValueError:
+            result.final_state = "failed"
+            result.error = f"Invalid attachment ID: {job_attachment_id_str}"
+            return None
+
+        # Download and verify job.json
+        try:
+            job_bytes = self.elabftw.download_upload(job_item_id, job_attachment_id)
+        except Exception as e:
+            result.final_state = "failed"
+            result.error = f"Failed to download job.json: {e}"
+            result.add_event("spec_load_failed", str(e))
+            return None
+
+        actual_hash = compute_hash(job_bytes)
+        if actual_hash != job_hash.lower():
+            result.final_state = "failed"
+            result.error = f"job.json hash mismatch: expected {job_hash}, got {actual_hash}"
+            result.add_event("spec_load_failed", "hash mismatch")
+            return None
+
+        job_spec_dict = json.loads(job_bytes)
+        result.add_event("job_spec_loaded", f"hash={actual_hash[:8]}")
+
+        # Parse JobSpec to get references
+        try:
+            job_spec = JobSpec.from_dict(job_spec_dict)
+        except Exception as e:
+            result.final_state = "failed"
+            result.error = f"Failed to parse job.json: {e}"
+            result.add_event("spec_load_failed", str(e))
+            return None
+
+        specs: dict[str, Any] = {
+            "job": job_spec_dict,
+            "hash": job_hash,
+        }
+
+        # Download method.json if referenced
+        if job_spec.method is not None:
+            method_spec = self._download_referenced_spec(
+                job_spec.method, "method", result
+            )
+            if method_spec is not None:
+                specs["method"] = method_spec
+                result.add_event("method_spec_loaded", f"mode={method_spec.get('mode', '?')}")
+            else:
+                return None  # result.final_state already set
+
+        # Download layout.json if referenced
+        if job_spec.layout is not None:
+            if job_spec.layout.source == "reusable" and job_spec.layout.object_id:
+                layout_spec = self._download_referenced_spec(
+                    job_spec.layout, "layout", result
+                )
+            else:
+                # one-off: attachment is on the job itself
+                layout_spec = self._download_one_off_layout(
+                    job_item_id, job_spec.layout, result
+                )
+            if layout_spec is not None:
+                specs["layout"] = layout_spec
+                result.add_event("layout_spec_loaded", f"wells={len(layout_spec.get('wells', []))}")
+            else:
+                return None
+
+        # Download analysis.json if referenced
+        if job_spec.analysis is not None:
+            analysis_spec = self._download_referenced_spec(
+                job_spec.analysis, "analysis", result
+            )
+            if analysis_spec is not None:
+                specs["analysis"] = analysis_spec
+                result.add_event("analysis_spec_loaded")
+            else:
+                return None
+
+        return specs
+
+    def _download_referenced_spec(
+        self,
+        ref: Any,
+        kind: str,
+        result: ExecutionResult,
+    ) -> dict[str, Any] | None:
+        """Download and verify a referenced canonical JSON attachment.
+
+        Handles ObjectReference (method, analysis) with object_id, and
+        LayoutReference with object_id (reusable) or without (one-off).
+        """
+        from .canonical import compute_hash
+
+        object_id = getattr(ref, "object_id", 0)
+        expected_hash = getattr(ref, "hash", "")
+        attachment_id = getattr(ref, "json_attachment_id", 0)
+
+        if not object_id or not expected_hash or not attachment_id:
+            result.final_state = "failed"
+            result.error = f"Missing {kind} reference fields"
+            result.add_event("spec_load_failed", f"missing {kind} reference")
+            return None
+
+        try:
+            spec_bytes = self.elabftw.download_upload(object_id, attachment_id)
+        except Exception as e:
+            result.final_state = "failed"
+            result.error = f"Failed to download {kind}.json: {e}"
+            result.add_event("spec_load_failed", str(e))
+            return None
+
+        actual_hash = compute_hash(spec_bytes)
+        if actual_hash != expected_hash.lower():
+            result.final_state = "failed"
+            result.error = f"{kind}.json hash mismatch: expected {expected_hash}, got {actual_hash}"
+            result.add_event("spec_load_failed", f"{kind} hash mismatch")
+            return None
+
+        return json.loads(spec_bytes)
+
+    def _download_one_off_layout(
+        self,
+        job_item_id: int,
+        layout_ref: Any,
+        result: ExecutionResult,
+    ) -> dict[str, Any] | None:
+        """Download a one-off layout.json attachment from the job item itself."""
+        from .canonical import compute_hash
+
+        expected_hash = getattr(layout_ref, "hash", "")
+        attachment_id = getattr(layout_ref, "json_attachment_id", 0)
+
+        if not expected_hash or not attachment_id:
+            result.final_state = "failed"
+            result.error = "Missing one-off layout reference fields"
+            return None
+
+        try:
+            spec_bytes = self.elabftw.download_upload(job_item_id, attachment_id)
+        except Exception as e:
+            result.final_state = "failed"
+            result.error = f"Failed to download layout.json: {e}"
+            result.add_event("spec_load_failed", str(e))
+            return None
+
+        actual_hash = compute_hash(spec_bytes)
+        if actual_hash != expected_hash.lower():
+            result.final_state = "failed"
+            result.error = f"layout.json hash mismatch: expected {expected_hash}, got {actual_hash}"
+            result.add_event("spec_load_failed", "layout hash mismatch")
+            return None
+
+        return json.loads(spec_bytes)
+
+    def _extract_mode(self, parsed_specs: dict[str, Any] | None) -> str:
+        """Extract measurement mode from the parsed method spec."""
+        if not parsed_specs:
             return "photometry"
-        method = spec_dict.get("method", {})
+        method = parsed_specs.get("method", {})
         return method.get("mode", "photometry")
 
-    def _extract_hash(self, spec_dict: dict[str, Any] | None) -> str:
-        """Extract spec hash from job spec."""
-        if not spec_dict:
+    def _extract_hash(self, parsed_specs: dict[str, Any] | None) -> str:
+        """Extract the job spec hash from parsed specs."""
+        if not parsed_specs:
             return ""
-        return spec_dict.get("hash", "")
+        return parsed_specs.get("hash", "")
 
-    def _extract_layout_wells(self, spec_dict: dict[str, Any]) -> dict[str, dict[str, Any]]:
-        """Extract layout wells from job spec dict."""
-        # In production, this would download and parse the layout.json
-        # attachment. For now, return empty if not inline.
-        layout = spec_dict.get("layout", {})
+    def _extract_layout_wells(self, parsed_specs: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Extract layout wells from the parsed layout spec."""
+        layout = parsed_specs.get("layout", {})
         if isinstance(layout, dict) and "wells" in layout:
             return {w["well_name"]: w for w in layout["wells"]}
         return {}
 
-    def _extract_analysis_spec(self, spec_dict: dict[str, Any]) -> AnalysisSpec | None:
-        """Extract analysis spec from job spec dict."""
-        analysis = spec_dict.get("analysis", {})
+    def _extract_analysis_spec(self, parsed_specs: dict[str, Any]) -> AnalysisSpec | None:
+        """Extract analysis spec from the parsed specs."""
+        analysis = parsed_specs.get("analysis", {})
         if not analysis:
             return None
         try:
