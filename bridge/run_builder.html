@@ -101,6 +101,7 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
   <!-- Auth -->
   <div class="auth-bar">
     <input type="text" id="elabftwUrl" placeholder="eLabFTW URL (e.g. https://100.119.135.27:3148)" style="flex:2;" />
+    <input type="text" id="bridgeUrl" placeholder="Bridge URL (e.g. http://100.81.236.54:8423)" style="flex:2;" />
     <input type="password" id="authToken" placeholder="Designer token (leave empty if none)" style="flex:1;" />
     <button class="btn btn-secondary" onclick="saveSettings()">Save</button>
   </div>
@@ -319,30 +320,45 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
   <!-- Step 5: Review & Finalize -->
   <div class="panel hidden" id="step5">
     <h2>Review & Finalize</h2>
-    <p class="subtitle">Review the bundle, then finalize each object. After finalization, sign each resource in eLabFTW.</p>
+    <p class="subtitle">Finalize canonical JSON, then submit directly to the bridge for execution.</p>
 
     <div class="summary-grid" id="reviewSummary"></div>
 
     <div style="margin-top:16px;">
       <h2>Actions</h2>
-      <p class="hint">Finalize computes the canonical JSON and attaches it with a SHA-256 hash. After finalizing, open each resource in eLabFTW and sign it.</p>
+      <p class="hint">Finalize computes the canonical JSON and attaches it with a SHA-256 hash. Then submit directly to the bridge — no eLabFTW signing required for quick runs.</p>
       <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
         <button class="btn btn-primary" onclick="finalizeAll()">Finalize All</button>
+        <button class="btn btn-primary" id="submitBtn" onclick="submitToBridge()" disabled>Submit to Bridge →</button>
       </div>
     </div>
 
     <div id="finalizeResults" style="margin-top:16px;"></div>
 
-    <div id="nextSteps" class="hidden" style="margin-top:16px;">
-      <h2>Next Steps — Sign & Submit in eLabFTW</h2>
-      <p class="hint">The Run Builder has created draft resources and attached canonical JSON. You now need to sign them in eLabFTW and submit the job for execution.</p>
-      <ol style="margin-left:20px; line-height:1.8;">
-        <li>Open each resource in eLabFTW (links above) and click <strong>Sign</strong>.</li>
-        <li>Set <strong>Lifecycle state</strong> to <code>signed/active</code> on the Method, Plate Layout, and Analysis Plan.</li>
-        <li>On the <strong>Automation Job</strong>: sign it, set <strong>Lifecycle state</strong> to <code>signed/active</code>, set <strong>Requested action</strong> to <code>submit</code>, and set <strong>Automation state</strong> to <code>requested</code>.</li>
-        <li>The bridge will pick up the job automatically within a few seconds.</li>
-      </ol>
-      <p class="hint">You can monitor progress on the Automation Job's <strong>Live Monitor</strong> URL field once the bridge claims it.</p>
+    <div id="jobStatus" class="hidden" style="margin-top:16px;">
+      <h2>Job Status</h2>
+      <div class="summary-grid">
+        <div class="summary-item">
+          <div class="summary-label">Job ID</div>
+          <div class="summary-value" id="statusJobId">—</div>
+        </div>
+        <div class="summary-item">
+          <div class="summary-label">Status</div>
+          <div class="summary-value" id="statusState">—</div>
+        </div>
+        <div class="summary-item">
+          <div class="summary-label">Run ID</div>
+          <div class="summary-value" id="statusRunId">—</div>
+        </div>
+        <div class="summary-item">
+          <div class="summary-label">Error</div>
+          <div class="summary-value" id="statusError">—</div>
+        </div>
+      </div>
+      <div id="statusEvents" style="margin-top:12px; max-height:200px; overflow-y:auto; font-family:monospace; font-size:0.8rem;"></div>
+      <div style="margin-top:8px;">
+        <button class="btn btn-danger" id="abortBtn" onclick="abortJob()" disabled>Request Abort</button>
+      </div>
     </div>
 
     <div class="btn-row">
@@ -355,11 +371,14 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
 // --- State ---
 let token = localStorage.getItem('wallacDesignerToken') || '';
 let elabftwUrl = localStorage.getItem('wallacElabftwUrl') || '';
+let bridgeUrl = localStorage.getItem('wallacBridgeUrl') || '';
 let savedMethod = null;
 let savedLayout = null;
 let savedAnalysis = null;
 let savedJob = null;
 let selectedWell = null;
+let submittedJobId = null;
+let statusPollTimer = null;
 const plateWells = {};
 
 // --- Init plate (all measured by default) ---
@@ -374,11 +393,14 @@ for (const r of ROWS) {
 // --- Auth ---
 document.getElementById('authToken').value = token;
 document.getElementById('elabftwUrl').value = elabftwUrl;
+document.getElementById('bridgeUrl').value = bridgeUrl;
 function saveSettings() {
   token = document.getElementById('authToken').value;
   elabftwUrl = document.getElementById('elabftwUrl').value.replace(/\/+$/, '');
+  bridgeUrl = document.getElementById('bridgeUrl').value.replace(/\/+$/, '');
   localStorage.setItem('wallacDesignerToken', token);
   localStorage.setItem('wallacElabftwUrl', elabftwUrl);
+  localStorage.setItem('wallacBridgeUrl', bridgeUrl);
   showStatus('Settings saved', 'success');
 }
 
@@ -874,9 +896,89 @@ async function finalizeAll() {
     }
   }
   if (allOk) {
-    document.getElementById('nextSteps').classList.remove('hidden');
+    document.getElementById('submitBtn').disabled = false;
   }
   renderReview();
+}
+
+// --- Submit to bridge ---
+async function submitToBridge() {
+  if (!bridgeUrl) { showStatus('Set the Bridge URL in settings first', 'error'); return; }
+
+  const jobSpec = {
+    title: savedJob ? savedJob.title : (savedMethod ? savedMethod.title : 'Untitled Run'),
+    execution_mode: document.getElementById('jobMode') ? document.getElementById('jobMode').value : 'existing_protocol',
+    protocol_name: document.getElementById('jobProtocolName') ? document.getElementById('jobProtocolName').value : '',
+    expected_outputs: document.getElementById('jobExpectedOutputs') ? document.getElementById('jobExpectedOutputs').value : '',
+  };
+
+  // Add references for generated_protocol
+  if (jobSpec.execution_mode === 'generated_protocol') {
+    if (savedMethod) jobSpec.method_ref = { object_id: savedMethod.item_id, hash: savedMethod.hash, attachment_id: savedMethod.json_attachment_id };
+    if (savedLayout) jobSpec.layout_ref = { source: 'reusable', object_id: savedLayout.item_id, hash: savedLayout.hash, attachment_id: savedLayout.json_attachment_id };
+    if (savedAnalysis) jobSpec.analysis_ref = { object_id: savedAnalysis.item_id, hash: savedAnalysis.hash, attachment_id: savedAnalysis.json_attachment_id };
+  }
+
+  try {
+    showStatus('Submitting to bridge...', 'info');
+    const resp = await fetch(`${bridgeUrl}/jobs`, {
+      method: 'POST',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(jobSpec),
+    });
+    if (!resp.ok) throw new Error(`${resp.status}: ${await resp.text()}`);
+    const job = await resp.json();
+    submittedJobId = job.job_id;
+    showStatus(`Job submitted: ${job.job_id}`, 'success');
+
+    // Show status panel and start polling
+    document.getElementById('jobStatus').classList.remove('hidden');
+    document.getElementById('abortBtn').disabled = false;
+    startStatusPolling();
+  } catch (e) {
+    showStatus('Submit failed: ' + e.message, 'error');
+  }
+}
+
+function startStatusPolling() {
+  if (statusPollTimer) clearInterval(statusPollTimer);
+  statusPollTimer = setInterval(pollJobStatus, 2000);
+  pollJobStatus(); // immediate first poll
+}
+
+async function pollJobStatus() {
+  if (!submittedJobId || !bridgeUrl) return;
+  try {
+    const resp = await fetch(`${bridgeUrl}/jobs/${submittedJobId}`, { headers: authHeaders() });
+    if (!resp.ok) return;
+    const job = await resp.json();
+
+    document.getElementById('statusJobId').textContent = job.job_id;
+    document.getElementById('statusState').textContent = job.status;
+    document.getElementById('statusRunId').textContent = job.run_id || '—';
+    document.getElementById('statusError').textContent = job.error || '—';
+
+    const eventsDiv = document.getElementById('statusEvents');
+    eventsDiv.innerHTML = job.events.map(e => `<div>[${e.ts.slice(0,19)}] ${e.event}: ${e.detail}</div>`).join('');
+    eventsDiv.scrollTop = eventsDiv.scrollHeight;
+
+    // Stop polling on terminal states
+    if (['completed', 'failed', 'aborted', 'unknown_requires_operator_review'].includes(job.status)) {
+      clearInterval(statusPollTimer);
+      statusPollTimer = null;
+      document.getElementById('abortBtn').disabled = true;
+    }
+  } catch {}
+}
+
+async function abortJob() {
+  if (!submittedJobId || !bridgeUrl) return;
+  try {
+    await fetch(`${bridgeUrl}/jobs/${submittedJobId}/abort`, { method: 'POST', headers: authHeaders() });
+    showStatus('Abort requested', 'info');
+  } catch (e) {
+    showStatus('Abort failed: ' + e.message, 'error');
+  }
 }
 
 // --- Init ---
