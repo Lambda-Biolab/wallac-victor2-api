@@ -268,6 +268,7 @@ class JobIntake:
                 live_url = self.claim_job(job)
                 result["status"] = "claimed"
                 result["live_monitor_url"] = live_url
+                result["job"] = job  # full AutomationJob with extra_fields + signed_snapshot
                 if job.signature_info:
                     result["signer"] = job.signature_info.signer_email
             except BridgeError as e:

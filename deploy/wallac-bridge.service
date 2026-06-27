@@ -1,0 +1,23 @@
+[Unit]
+Description=Wallac Victor2 eLabFTW Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=antonio
+WorkingDirectory=/home/antonio/repos/wallac-victor2-api
+EnvironmentFile=/etc/wallac-bridge/bridge.env
+ExecStart=/usr/bin/python3 main.py
+
+Restart=on-failure
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/wallac-bridge
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
