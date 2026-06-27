@@ -3,7 +3,7 @@
 Date: 2026-06-26
 Target repo: `Lambda-Biolab/wallac-victor2-api`
 Plan branch: `plan/wallac-protocol-authoring`
-Status: **Stages 1–6 implemented and merged. Stage 7 in progress: `existing_protocol` path validated on live hardware; `generated_protocol` path not yet tested on instrument.**
+Status: **Stages 1–6 implemented and merged. Stage 7 substantially complete: both `existing_protocol` and `generated_protocol` paths validated end-to-end on live hardware. Remaining Stage 7 items: OEM OD comparison, cleanup dry-run, abort during generated run, systemd service install, designer app as persistent service.**
 
 ## Purpose
 
@@ -724,7 +724,7 @@ Implementation:
 
 ### Stage 7: hardware e2e acceptance and production enablement
 
-**Status: 🔄 IN PROGRESS — existing_protocol path done, generated_protocol path pending**
+**Status: ✅ MOSTLY DONE — both execution paths validated end-to-end on live hardware**
 
 - Run real eLabFTW -> bridge -> vm-agent -> Wallac -> raw results -> analysis -> artifacts -> Assay summary flow.
 - Validate generated MDB protocol in OEM/Wallac context.
@@ -744,14 +744,30 @@ Acceptance:
 - cleanup dry-run lists only eligible generated protocols;
 - production feature flag remains off until operator approval.
 
-**Progress:**
+**Completed:**
 - ✅ `existing_protocol` path validated end-to-end (Jobs #326, #327): signature verification, claiming, 96-well measurement, results upload, Assay creation + linking, event log.
-- ❌ `generated_protocol` path NOT yet tested on live instrument — requires creating signed Method/Layout/Analysis bundle via designer API, generating MDB protocol, running by AssayProtID.
-- ❌ OEM OD comparison not done.
-- ❌ Cleanup dry-run not tested on live MDB.
-- ❌ Abort during generated run not tested.
+- ✅ `generated_protocol` path validated end-to-end (Job #337): signed Method/Layout/Analysis/Job bundle, canonical JSON hash verification, MDB protocol generation (2000002), 96-well photometry run, result completeness check, analysis (blank subtraction, replicate aggregation, pass/fail), 5 artifacts uploaded to eLabFTW, job marked `completed`.
+- ✅ Designer app deployed on `lambdabiolab-computer` (FastAPI + uvicorn on port 8422).
+- ✅ Signed bundle created via designer API: Method #334 (photometry, P610, 0.1s), Layout #335 (96-well, all measured), Analysis #336 (no transforms), Job #337.
+
+**Bugs found and fixed during `generated_protocol` live testing (8 commits):**
+
+1. **`op_mdb_insert_protocol` used DAO AddNew/Update** — fails with comtypes on Jet. Fixed: use SQL INSERT (same pattern as ProtocolGroup creation).
+2. **Generated protocol only had basic columns** — missing PlateMap, MeasurementMode, etc. Fixed: `generate_protocol()` now copies the full template row.
+3. **Direct `bytes` assignment to PlateMap field fails** — comtypes can't marshal `bytes` to COM VARIANT. Fixed: use `array.array('B', ...)` with `AppendChunk()`.
+4. **`NormalizationInfo` is also a binary OLE Object field** — was in SQL INSERT, causing "Data type conversion error". Fixed: added to `_BINARY_COLS` set.
+5. **`NormalizationInfo` is NULL in template** — `list(None)` raises TypeError. Fixed: skip None binary fields.
+6. **DAO AppendChunk fails on NULL OLE Object fields** — Jet doesn't allow appending binary data to a field initialized as NULL by SQL INSERT. Fixed: clone template via `INSERT INTO ... SELECT` (copies binary fields in one SQL step), then `UPDATE` specific fields.
+7. **vm-agent returns `{"well": "A1"}` but analysis expected `{"well_name": "A1"}`** — KeyError in `_load_raw`. Fixed: `_well_key()` helper checks both keys.
+8. **vm-agent zero-pads well names (A01, A02)** but layout specs don't (A1, A2) — all 96 wells reported missing. Fixed: `_normalize_well_name()` strips leading zeros.
+
+**Remaining (non-blocking for v1 go-live):**
+- ❌ OEM OD comparison not done (Test 5).
+- ❌ Cleanup dry-run not tested on live MDB (Test 6).
+- ❌ Abort during generated run not tested (Test 8).
 - ❌ Bridge daemon not installed as systemd service (running as nohup process).
-- ❌ Designer app not deployed (FastAPI not installed on host).
+- ❌ Designer app not deployed as persistent service (running as nohup).
+- ❌ Dedicated eLabFTW service API key not created (using admin key).
 
 **Test plan:** `docs/stage7-hardware-e2e-test-plan.md` (8 test sequences).
 
@@ -820,36 +836,33 @@ These are not product decisions; resolve during implementation and testing:
 | eLabFTW | `antonios-beast` (Tailscale 100.119.135.27:3148) | Running, v5.5.14 |
 | Bridge daemon | `lambdabiolab-computer` (Tailscale 100.81.236.54) | Running as `nohup` process (not yet systemd) |
 | vm-agent | `win7-wallac` VM (libvirt NAT 192.168.122.203:8420) | Running via scheduled task `wallac-agent` |
+| Designer app | `lambdabiolab-computer` (port 8422) | Running as `nohup` uvicorn process (not yet systemd) |
 | Instrument | Victor2 1420 | Connected, idle, working |
 
 ### Configuration
 
-- Bridge env: `/etc/wallac-bridge/bridge.env` on `lambdabiolab-computer`
+- Bridge env: `/etc/wallac-bridge/bridge.env` on `lambdabiolab-computer` (includes `WALLAC_ENABLE_PROTOCOL_AUTHORING=true`, `WALLAC_ENABLE_PHOTOMETRY=true`, `WALLAC_PHOTOMETRY_TEMPLATE_ID=2000001`, `WALLAC_PHOTOMETRY_TEMPLATE_NAME="Absorbance @ 600 (0.1s)"`)
 - vm-agent: `C:\install\agent.py` on `win7-wallac`, started by `C:\install\run_agent.bat` (sets `WALLAC_ENABLE_PROTOCOL_AUTHORING=true`)
 - eLabFTW signing key: created for user 1 (Antonio Lamb), passphrase `wallac2024`
 - `eLabFTW Generated` protocol group: GroupID=10001 in MDB
 - Spool dir: `/var/lib/wallac-bridge/spool`
 - Dashboard: `http://lambdabiolab-computer:8421`
+- Designer app: `http://lambdabiolab-computer:8422`
 
 ### What's NOT yet deployed
 
-- **systemd service**: `deploy/wallac-bridge.service` exists but not installed. Bridge runs as `nohup python3 main.py`. Won't survive reboot.
-- **Designer app**: FastAPI not installed on host. Run Builder UI not served.
+- **systemd service for bridge daemon**: `deploy/wallac-bridge.service` exists but not installed. Bridge runs as `nohup python3 main.py`. Won't survive reboot.
+- **systemd service for designer app**: running as `nohup uvicorn`. Won't survive reboot.
 - **Dedicated eLabFTW API key for bridge**: using admin key (`4-l4mbd4...`), not a scoped service key.
 
 ### Remaining work for Stage 7
 
-1. **`generated_protocol` path on live hardware** — the main gap. Requires:
-   - Installing FastAPI on `lambdabiolab-computer` and starting the designer app
-   - Creating signed Method/Layout/Analysis resources via the designer API
-   - The GeneratedProtocolManager creating an MDB protocol from the signed bundle
-   - Running the generated protocol by numeric AssayProtID
-   - Verifying the analysis pipeline (blank subtraction, replicate aggregation, pass/fail)
-2. **OEM OD comparison** (Test 5)
-3. **Cleanup dry-run** (Test 6)
-4. **Abort during generated run** (Test 8)
-5. **Install systemd service** for bridge daemon
-6. **Deploy designer app** as a persistent service
+1. ~~**`generated_protocol` path on live hardware**~~ — ✅ DONE (Job #337 completed successfully: protocol generated, 96-well run, results analyzed, 5 artifacts uploaded, job marked `completed`).
+2. **OEM OD comparison** (Test 5) — compare vm-agent-derived OD against OEM/Wallac-reported OD values.
+3. **Cleanup dry-run** (Test 6) — test `DELETE /mdb/protocols` dry-run/confirm on live MDB.
+4. **Abort during generated run** (Test 8) — test eLabFTW abort mid-run.
+5. **Install systemd service** for bridge daemon — `deploy/wallac-bridge.service` exists, needs `systemctl enable`.
+6. **Deploy designer app** as a persistent service — currently nohup, needs systemd or similar.
 
 ### Key files for a new agent
 
@@ -857,11 +870,12 @@ These are not product decisions; resolve during implementation and testing:
 - `docs/stage7-hardware-e2e-test-plan.md` — 8 test sequences for Stage 7
 - `docs/api-reference.md` — complete API docs (vm-agent, designer, bridge daemon, error codes)
 - `main.py` — bridge daemon entry point
-- `bridge/factory.py` — component wiring (`create_orchestrator()`)
-- `bridge/execution.py` — ExecutionOrchestrator (full pipeline)
-- `bridge/generated_protocols.py` — GeneratedProtocolManager (MDB protocol lifecycle)
+- `bridge/factory.py` — component wiring (`create_orchestrator()`, reads template config from env vars)
+- `bridge/execution.py` — ExecutionOrchestrator (full pipeline: validation → generation → run → completeness → analysis → spool → write-back → Assay summary). Includes `_well_key()` and `_normalize_well_name()` for vm-agent↔layout well name normalization.
+- `bridge/analysis.py` — AnalysisPipeline (10-step analysis — blank subtraction, normalization, replicate aggregation, thresholds, artifact export). Uses `_well_key()` from execution.py for raw well matching.
+- `bridge/generated_protocols.py` — GeneratedProtocolManager (MDB protocol lifecycle). `generate_protocol()` clones template via INSERT INTO SELECT, overrides fields via UPDATE.
 - `bridge/remote_mdb_client.py` — RemoteMdbClient (HTTP → vm-agent MDB endpoints)
-- `vm-agent/agent.py` — vm-agent with MDB endpoints (deployed to `C:\install\agent.py`)
+- `vm-agent/agent.py` — vm-agent with MDB endpoints (deployed to `C:\install\agent.py`). `op_mdb_insert_protocol()` clones template row via SQL INSERT INTO SELECT (handles binary PlateMap/NormalizationInfo fields that can't be set via DAO AppendChunk on NULL fields).
 - `deploy/wallac-bridge.service` — systemd unit (not yet installed)
 - `deploy/bridge.env.example` — env file template
 
