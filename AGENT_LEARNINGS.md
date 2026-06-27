@@ -185,3 +185,41 @@ Phenol-red-level dye concentrations (e.g. DMEM) give OD600 ~0.03–0.05 at
 200µL, which is near the instrument's detection floor for colorimetric use.
 600nm photometry is primarily useful for turbidity (bacterial growth, OD600
 0.1–1.0), not dilute colorimetric dyes.
+
+## eLabFTW API key creation via database
+
+### Creating a dedicated service user + API key
+
+eLabFTW's `POST /apikeys` endpoint only creates keys for the *authenticated*
+user — you can't create a key for another user via the API. To provision a
+dedicated service identity:
+
+1. **Create user via API:** `POST /users` with
+   `{"firstname", "lastname", "email", "team", "usergroup"}`. Returns 201
+   with Location header. User is created with `validated=1` and added to
+   `users2teams`.
+
+2. **Remove sysadmin (least privilege):** `UPDATE users SET is_sysadmin = 0
+   WHERE userid = N;` via MySQL.
+
+3. **Insert API key via DB:** The key format is `<api_keys.id>-<secret>`.
+   The bcrypt hash must be of the **secret part only**, NOT the full key
+   with the id prefix. eLabFTW splits the key by `-`, looks up the row by
+   id, then calls `password_verify($secret, $hash)`.
+
+   ```python
+   import bcrypt, secrets
+   secret = secrets.token_hex(24)
+   hashed = bcrypt.hashpw(secret.encode(), bcrypt.gensalt(rounds=12)).decode()
+   hashed_php = hashed.replace('$2b$', '$2y$', 1)  # PHP compatibility
+   # INSERT INTO api_keys (name, hash, can_write, userid, team)
+   #   VALUES ('service', '<hashed_php>', 1, <userid>, <team>);
+   # Full key: <id>-<secret>
+   ```
+
+4. **Verify:** `curl -H "Authorization: <id>-<secret>" /api/v2/users/me`
+   should return the service user's data.
+
+**Gotcha:** Python's bcrypt generates `$2b$` hashes; PHP's `password_verify()`
+accepts both `$2b$` and `$2y$`, but use `$2y$` for consistency with
+eLabFTW's existing keys.

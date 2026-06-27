@@ -841,7 +841,7 @@ These are not product decisions; resolve during implementation and testing:
 
 ### Configuration
 
-- Bridge env: `/etc/wallac-bridge/bridge.env` on `lambdabiolab-computer` (includes `WALLAC_ENABLE_PROTOCOL_AUTHORING=true`, `WALLAC_ENABLE_PHOTOMETRY=true`, `WALLAC_PHOTOMETRY_TEMPLATE_ID=2000001`, `WALLAC_PHOTOMETRY_TEMPLATE_NAME="Absorbance @ 600 (0.1s)"`, `WALLAC_AUTHORIZED_SIGNERS=antonio@lambconsulting.bio`, `WALLAC_DESIGNER_TOKEN=`)
+- Bridge env: `/etc/wallac-bridge/bridge.env` on `lambdabiolab-computer` (includes `WALLAC_ENABLE_PROTOCOL_AUTHORING=true`, `WALLAC_ENABLE_PHOTOMETRY=true`, `WALLAC_PHOTOMETRY_TEMPLATE_ID=2000001`, `WALLAC_PHOTOMETRY_TEMPLATE_NAME="Absorbance @ 600 (0.1s)"`, `WALLAC_AUTHORIZED_SIGNERS=antonio@lambconsulting.bio`, `WALLAC_DESIGNER_TOKEN=`). API key: dedicated service user "Wallac Bridge" (userid=2, non-sysadmin), key id=5.
 - vm-agent: `C:\install\agent.py` on `win7-wallac`, started by `C:\install\run_agent.bat` (sets `WALLAC_ENABLE_PROTOCOL_AUTHORING=true`)
 - eLabFTW signing key: created for user 1 (Antonio Lamb), passphrase `wallac2024`
 - `eLabFTW Generated` protocol group: GroupID=10001 in MDB
@@ -851,7 +851,7 @@ These are not product decisions; resolve during implementation and testing:
 
 ### What's NOT yet deployed
 
-- **Dedicated eLabFTW API key for bridge**: using admin key (`4-l4mbd4...`), not a scoped service key.
+(none — all components deployed and running)
 
 ### Stage 7 — COMPLETE (all 8 tests pass)
 
@@ -905,10 +905,12 @@ All fixes committed, pushed, and deployed. `make validate` fully green (lint, fo
 - Sign an entity: `PATCH /{entity_type}/{id}` with `{"action": "sign", "passphrase": "...", "meaning": 10}` (meaning is an integer: 10=Approval, 20=Authorship, etc.).
 - Link experiment to item: `POST /experiments/{id}/items_links/{item_id}` with empty JSON body (item_id in URL path, not body).
 - `patch_metadata` must read current metadata, merge new fields, and write back the full metadata JSON string.
+- API key creation via DB insert: the key format is `<api_keys.id>-<secret>`. The bcrypt hash must be of the **secret part only**, not the full key. PHP's `password_verify()` is called on the secret after splitting by `-`. Use `$2y$` prefix (not `$2b$`) for PHP compatibility.
+- Service user creation: `POST /users` with `{"firstname", "lastname", "email", "team", "usergroup"}`. User is created with `validated=1` and added to `users2teams`. Set `is_sysadmin=0` via DB update for least privilege.
 
 ### Remaining work (post-Stage-7)
 
-1. **Dedicated eLabFTW API key for bridge** — currently using admin key (`4-l4mbd4...`). Needs a scoped service key with minimum permissions (read items, create/upload, patch metadata, post comments).
+1. ~~**Dedicated eLabFTW API key for bridge**~~ — ✅ DONE (2026-06-27: created dedicated service user "Wallac Bridge" (userid=2, non-sysadmin, team admin in Default team). API key `5-ee534a...` provisioned via direct DB insert with bcrypt hash. Bridge and designer restarted with new key. Verified: bridge polling eLabFTW successfully, `last_used_at` updating. Old admin key (`4-l4mbd4...`) still valid for admin scripting but no longer used by bridge.)
 2. **7 unmatched plasmid-to-primer links** — operator decision needed on correct primer pairs (in `antomicblitz/elabftw-lambdabiolab` repo).
 3. **6 Phase 2 decisions** (in `antomicblitz/elabftw-lambdabiolab` AGENT_REQUESTS.md): off-host backup target, SMTP provider, domain/DNS, Benchling review set, alerting target, Hetzner sizing.
 4. **Complexity refactoring** — all 6 pre-existing cognitive complexity violations fixed (op_mdb_insert_protocol 36→8, _load_canonical_specs 25→4, Handler::do_GET 18→5, Handler::_get_jobs 20→5, Handler::_get_simple 16→4, _grid_csv 17→6). `make validate` fully green.
