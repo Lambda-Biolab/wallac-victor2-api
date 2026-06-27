@@ -1037,16 +1037,34 @@ def op_mdb_insert_protocol(protocol_row):
     def _op(_srv):
         db = _open_mdb_w()
         try:
-            rs = db.OpenRecordset("AssayProtocol", 2)  # dbOpenDynaset
-            rs.AddNew()
-            for key, val in protocol_row.items():
-                if key in _ASSAY_PROTOCOL_COLUMNS:
-                    # DAO expects ints for bool fields
-                    if isinstance(val, bool):
-                        val = -1 if val else 0
-                    rs.Fields(key).Value = val
-            rs.Update()
-            rs.Close()
+            # Build SQL INSERT (more reliable than AddNew for Jet/comtypes).
+            # Only insert columns that are in _ASSAY_PROTOCOL_COLUMNS and present
+            # in the protocol_row dict.
+            cols = []
+            vals = []
+            for key in _ASSAY_PROTOCOL_COLUMNS:
+                if key not in protocol_row:
+                    continue
+                val = protocol_row[key]
+                if isinstance(val, bool):
+                    val = -1 if val else 0
+                cols.append(key)
+                if isinstance(val, (int, float)):
+                    vals.append(str(val))
+                else:
+                    # String value — escape single quotes for SQL safety
+                    vals.append("'" + str(val).replace("'", "''") + "'")
+            if not cols:
+                raise RuntimeError("no valid columns to insert")
+
+            sql = (
+                "INSERT INTO AssayProtocol ("
+                + ", ".join(cols)
+                + ") VALUES ("
+                + ", ".join(vals)
+                + ")"
+            )
+            db.Execute(sql)
             return int(protocol_row["AssayProtID"])
         finally:
             db.Close()
