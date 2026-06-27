@@ -13,5 +13,11 @@ ExecStart=/home/antonio/repos/wallac-victor2-api/.venv/bin/python3 -m uvicorn br
 Restart=on-failure
 RestartSec=10
 
+# Security hardening. The designer is read-only on the filesystem; it only
+# talks to eLabFTW over HTTP. No WritePaths needed.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+
 [Install]
 WantedBy=multi-user.target
