@@ -1109,6 +1109,8 @@ def op_mdb_insert_protocol(protocol_row):
 
             # Step 2: DAO Edit/Update for binary fields (PlateMap)
             if binary_fields:
+                import array as _array
+
                 new_id = int(protocol_row["AssayProtID"])
                 rs = db.OpenRecordset(
                     "SELECT * FROM AssayProtocol WHERE AssayProtID = " + str(new_id),
@@ -1117,9 +1119,10 @@ def op_mdb_insert_protocol(protocol_row):
                 if not rs.EOF:
                     rs.Edit()
                     for key, val in binary_fields.items():
-                        if isinstance(val, list):
-                            val = bytes(val)
-                        # Jet OLE Object fields require AppendChunk, not direct assignment
+                        # comtypes returns PlateMap as a tuple of ints;
+                        # DAO AppendChunk accepts array.array('B', ...) only.
+                        if not isinstance(val, _array.array):
+                            val = _array.array("B", list(val))
                         fld = rs.Fields(key)
                         # AppendChunk writes binary data in chunks
                         CHUNK = 32768
