@@ -96,6 +96,46 @@ normalizes both sides to non-padded form via `_normalize_well_name()`.
 See `bridge/execution.py` (`_well_key`, `_normalize_well_name`) and
 `bridge/analysis.py` (`_load_raw`).
 
+## Jet SQL — wildcard and quoting gotchas
+
+### 1. `LIKE` uses `*` and `?`, NOT ANSI `%` and `_`
+
+Jet/DAO SQL's `LIKE` operator uses the legacy Access wildcards:
+`*` (any sequence), `?` (single char), `#` (single digit), `[chars]`
+(character class). The ANSI wildcards (`%`, `_`) are treated as
+**literal characters** — `LIKE "ELAB-Job-%"` matches the literal string
+`ELAB-Job-%` and returns 0 rows.
+
+Use `ALIKE` for ANSI-standard wildcards: `ALIKE "ELAB-Job-%"` works.
+Or use Jet wildcards: `LIKE "ELAB-Job-*"`.
+
+### 2. Double-quoted strings in `/mdb/query` SQL are accepted as string literals
+
+Contrary to expectation, Jet accepts `"..."` as string-literal delimiters
+in `WHERE` clauses (in addition to the standard `'...'`). Either works
+in the vm-agent `/mdb/query` endpoint. The vm-agent passes SQL straight
+to `db.OpenRecordset(sql)` with no sanitization.
+
+### 3. `/mdb/protocols?name=` is EXACT match only
+
+The vm-agent `GET /mdb/protocols?name=<n>` calls
+`op_mdb_find_protocol_by_name(name)` which does exact match. No glob,
+no prefix, no wildcard. Use `POST /mdb/query` with a `LIKE`/`ALIKE`
+clause for pattern matching.
+
+## Generated-protocol cleanup — in-memory gap
+
+`GeneratedProtocolManager.cleanup_terminal()` (line 381 in
+`bridge/generated_protocols.py`) iterates only the in-memory
+`self._generated` dict. After a bridge restart this dict is empty, so
+cleanup dry-run silently reports nothing-to-do even though `ELAB-Job-*`
+protocols exist in the MDB. To make Stage 7 Test 6 (cleanup dry-run)
+pass against a restarted bridge, `cleanup_terminal()` must query the
+MDB via `MdbClient.query("SELECT ... WHERE ProtName ALIKE 'ELAB-Job-%'")`
+instead of iterating `self._generated`. (Predicate verified 2026-06-27:
+generated group 10001 contains only ELAB-Job-* rows; 0 factory presets
+in group 10001.)
+
 
 ### Plate presence detection
 
