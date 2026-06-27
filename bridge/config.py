@@ -39,6 +39,12 @@ ENV_DASHBOARD_PORT = "WALLAC_DASHBOARD_PORT"
 ENV_BRIDGE_IDENTITY = "WALLAC_BRIDGE_IDENTITY"
 ENV_DEVICE_IDENTITY = "WALLAC_DEVICE_IDENTITY"
 
+# Result spool directory (for write-back resilience)
+ENV_SPOOL_DIR = "WALLAC_SPOOL_DIR"
+
+# Poll interval for eLabFTW job intake (seconds)
+ENV_POLL_INTERVAL = "WALLAC_POLL_INTERVAL"
+
 
 # --- Defaults ---------------------------------------------------------------
 
@@ -49,6 +55,8 @@ DEFAULT_DASHBOARD_HOST = "0.0.0.0"
 DEFAULT_DASHBOARD_PORT = 8421
 DEFAULT_BRIDGE_IDENTITY = "wallac-bridge"
 DEFAULT_DEVICE_IDENTITY = "victor2-unknown"
+DEFAULT_SPOOL_DIR = "/var/lib/wallac-bridge/spool"
+DEFAULT_POLL_INTERVAL = 5.0
 
 
 # --- Config -----------------------------------------------------------------
@@ -76,6 +84,8 @@ class BridgeConfig:
     dashboard_port: int
     bridge_identity: str
     device_identity: str
+    spool_dir: str
+    poll_interval: float
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> BridgeConfig:
@@ -109,6 +119,8 @@ class BridgeConfig:
             dashboard_port=int(e.get(ENV_DASHBOARD_PORT, DEFAULT_DASHBOARD_PORT)),
             bridge_identity=e.get(ENV_BRIDGE_IDENTITY, DEFAULT_BRIDGE_IDENTITY),
             device_identity=e.get(ENV_DEVICE_IDENTITY, DEFAULT_DEVICE_IDENTITY),
+            spool_dir=e.get(ENV_SPOOL_DIR, DEFAULT_SPOOL_DIR),
+            poll_interval=float(e.get(ENV_POLL_INTERVAL, str(DEFAULT_POLL_INTERVAL))),
         )
 
     @property
@@ -138,4 +150,6 @@ class BridgeConfig:
             "dashboard_port": str(self.dashboard_port),
             "bridge_identity": self.bridge_identity,
             "device_identity": self.device_identity,
+            "spool_dir": self.spool_dir,
+            "poll_interval": str(self.poll_interval),
         }
