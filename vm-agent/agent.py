@@ -1118,9 +1118,13 @@ def op_mdb_insert_protocol(protocol_row):
                     rs.Edit()
                     for key, val in binary_fields.items():
                         if isinstance(val, list):
-                            # Byte array as list of ints -> convert to bytes
                             val = bytes(val)
-                        rs.Fields(key).Value = val
+                        # Jet OLE Object fields require AppendChunk, not direct assignment
+                        fld = rs.Fields(key)
+                        # AppendChunk writes binary data in chunks
+                        CHUNK = 32768
+                        for i in range(0, len(val), CHUNK):
+                            fld.AppendChunk(val[i:i + CHUNK])
                     rs.Update()
                 rs.Close()
 
