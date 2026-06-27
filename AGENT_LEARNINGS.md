@@ -123,18 +123,18 @@ The vm-agent `GET /mdb/protocols?name=<n>` calls
 no prefix, no wildcard. Use `POST /mdb/query` with a `LIKE`/`ALIKE`
 clause for pattern matching.
 
-## Generated-protocol cleanup — in-memory gap
+## Generated-protocol cleanup — in-memory gap (FIXED)
 
-`GeneratedProtocolManager.cleanup_terminal()` (line 381 in
-`bridge/generated_protocols.py`) iterates only the in-memory
-`self._generated` dict. After a bridge restart this dict is empty, so
-cleanup dry-run silently reports nothing-to-do even though `ELAB-Job-*`
-protocols exist in the MDB. To make Stage 7 Test 6 (cleanup dry-run)
-pass against a restarted bridge, `cleanup_terminal()` must query the
-MDB via `MdbClient.query("SELECT ... WHERE ProtName ALIKE 'ELAB-Job-%'")`
-instead of iterating `self._generated`. (Predicate verified 2026-06-27:
-generated group 10001 contains only ELAB-Job-* rows; 0 factory presets
-in group 10001.)
+`GeneratedProtocolManager.cleanup_terminal()` previously iterated only the
+in-memory `self._generated` dict — empty after a bridge restart, so
+cleanup dry-run silently reported nothing-to-do even though `ELAB-Job-*`
+protocols existed in the MDB.
+
+**Fixed (2026-06-27):** both `cleanup_terminal()` and `delete_protocol()`
+now query the MDB via `MdbClient.query("SELECT ... WHERE ProtName ALIKE 'ELAB-Job-%'")`
+(ANSI wildcard for Jet SQL). Defense-in-depth: results are filtered again
+by `GENERATED_NAME_PREFIX` before any delete, so factory presets and user
+protocols can never be targeted. 7 new tests cover the restart scenario.
 
 
 ### Plate presence detection
