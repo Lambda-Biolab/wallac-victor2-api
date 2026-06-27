@@ -1,324 +1,720 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Wallac Victor2 Run Builder</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallac Victor2 — Run Builder</title>
 <style>
 :root {
-  --bg: #1a1a2e; --card: #16213e; --accent: #0f3460; --text: #e0e0e0;
-  --border: #30475e; --green: #4ecca3; --red: #e94560; --yellow: #f0a500;
+  --bg: #0f1419; --panel: #1a2332; --border: #2a3f5f;
+  --text: #e0e6ed; --muted: #7a8a9a; --accent: #17a2b8;
+  --green: #28a745; --yellow: #ffc107; --red: #dc3545; --blue: #007bff;
+  --well-size: 32px;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
-.container { max-width: 900px; margin: 0 auto; padding: 20px; }
-h1 { text-align: center; margin-bottom: 10px; color: var(--green); }
-.subtitle { text-align: center; color: var(--text); opacity: 0.7; margin-bottom: 30px; }
-.steps { display: flex; justify-content: space-between; margin-bottom: 30px; }
-.step { flex: 1; text-align: center; padding: 10px; border-radius: 8px; background: var(--card); margin: 0 5px; border: 2px solid transparent; }
-.step.active { border-color: var(--green); }
-.step.done { border-color: var(--accent); }
-.step-num { font-size: 24px; font-weight: bold; }
-.step-label { font-size: 12px; opacity: 0.8; }
-.card { background: var(--card); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
-.card h2 { color: var(--green); margin-bottom: 15px; font-size: 18px; }
-.form-group { margin-bottom: 15px; }
-.form-group label { display: block; margin-bottom: 5px; font-size: 14px; }
-.form-group input, .form-group select, .form-group textarea {
-  width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border);
-  border-radius: 6px; color: var(--text); font-size: 14px;
-}
-.form-group textarea { min-height: 80px; font-family: monospace; }
-.btn {
-  padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px;
-  font-weight: 600; transition: opacity 0.2s;
-}
-.btn:hover { opacity: 0.85; }
-.btn-primary { background: var(--green); color: var(--bg); }
-.btn-secondary { background: var(--accent); color: var(--text); }
-.btn-danger { background: var(--red); color: var(--text); }
-.btn:disabled { opacity: 0.4; cursor: not-allowed; }
-.actions { display: flex; gap: 10px; justify-content: flex-end; }
-.list { list-style: none; }
-.list li { padding: 10px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
-.list li:last-child { border-bottom: none; }
-.badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
-.badge-signed { background: var(--green); color: var(--bg); }
-.badge-draft { background: var(--yellow); color: var(--bg); }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, system-ui, sans-serif; font-size: 14px; }
+.container { max-width: 1200px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 1.4rem; margin-bottom: 4px; }
+h2 { font-size: 1.1rem; color: var(--accent); margin-bottom: 8px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+.subtitle { color: var(--muted); margin-bottom: 16px; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
 .hidden { display: none; }
-.alert { padding: 12px; border-radius: 6px; margin-bottom: 15px; }
-.alert-success { background: rgba(78, 204, 163, 0.15); border: 1px solid var(--green); }
-.alert-error { background: rgba(233, 69, 96, 0.15); border: 1px solid var(--red); }
-.alert-info { background: rgba(15, 52, 96, 0.3); border: 1px solid var(--accent); }
-#step-content { min-height: 300px; }
-.summary { background: var(--bg); border-radius: 8px; padding: 15px; margin: 10px 0; }
-.summary-row { display: flex; justify-content: space-between; padding: 5px 0; }
-.summary-label { opacity: 0.7; }
-.summary-value { font-weight: 600; }
-.elabftw-link { display: inline-block; padding: 10px 20px; background: var(--accent); color: var(--text); border-radius: 6px; text-decoration: none; margin-top: 10px; }
+
+/* Stepper */
+.stepper { display: flex; gap: 4px; margin-bottom: 20px; }
+.step { flex: 1; padding: 10px 8px; text-align: center; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; font-size: 0.85rem; color: var(--muted); cursor: pointer; transition: all 0.2s; }
+.step.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.step.done { background: #1a3a2a; color: var(--green); border-color: var(--green); }
+.step:hover { border-color: var(--accent); }
+
+/* Forms */
+.form-group { margin-bottom: 12px; }
+label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 4px; }
+input, select, textarea { width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text); font-size: 0.9rem; }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+textarea { min-height: 60px; resize: vertical; font-family: monospace; }
+.hint { font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
+
+/* Buttons */
+.btn { padding: 8px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9rem; }
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-primary:hover { background: #138496; }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-secondary { background: var(--border); color: var(--text); }
+.btn-secondary:hover { background: #3a4f6f; }
+.btn-danger { background: var(--red); color: #fff; }
+.btn-row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+
+/* Plate grid */
+.plate-container { display: inline-block; }
+.plate-grid { display: grid; grid-template-columns: 24px repeat(12, var(--well-size)); grid-template-rows: 24px repeat(8, var(--well-size)); gap: 2px; }
+.plate-col-label, .plate-row-label { display: flex; align-items: center; justify-content: center; font-size: 0.7rem; color: var(--muted); }
+.well { border: 1px solid var(--border); border-radius: 3px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 0.6rem; transition: all 0.15s; }
+.well.measured { background: var(--accent); color: #fff; }
+.well.skipped { background: var(--bg); color: var(--muted); }
+.well.excluded { background: var(--red); color: #fff; }
+.well.blank { background: var(--yellow); color: #000; }
+.well.positive_control { background: var(--green); color: #fff; }
+.well.negative_control { background: var(--blue); color: #fff; }
+.well:hover { border-color: #fff; border-width: 2px; }
+.well.selected { border-color: #fff; border-width: 2px; box-shadow: 0 0 4px #fff; }
+
+/* Legend */
+.legend { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; font-size: 0.75rem; }
+.legend-item { display: flex; align-items: center; gap: 4px; }
+.legend-swatch { width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--border); }
+
+/* Well detail panel */
+.well-detail { margin-top: 12px; padding: 12px; background: var(--bg); border-radius: 4px; border: 1px solid var(--border); }
+.well-detail label { font-size: 0.75rem; }
+
+/* Resource list */
+.resource-list { list-style: none; }
+.resource-list li { padding: 8px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+.resource-list li:hover { background: var(--bg); }
+.resource-title { font-weight: 500; }
+.resource-meta { font-size: 0.75rem; color: var(--muted); }
+
+/* Status messages */
+.status-msg { padding: 8px 12px; border-radius: 4px; margin-bottom: 12px; font-size: 0.85rem; }
+.status-msg.success { background: #1a3a2a; color: var(--green); }
+.status-msg.error { background: #3a1a1a; color: var(--red); }
+.status-msg.info { background: #1a2a3a; color: var(--blue); }
+
+/* Summary */
+.summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.summary-item { padding: 8px; background: var(--bg); border-radius: 4px; }
+.summary-label { font-size: 0.75rem; color: var(--muted); }
+.summary-value { font-size: 1rem; font-weight: 500; }
+
+/* Auth bar */
+.auth-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; }
+.auth-bar input { flex: 1; }
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>Wallac Victor2 Run Builder</h1>
-  <p class="subtitle">Author signed protocol bundles for the plate reader</p>
+  <h1>Wallac Victor2 — Run Builder</h1>
+  <p class="subtitle">Create a signed protocol bundle: Method → Plate Layout → Analysis Plan → Automation Job</p>
 
-  <div class="steps">
-    <div class="step active" id="step-indicator-1"><div class="step-num">1</div><div class="step-label">Method</div></div>
-    <div class="step" id="step-indicator-2"><div class="step-num">2</div><div class="step-label">Layout</div></div>
-    <div class="step" id="step-indicator-3"><div class="step-num">3</div><div class="step-label">Analysis</div></div>
-    <div class="step" id="step-indicator-4"><div class="step-num">4</div><div class="step-label">Job</div></div>
+  <!-- Auth -->
+  <div class="auth-bar">
+    <input type="password" id="authToken" placeholder="Designer token (leave empty if none)" />
+    <button class="btn btn-secondary" onclick="saveToken()">Save</button>
   </div>
 
-  <div id="alerts"></div>
-  <div id="step-content"></div>
+  <!-- Stepper -->
+  <div class="stepper" id="stepper">
+    <div class="step active" data-step="1" onclick="goToStep(1)">1. Method</div>
+    <div class="step" data-step="2" onclick="goToStep(2)">2. Plate Layout</div>
+    <div class="step" data-step="3" onclick="goToStep(3)">3. Analysis Plan</div>
+    <div class="step" data-step="4" onclick="goToStep(4)">4. Automation Job</div>
+    <div class="step" data-step="5" onclick="goToStep(5)">5. Review & Finalize</div>
+  </div>
 
-  <div class="actions" id="nav-actions" style="margin-top: 20px;">
-    <button class="btn btn-secondary hidden" id="btn-prev" onclick="prevStep()">Previous</button>
-    <button class="btn btn-primary" id="btn-next" onclick="nextStep()">Next</button>
+  <div id="statusArea"></div>
+
+  <!-- Step 1: Method -->
+  <div class="panel" id="step1">
+    <h2>Method — Acquisition Settings</h2>
+    <div class="form-group">
+      <label>Method title</label>
+      <input type="text" id="methodTitle" placeholder="e.g. OD600 Photometry v1" />
+    </div>
+    <div class="form-group">
+      <label>Measurement mode</label>
+      <select id="methodMode" onchange="onModeChange()">
+        <option value="photometry">Photometry (absorbance)</option>
+        <option value="fluorometry">Fluorometry</option>
+        <option value="luminescence">Luminescence</option>
+      </select>
+    </div>
+
+    <!-- Photometry settings -->
+    <div id="photometrySettings" class="form-group">
+      <label>Filter</label>
+      <select id="photoFilter">
+        <option value="P610">P610 — 610nm (OD600)</option>
+        <option value="P405">P405 — 405nm</option>
+        <option value="P450">P450 — 450nm</option>
+        <option value="P490">P490 — 490nm</option>
+        <option value="P260">P260 — 260nm</option>
+        <option value="P280">P280 — 280nm</option>
+      </select>
+      <label style="margin-top:8px">Read time (seconds)</label>
+      <input type="number" id="photoReadTime" value="1.0" step="0.1" min="0.1" />
+    </div>
+
+    <!-- Fluorometry settings -->
+    <div id="fluorometrySettings" class="form-group hidden">
+      <label>Excitation filter</label>
+      <select id="fluoExFilter">
+        <option value="F485">F485 — 485nm</option>
+        <option value="F355">F355 — 355nm</option>
+      </select>
+      <label style="margin-top:8px">Emission filter</label>
+      <select id="fluoEmFilter">
+        <option value="F535">F535 — 535nm</option>
+        <option value="F460">F460 — 460nm</option>
+      </select>
+      <label style="margin-top:8px">Read time (seconds)</label>
+      <input type="number" id="fluoReadTime" value="1.0" step="0.1" min="0.1" />
+    </div>
+
+    <!-- Luminescence settings -->
+    <div id="luminescenceSettings" class="form-group hidden">
+      <label>Integration time (seconds)</label>
+      <input type="number" id="lumiIntTime" value="1.0" step="0.1" min="0.1" />
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="saveMethod()">Save Method</button>
+    </div>
+
+    <div id="methodList"></div>
+  </div>
+
+  <!-- Step 2: Plate Layout -->
+  <div class="panel hidden" id="step2">
+    <h2>Plate Layout — 96-well Map</h2>
+    <div class="form-group">
+      <label>Layout title</label>
+      <input type="text" id="layoutTitle" placeholder="e.g. 96-well OD600 growth layout" />
+    </div>
+
+    <div style="display:flex; gap:16px; flex-wrap:wrap;">
+      <div class="plate-container">
+        <div class="plate-grid" id="plateGrid"></div>
+        <div class="legend">
+          <div class="legend-item"><div class="legend-swatch" style="background:var(--accent)"></div>Measured</div>
+          <div class="legend-item"><div class="legend-swatch" style="background:var(--bg);border:1px solid var(--border)"></div>Skipped</div>
+          <div class="legend-item"><div class="legend-swatch" style="background:var(--red)"></div>Excluded</div>
+          <div class="legend-item"><div class="legend-swatch" style="background:var(--yellow)"></div>Blank</div>
+          <div class="legend-item"><div class="legend-swatch" style="background:var(--green)"></div>Pos. control</div>
+          <div class="legend-item"><div class="legend-swatch" style="background:var(--blue)"></div>Neg. control</div>
+        </div>
+      </div>
+
+      <div style="flex:1; min-width:250px;">
+        <h2>Well Properties</h2>
+        <div id="wellDetail" class="well-detail">
+          <p class="hint">Click a well to edit its properties.</p>
+        </div>
+        <div style="margin-top:12px;">
+          <label>Quick fill: set all wells to</label>
+          <div style="display:flex; gap:4px; margin-top:4px;">
+            <button class="btn btn-secondary" onclick="fillAll('measured')">Measured</button>
+            <button class="btn btn-secondary" onclick="fillAll('skipped')">Skipped</button>
+          </div>
+        </div>
+        <div style="margin-top:8px;">
+          <label>Set selected wells to role:</label>
+          <div style="display:flex; gap:4px; margin-top:4px; flex-wrap:wrap;">
+            <button class="btn btn-secondary" onclick="setSelectedRole('measured')">Measured</button>
+            <button class="btn btn-secondary" onclick="setSelectedRole('skipped')">Skipped</button>
+            <button class="btn btn-secondary" onclick="setSelectedRole('excluded')">Excluded</button>
+            <button class="btn btn-secondary" onclick="setSelectedRole('blank')">Blank</button>
+            <button class="btn btn-secondary" onclick="setSelectedRole('positive_control')">Pos. Ctrl</button>
+            <button class="btn btn-secondary" onclick="setSelectedRole('negative_control')">Neg. Ctrl</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-secondary" onclick="goToStep(1)">Back</button>
+      <button class="btn btn-primary" onclick="saveLayout()">Save Layout</button>
+      <button class="btn btn-primary" onclick="goToStep(3)">Next →</button>
+    </div>
+  </div>
+
+  <!-- Step 3: Analysis Plan -->
+  <div class="panel hidden" id="step3">
+    <h2>Analysis Plan — Processing Rules</h2>
+    <div class="form-group">
+      <label>Analysis title</label>
+      <input type="text" id="analysisTitle" placeholder="e.g. Blank subtract + replicate stats" />
+    </div>
+
+    <div class="form-group">
+      <label><input type="checkbox" id="blankEnabled" onchange="toggleBlank()" /> Blank subtraction</label>
+      <div id="blankConfig" class="hidden" style="margin-left:16px; margin-top:8px;">
+        <p class="hint">Blank wells are identified by their control_type in the plate layout.</p>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label><input type="checkbox" id="replicateEnabled" checked /> Replicate aggregation (mean, SD, CV, N)</label>
+      <div style="margin-left:16px; margin-top:4px;">
+        <label>Group by</label>
+        <select id="replicateGroupBy">
+          <option value="replicate_group">replicate_group</option>
+          <option value="sample_name">sample_name</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label><input type="checkbox" id="normEnabled" onchange="toggleNorm()" /> Normalization to control</label>
+      <div id="normConfig" class="hidden" style="margin-left:16px; margin-top:8px;">
+        <label>Control type</label>
+        <select id="normControl">
+          <option value="positive_control">Positive control</option>
+          <option value="negative_control">Negative control</option>
+        </select>
+        <label style="margin-top:8px">Target value</label>
+        <input type="number" id="normTarget" value="100" step="1" />
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label>Excluded wells (comma-separated, e.g. A1,B2)</label>
+      <input type="text" id="exclusions" placeholder="A1,B2" />
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-secondary" onclick="goToStep(2)">Back</button>
+      <button class="btn btn-primary" onclick="saveAnalysis()">Save Analysis Plan</button>
+      <button class="btn btn-primary" onclick="goToStep(4)">Next →</button>
+    </div>
+  </div>
+
+  <!-- Step 4: Automation Job -->
+  <div class="panel hidden" id="step4">
+    <h2>Automation Job — Execution Request</h2>
+    <div class="form-group">
+      <label>Job title</label>
+      <input type="text" id="jobTitle" placeholder="e.g. OD600 run — E. coli growth 2026-06-27" />
+    </div>
+    <div class="form-group">
+      <label>Execution mode</label>
+      <select id="jobMode">
+        <option value="generated_protocol">Generated protocol (signed bundle)</option>
+        <option value="existing_protocol">Existing protocol (by name)</option>
+      </select>
+    </div>
+    <div id="existingProtocolField" class="form-group hidden">
+      <label>Protocol name</label>
+      <input type="text" id="jobProtocolName" placeholder="e.g. Absorbance @ 600 (1.0s)" />
+      <p class="hint">Enter the exact Wallac protocol name. Use the vm-agent /protocols endpoint to list available protocols.</p>
+    </div>
+    <div class="form-group">
+      <label>Linked experiment ID (optional)</label>
+      <input type="text" id="jobExperimentId" placeholder="e.g. 42" />
+    </div>
+    <div class="form-group">
+      <label>Expected outputs</label>
+      <textarea id="jobExpectedOutputs" placeholder="e.g. OD600 readings 0.2-0.8 for overnight cultures"></textarea>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-secondary" onclick="goToStep(3)">Back</button>
+      <button class="btn btn-primary" onclick="saveJob()">Save Job</button>
+      <button class="btn btn-primary" onclick="goToStep(5)">Review →</button>
+    </div>
+  </div>
+
+  <!-- Step 5: Review & Finalize -->
+  <div class="panel hidden" id="step5">
+    <h2>Review & Finalize</h2>
+    <p class="subtitle">Review the bundle, then finalize each object. After finalization, sign each resource in eLabFTW.</p>
+
+    <div class="summary-grid" id="reviewSummary"></div>
+
+    <div style="margin-top:16px;">
+      <h2>Actions</h2>
+      <p class="hint">Finalize computes the canonical JSON and attaches it with a SHA-256 hash. After finalizing, open each resource in eLabFTW and sign it.</p>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
+        <button class="btn btn-primary" onclick="finalizeAll()">Finalize All</button>
+      </div>
+    </div>
+
+    <div id="finalizeResults" style="margin-top:16px;"></div>
+
+    <div class="btn-row">
+      <button class="btn btn-secondary" onclick="goToStep(4)">Back</button>
+    </div>
   </div>
 </div>
 
 <script>
-// --- Configuration ---
-const ELABFTW_URL = window.location.origin.replace(/:\d+$/, ':3148'); // eLabFTW on same host
-
 // --- State ---
-let currentStep = 1;
-const selections = { method: null, layout: null, analysis: null, job: null };
-const drafts = { method: [], layout: [], analysis: [], job: [] };
+let token = localStorage.getItem('wallacDesignerToken') || '';
+let savedMethod = null;
+let savedLayout = null;
+let savedAnalysis = null;
+let savedJob = null;
+let selectedWell = null;
+const plateWells = {};
+
+// --- Init plate (all measured by default) ---
+const ROWS = 'ABCDEFGH';
+const COLS = Array.from({length: 12}, (_, i) => i + 1);
+for (const r of ROWS) {
+  for (const c of COLS) {
+    plateWells[`${r}${c}`] = { role: 'measured', sample_name: '', replicate_group: '', control_type: '' };
+  }
+}
+
+// --- Auth ---
+document.getElementById('authToken').value = token;
+function saveToken() {
+  token = document.getElementById('authToken').value;
+  localStorage.setItem('wallacDesignerToken', token);
+  showStatus('Token saved', 'success');
+}
+
+function authHeaders() {
+  return token ? { 'Authorization': 'Bearer ' + token } : {};
+}
 
 // --- API helpers ---
 async function api(method, path, body) {
-  const opts = { method, headers: {} };
-  if (body) {
-    opts.headers['Content-Type'] = 'application/json';
-    opts.body = JSON.stringify(body);
-  }
-  const resp = await fetch('/api/' + path, opts);
+  const opts = { method, headers: { ...authHeaders(), 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const resp = await fetch(path, opts);
   if (!resp.ok) {
-    const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-    throw new Error(err.detail?.human_message || err.detail || resp.statusText);
+    let detail = resp.statusText;
+    try { detail = JSON.stringify(await resp.json()); } catch {}
+    throw new Error(`${resp.status}: ${detail}`);
   }
   return resp.json();
 }
 
-function showAlert(type, msg) {
-  const el = document.getElementById('alerts');
-  el.innerHTML = `<div class="alert alert-${type}">${msg}</div>`;
-  setTimeout(() => el.innerHTML = '', 5000);
+// --- Status messages ---
+function showStatus(msg, type) {
+  const area = document.getElementById('statusArea');
+  area.innerHTML = `<div class="status-msg ${type}">${msg}</div>`;
+  setTimeout(() => area.innerHTML = '', 5000);
 }
 
-// --- Step rendering ---
-function renderStep(step) {
-  const content = document.getElementById('step-content');
-  const kinds = { 1: 'method', 2: 'layout', 3: 'analysis', 4: 'job' };
-  const kind = kinds[step];
-  const titles = { 1: 'Method', 2: 'Plate Layout', 3: 'Analysis Plan', 4: 'Automation Job' };
-
-  // Update indicators
-  for (let i = 1; i <= 4; i++) {
-    const el = document.getElementById('step-indicator-' + i);
-    el.classList.remove('active', 'done');
-    if (i < step) el.classList.add('done');
-    if (i === step) el.classList.add('active');
+// --- Stepper ---
+function goToStep(n) {
+  for (let i = 1; i <= 5; i++) {
+    document.getElementById('step' + i).classList.toggle('hidden', i !== n);
   }
-
-  // Update nav buttons
-  document.getElementById('btn-prev').classList.toggle('hidden', step === 1);
-  document.getElementById('btn-next').textContent = step === 4 ? 'Create Job' : 'Next';
-
-  if (step === 4) {
-    renderJobStep(content);
-  } else {
-    renderObjectStep(content, kind, titles[step]);
-  }
+  document.querySelectorAll('.step').forEach(s => {
+    const step = parseInt(s.dataset.step);
+    s.classList.toggle('active', step === n);
+    s.classList.toggle('done', step < n);
+  });
+  if (n === 5) renderReview();
 }
 
-function renderObjectStep(content, kind, title) {
-  content.innerHTML = `
-    <div class="card">
-      <h2>Select ${title}</h2>
-      <div class="form-group">
-        <label>Existing ${title}</label>
-        <select id="select-${kind}" onchange="selections.${kind} = this.value || null">
-          <option value="">-- Create new --</option>
-        </select>
-      </div>
-      <button class="btn btn-secondary" onclick="loadList('${kind}')">Refresh list</button>
-    </div>
-    <div class="card">
-      <h2>Create New ${title} Draft</h2>
-      <div class="form-group">
-        <label>Title</label>
-        <input type="text" id="new-${kind}-title" placeholder="${title} name">
-      </div>
-      <div class="form-group">
-        <label>Spec (JSON)</label>
-        <textarea id="new-${kind}-spec" placeholder='{"mode": "photometry", ...}'>${kind === 'method' ? '{"mode":"photometry","filter":"P610","read_time_s":0.1}' : kind === 'layout' ? '{"wells":[{"well_name":"A1","role":"measured"}]}' : '{"blank_subtraction":true,"replicate_groups":["A"]}'}</textarea>
-      </div>
-      <button class="btn btn-primary" onclick="createDraft('${kind}')">Create Draft</button>
-      <button class="btn btn-secondary" onclick="finalizeDraft('${kind}')">Finalize Selected</button>
-    </div>
-  `;
-  loadList(kind);
+// --- Step 1: Method ---
+function onModeChange() {
+  const mode = document.getElementById('methodMode').value;
+  document.getElementById('photometrySettings').classList.toggle('hidden', mode !== 'photometry');
+  document.getElementById('fluorometrySettings').classList.toggle('hidden', mode !== 'fluorometry');
+  document.getElementById('luminescenceSettings').classList.toggle('hidden', mode !== 'luminescence');
 }
 
-function renderJobStep(content) {
-  const methodId = selections.method || '(none)';
-  const layoutId = selections.layout || '(none)';
-  const analysisId = selections.analysis || '(none)';
-
-  content.innerHTML = `
-    <div class="card">
-      <h2>Automation Job Summary</h2>
-      <div class="summary">
-        <div class="summary-row"><span class="summary-label">Method:</span><span class="summary-value">${methodId}</span></div>
-        <div class="summary-row"><span class="summary-label">Layout:</span><span class="summary-value">${layoutId}</span></div>
-        <div class="summary-row"><span class="summary-label">Analysis:</span><span class="summary-value">${analysisId}</span></div>
-      </div>
-      <div class="form-group">
-        <label>Job Title</label>
-        <input type="text" id="job-title" placeholder="Automation Job title" value="Run ${new Date().toISOString().slice(0,10)}">
-      </div>
-      <div class="form-group">
-        <label>Execution Mode</label>
-        <select id="job-mode">
-          <option value="generated_protocol">generated_protocol (signed bundle)</option>
-          <option value="existing_protocol">existing_protocol (by name)</option>
-        </select>
-      </div>
-      <div class="form-group">
-        <label>Protocol Name (existing_protocol only)</label>
-        <input type="text" id="job-protocol-name" placeholder="Absorbance @ 600 (0.1s)">
-      </div>
-      <div class="form-group">
-        <label>Linked Experiment ID (optional)</label>
-        <input type="text" id="job-exp-id" placeholder="">
-      </div>
-      <button class="btn btn-primary" onclick="createJob()">Create & Finalize Job</button>
-    </div>
-    <div id="job-result"></div>
-  `;
-}
-
-// --- Actions ---
-async function loadList(kind) {
-  const select = document.getElementById('select-' + kind);
-  if (!select) return;
-  select.innerHTML = '<option value="">-- Create new --</option>';
-  try {
-    const items = await api('GET', kind + 's');
-    drafts[kind] = items;
-    for (const item of items) {
-      const opt = document.createElement('option');
-      opt.value = item.item_id;
-      const badge = item.hash ? ' [signed]' : ' [draft]';
-      opt.textContent = `#${item.item_id}: ${item.title}${badge}`;
-      select.appendChild(opt);
-    }
-  } catch (e) {
-    showAlert('error', 'Failed to load ' + kind + ' list: ' + e.message);
-  }
-}
-
-async function createDraft(kind) {
-  const title = document.getElementById('new-' + kind + '-title').value.trim();
-  const specText = document.getElementById('new-' + kind + '-spec').value.trim();
-  if (!title) { showAlert('error', 'Title is required'); return; }
-  let spec = {};
-  try { spec = JSON.parse(specText || '{}'); } catch { showAlert('error', 'Invalid JSON spec'); return; }
-
-  try {
-    const result = await api('POST', kind + 's', { title, spec });
-    showAlert('success', `Created ${kind} draft #${result.item_id}`);
-    selections[kind] = result.item_id;
-    await loadList(kind);
-    document.getElementById('select-' + kind).value = result.item_id;
-  } catch (e) {
-    showAlert('error', 'Create failed: ' + e.message);
-  }
-}
-
-async function finalizeDraft(kind) {
-  const itemId = selections[kind];
-  if (!itemId) { showAlert('error', 'Select a ' + kind + ' first'); return; }
-  try {
-    const result = await api('POST', kind + 's/' + itemId + '/finalize');
-    showAlert('success', `Finalized ${kind} #${itemId}. Hash: ${result.hash.slice(0,12)}...`);
-    showAlert('info', `Sign this object in eLabFTW, then proceed to the next step.`);
-  } catch (e) {
-    showAlert('error', 'Finalize failed: ' + e.message);
-  }
-}
-
-async function createJob() {
-  const title = document.getElementById('job-title').value.trim();
-  const mode = document.getElementById('job-mode').value;
-  const protocolName = document.getElementById('job-protocol-name').value.trim();
-  const expId = document.getElementById('job-exp-id').value.trim();
-
-  if (!title) { showAlert('error', 'Job title is required'); return; }
-
+function buildMethodSpec() {
+  const mode = document.getElementById('methodMode').value;
   const spec = {
-    execution_mode: mode,
-    method: { object_id: parseInt(selections.method) || 0 },
-    layout: { object_id: parseInt(selections.layout) || 0 },
-    analysis: { object_id: parseInt(selections.analysis) || 0 },
+    schema_name: 'wallac.method',
+    schema_version: 1,
+    mode: mode,
+    name: document.getElementById('methodTitle').value || 'Untitled Method',
+    plate_type: '96-well',
   };
-  if (protocolName) spec.protocol_name = protocolName;
-  if (expId) spec.linked_experiment_id = expId;
+  if (mode === 'photometry') {
+    const f = document.getElementById('photoFilter');
+    spec.photometry = {
+      filter_id: f.value,
+      filter_name: f.options[f.selectedIndex].text,
+      read_time_seconds: parseFloat(document.getElementById('photoReadTime').value),
+    };
+  } else if (mode === 'fluorometry') {
+    const ex = document.getElementById('fluoExFilter');
+    const em = document.getElementById('fluoEmFilter');
+    spec.fluorometry = {
+      excitation_filter_id: ex.value,
+      excitation_filter_name: ex.options[ex.selectedIndex].text,
+      emission_filter_id: em.value,
+      emission_filter_name: em.options[em.selectedIndex].text,
+      read_time_seconds: parseFloat(document.getElementById('fluoReadTime').value),
+    };
+  } else if (mode === 'luminescence') {
+    spec.luminescence = {
+      integration_time_seconds: parseFloat(document.getElementById('lumiIntTime').value),
+    };
+  }
+  return spec;
+}
 
+async function saveMethod() {
+  const title = document.getElementById('methodTitle').value;
+  if (!title) { showStatus('Enter a method title', 'error'); return; }
+  const spec = buildMethodSpec();
   try {
-    // Create the job draft
-    const job = await api('POST', 'jobs', { title, spec });
-    showAlert('success', `Created job draft #${job.item_id}`);
+    const result = await api('POST', '/api/methods', { title, spec });
+    savedMethod = result;
+    showStatus(`Method saved: id=${result.item_id}`, 'success');
+    loadMethods();
+  } catch (e) { showStatus('Failed: ' + e.message, 'error'); }
+}
 
-    // Finalize the job
-    const finalized = await api('POST', 'jobs/' + job.item_id + '/finalize');
-    showAlert('info', `Finalized job #${job.item_id}. Hash: ${finalized.hash.slice(0,12)}...`);
+async function loadMethods() {
+  try {
+    const methods = await api('GET', '/api/methods');
+    const list = document.getElementById('methodList');
+    list.innerHTML = '<h2 style="margin-top:16px;">Saved Methods</h2><ul class="resource-list">' +
+      methods.map(m => `<li><div><span class="resource-title">${m.title}</span><br><span class="resource-meta">id=${m.item_id}, lifecycle=${m.lifecycle}, mode=${m.spec.mode||'?'}</span></div><button class="btn btn-secondary" onclick="selectMethod(${m.item_id})">Select</button></li>`).join('') +
+      '</ul>';
+  } catch {}
+}
 
-    // Show result with eLabFTW link
-    document.getElementById('job-result').innerHTML = `
-      <div class="card">
-        <h2>Job Created</h2>
-        <div class="summary">
-          <div class="summary-row"><span class="summary-label">Job ID:</span><span class="summary-value">#${job.item_id}</span></div>
-          <div class="summary-row"><span class="summary-label">Hash:</span><span class="summary-value">${finalized.hash}</span></div>
-        </div>
-        <div class="alert alert-info">
-          <strong>Next steps:</strong>
-          <ol>
-            <li>Sign the Automation Job in eLabFTW (an authorized operator must sign)</li>
-            <li>Set <code>Requested action = submit</code> in eLabFTW</li>
-            <li>The bridge will automatically pick up and execute the job</li>
-          </ol>
-        </div>
-        <a class="elabftw-link" href="${ELABFTW_URL}/database.php?mode=view&id=${job.item_id}" target="_blank">Open in eLabFTW</a>
-      </div>
-    `;
-  } catch (e) {
-    showAlert('error', 'Job creation failed: ' + e.message);
+async function selectMethod(id) {
+  try {
+    savedMethod = await api('GET', `/api/methods/${id}`);
+    document.getElementById('methodTitle').value = savedMethod.title;
+    document.getElementById('methodMode').value = savedMethod.spec.mode || 'photometry';
+    onModeChange();
+    showStatus(`Selected method: ${savedMethod.title}`, 'info');
+  } catch (e) { showStatus('Failed: ' + e.message, 'error'); }
+}
+
+// --- Step 2: Plate Layout ---
+function renderPlate() {
+  const grid = document.getElementById('plateGrid');
+  let html = '<div></div>';
+  for (const c of COLS) html += `<div class="plate-col-label">${c}</div>`;
+  for (const r of ROWS) {
+    html += `<div class="plate-row-label">${r}</div>`;
+    for (const c of COLS) {
+      const name = `${r}${c}`;
+      const w = plateWells[name];
+      let cls = 'well ' + (w.control_type || w.role);
+      html += `<div class="${cls}" data-well="${name}" onclick="selectWell('${name}')">${name.slice(1)}</div>`;
+    }
+  }
+  grid.innerHTML = html;
+}
+
+function selectWell(name) {
+  selectedWell = name;
+  document.querySelectorAll('.well').forEach(w => w.classList.remove('selected'));
+  document.querySelector(`[data-well="${name}"]`)?.classList.add('selected');
+  const w = plateWells[name];
+  document.getElementById('wellDetail').innerHTML = `
+    <label>Well: ${name}</label>
+    <label style="margin-top:8px;">Role</label>
+    <select onchange="updateWell('${name}', 'role', this.value)">
+      <option value="measured" ${w.role==='measured'?'selected':''}>Measured</option>
+      <option value="skipped" ${w.role==='skipped'?'selected':''}>Skipped</option>
+      <option value="excluded" ${w.role==='excluded'?'selected':''}>Excluded</option>
+    </select>
+    <label style="margin-top:8px;">Control type</label>
+    <select onchange="updateWell('${name}', 'control_type', this.value)">
+      <option value="" ${!w.control_type?'selected':''}>None</option>
+      <option value="blank" ${w.control_type==='blank'?'selected':''}>Blank</option>
+      <option value="positive_control" ${w.control_type==='positive_control'?'selected':''}>Positive control</option>
+      <option value="negative_control" ${w.control_type==='negative_control'?'selected':''}>Negative control</option>
+    </select>
+    <label style="margin-top:8px;">Sample name</label>
+    <input type="text" value="${w.sample_name||''}" onchange="updateWell('${name}', 'sample_name', this.value)" />
+    <label style="margin-top:8px;">Replicate group</label>
+    <input type="text" value="${w.replicate_group||''}" onchange="updateWell('${name}', 'replicate_group', this.value)" />
+  `;
+}
+
+function updateWell(name, field, value) {
+  plateWells[name][field] = value;
+  if (field === 'role' || field === 'control_type') renderPlate();
+  if (selectedWell === name) selectWell(name);
+}
+
+function fillAll(role) {
+  for (const name in plateWells) plateWells[name].role = role;
+  renderPlate();
+}
+
+function setSelectedRole(role) {
+  // If a well is selected, apply to it; otherwise apply to all
+  if (selectedWell) {
+    if (['measured','skipped','excluded'].includes(role)) {
+      plateWells[selectedWell].role = role;
+    } else {
+      plateWells[selectedWell].control_type = role;
+      plateWells[selectedWell].role = 'measured';
+    }
+    renderPlate();
+    selectWell(selectedWell);
+  } else {
+    for (const name in plateWells) {
+      if (['measured','skipped','excluded'].includes(role)) {
+        plateWells[name].role = role;
+      } else {
+        plateWells[name].control_type = role;
+        plateWells[name].role = 'measured';
+      }
+    }
+    renderPlate();
   }
 }
 
-// --- Navigation ---
-function nextStep() {
-  if (currentStep < 4) {
-    currentStep++;
-    renderStep(currentStep);
+function buildLayoutSpec() {
+  const wells = [];
+  for (const r of ROWS) {
+    for (const c of COLS) {
+      const name = `${r}${c}`;
+      const w = plateWells[name];
+      const well = { well_name: name, role: w.role };
+      if (w.sample_name) well.sample_name = w.sample_name;
+      if (w.replicate_group) well.replicate_group = w.replicate_group;
+      if (w.control_type) well.control_type = w.control_type;
+      wells.push(well);
+    }
   }
+  return {
+    schema_name: 'wallac.layout',
+    schema_version: 1,
+    plate_type: '96-well',
+    wells: wells,
+  };
 }
 
-function prevStep() {
-  if (currentStep > 1) {
-    currentStep--;
-    renderStep(currentStep);
+async function saveLayout() {
+  const title = document.getElementById('layoutTitle').value;
+  if (!title) { showStatus('Enter a layout title', 'error'); return; }
+  const spec = buildLayoutSpec();
+  try {
+    const result = await api('POST', '/api/layouts', { title, spec });
+    savedLayout = result;
+    showStatus(`Layout saved: id=${result.item_id}`, 'success');
+  } catch (e) { showStatus('Failed: ' + e.message, 'error'); }
+}
+
+// --- Step 3: Analysis ---
+function toggleBlank() {
+  document.getElementById('blankConfig').classList.toggle('hidden', !document.getElementById('blankEnabled').checked);
+}
+function toggleNorm() {
+  document.getElementById('normConfig').classList.toggle('hidden', !document.getElementById('normEnabled').checked);
+}
+
+function buildAnalysisSpec() {
+  const spec = {
+    schema_name: 'wallac.analysis',
+    schema_version: 1,
+    blank_subtraction: {
+      enabled: document.getElementById('blankEnabled').checked,
+      blank_wells: Object.entries(plateWells).filter(([_,w]) => w.control_type === 'blank').map(([name]) => name),
+    },
+    replicate_aggregation: {
+      enabled: document.getElementById('replicateEnabled').checked,
+      group_by: document.getElementById('replicateGroupBy').value,
+    },
+    normalization: {
+      enabled: document.getElementById('normEnabled').checked,
+      control_type: document.getElementById('normControl').value,
+      target_value: parseFloat(document.getElementById('normTarget').value),
+    },
+    thresholds: [],
+    exclusions: document.getElementById('exclusions').value.split(',').map(s => s.trim()).filter(Boolean),
+    outputs: ['raw_results', 'analyzed_wells', 'replicate_summary', 'analysis_summary'],
+  };
+  return spec;
+}
+
+async function saveAnalysis() {
+  const title = document.getElementById('analysisTitle').value;
+  if (!title) { showStatus('Enter an analysis title', 'error'); return; }
+  const spec = buildAnalysisSpec();
+  try {
+    const result = await api('POST', '/api/analyses', { title, spec });
+    savedAnalysis = result;
+    showStatus(`Analysis plan saved: id=${result.item_id}`, 'success');
+  } catch (e) { showStatus('Failed: ' + e.message, 'error'); }
+}
+
+// --- Step 4: Job ---
+document.getElementById('jobMode').addEventListener('change', function() {
+  document.getElementById('existingProtocolField').classList.toggle('hidden', this.value !== 'existing_protocol');
+});
+
+function buildJobSpec() {
+  const mode = document.getElementById('jobMode').value;
+  const spec = {
+    schema_name: 'wallac.job',
+    schema_version: 1,
+    execution_mode: mode,
+  };
+  if (mode === 'existing_protocol') {
+    spec.protocol_name = document.getElementById('jobProtocolName').value;
+  } else {
+    if (savedMethod) {
+      spec.method = { object_id: savedMethod.item_id, hash: savedMethod.hash || '', json_attachment_id: savedMethod.json_attachment_id || 0 };
+    }
+    if (savedLayout) {
+      spec.layout = { source: 'reusable', hash: savedLayout.hash || '', json_attachment_id: savedLayout.json_attachment_id || 0, object_id: savedLayout.item_id };
+    }
+    if (savedAnalysis) {
+      spec.analysis = { object_id: savedAnalysis.item_id, hash: savedAnalysis.hash || '', json_attachment_id: savedAnalysis.json_attachment_id || 0 };
+    }
   }
+  return spec;
+}
+
+async function saveJob() {
+  const title = document.getElementById('jobTitle').value;
+  if (!title) { showStatus('Enter a job title', 'error'); return; }
+  const spec = buildJobSpec();
+  try {
+    const result = await api('POST', '/api/jobs', { title, spec });
+    savedJob = result;
+    showStatus(`Job saved: id=${result.item_id}`, 'success');
+  } catch (e) { showStatus('Failed: ' + e.message, 'error'); }
+}
+
+// --- Step 5: Review ---
+function renderReview() {
+  const summary = document.getElementById('reviewSummary');
+  const items = [];
+  if (savedMethod) items.push(['Method', savedMethod]);
+  if (savedLayout) items.push(['Plate Layout', savedLayout]);
+  if (savedAnalysis) items.push(['Analysis Plan', savedAnalysis]);
+  if (savedJob) items.push(['Automation Job', savedJob]);
+
+  summary.innerHTML = items.map(([label, obj]) => `
+    <div class="summary-item">
+      <div class="summary-label">${label}</div>
+      <div class="summary-value">${obj.title}</div>
+      <div class="resource-meta">id=${obj.item_id}, lifecycle=${obj.lifecycle}</div>
+      <div class="resource-meta">hash=${obj.hash ? obj.hash.slice(0,16)+'...' : '(not finalized)'}</div>
+      <div class="resource-meta">attachment=${obj.json_attachment_id || '(none)'}</div>
+    </div>
+  `).join('');
+}
+
+async function finalizeAll() {
+  const results = document.getElementById('finalizeResults');
+  results.innerHTML = '';
+  const items = [
+    ['Method', savedMethod, 'methods'],
+    ['Plate Layout', savedLayout, 'layouts'],
+    ['Analysis Plan', savedAnalysis, 'analyses'],
+    ['Automation Job', savedJob, 'jobs'],
+  ];
+  for (const [label, obj, prefix] of items) {
+    if (!obj) continue;
+    try {
+      const result = await api('POST', `/api/${prefix}/${obj.item_id}/finalize`);
+      obj.hash = result.hash;
+      obj.json_attachment_id = result.json_attachment_id;
+      results.innerHTML += `<div class="status-msg success">${label} finalized: hash=${result.hash.slice(0,16)}..., attachment=${result.json_attachment_id}</div>`;
+    } catch (e) {
+      results.innerHTML += `<div class="status-msg error">${label} finalize failed: ${e.message}</div>`;
+    }
+  }
+  renderReview();
 }
 
 // --- Init ---
-renderStep(1);
+renderPlate();
+onModeChange();
+loadMethods();
 </script>
 </body>
 </html>
