@@ -184,6 +184,9 @@ class MockElabftwClient:
         self._next_upload_id = 1
         # If set, patch_metadata raises this to simulate transient failures
         self._patch_fail_countdown: int = 0
+        # experiment_id -> {"title":..., "body":..., "links": [item_id, ...]}
+        self._experiments: dict[int, dict[str, Any]] = {}
+        self._next_experiment_id = 1
 
     # --- Setup helpers (for tests) ---
 
@@ -305,6 +308,19 @@ class MockElabftwClient:
 
     def post_comment(self, item_id: int, comment: str) -> None:
         self._comments.setdefault(item_id, []).append(comment)
+
+    # --- Experiment methods (Stage 6: Assay write-back) ---
+
+    def create_experiment(self, title: str, body: str = "") -> int:
+        exp_id = self._next_experiment_id
+        self._next_experiment_id += 1
+        self._experiments[exp_id] = {"title": title, "body": body, "links": []}
+        return exp_id
+
+    def link_experiment_to_item(self, experiment_id: int, item_id: int) -> None:
+        if experiment_id not in self._experiments:
+            raise KeyError(f"experiment {experiment_id} not found")
+        self._experiments[experiment_id]["links"].append(item_id)
 
     # --- Inspection helpers (for test assertions) ---
 
