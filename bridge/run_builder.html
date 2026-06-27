@@ -58,6 +58,7 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
 .well.negative_control { background: var(--blue); color: #fff; }
 .well:hover { border-color: #fff; border-width: 2px; }
 .well.selected { border-color: #fff; border-width: 2px; box-shadow: 0 0 4px #fff; }
+.well.dragging { outline: 2px solid #fff; outline-offset: -2px; }
 
 /* Legend */
 .legend { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; font-size: 0.75rem; }
@@ -198,7 +199,7 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
       <div style="flex:1; min-width:250px;">
         <h2>Well Properties</h2>
         <div id="wellDetail" class="well-detail">
-          <p class="hint">Click a well to edit its properties.</p>
+          <p class="hint">Click a well to edit it. Click and drag to select a rectangular region. Shift+click to add to selection.</p>
         </div>
         <div style="margin-top:12px;">
           <label>Quick fill: set all wells to</label>
@@ -476,6 +477,13 @@ async function selectMethod(id) {
 }
 
 // --- Step 2: Plate Layout ---
+
+// Drag-select state
+let isDragging = false;
+let dragStart = null;  // {row, col}
+let dragEnd = null;
+let selectedWells = new Set();
+
 function renderPlate() {
   const grid = document.getElementById('plateGrid');
   let html = '<div></div>';
@@ -486,16 +494,146 @@ function renderPlate() {
       const name = `${r}${c}`;
       const w = plateWells[name];
       let cls = 'well ' + (w.control_type || w.role);
-      html += `<div class="${cls}" data-well="${name}" onclick="selectWell('${name}')">${name.slice(1)}</div>`;
+      html += `<div class="${cls}" data-well="${name}" data-row="${r}" data-col="${c}">${c}</div>`;
     }
   }
   grid.innerHTML = html;
+
+  // Attach mouse listeners for drag-select
+  grid.querySelectorAll('.well').forEach(el => {
+    el.addEventListener('mousedown', onWellMouseDown);
+    el.addEventListener('mouseenter', onWellMouseEnter);
+  });
+  document.addEventListener('mouseup', onDocMouseUp);
+}
+
+function onWellMouseDown(e) {
+  e.preventDefault();
+  const el = e.currentTarget;
+  const name = el.dataset.well;
+
+  // If clicking a single well without drag, select it for detail editing
+  isDragging = true;
+  dragStart = { row: el.dataset.row, col: parseInt(el.dataset.col) };
+  dragEnd = { ...dragStart };
+
+  // Clear previous selection unless shift/ctrl is held
+  if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
+    selectedWells.clear();
+  }
+  updateDragSelection();
+}
+
+function onWellMouseEnter(e) {
+  if (!isDragging) return;
+  const el = e.currentTarget;
+  dragEnd = { row: el.dataset.row, col: parseInt(el.dataset.col) };
+  updateDragSelection();
+}
+
+function onDocMouseUp() {
+  if (!isDragging) return;
+  isDragging = false;
+
+  // If only one well selected, show its detail panel
+  if (selectedWells.size === 1) {
+    const name = [...selectedWells][0];
+    selectWell(name);
+  } else if (selectedWells.size > 1) {
+    showMultiSelectDetail();
+  }
+}
+
+function updateDragSelection() {
+  if (!dragStart || !dragEnd) return;
+
+  const startRowIdx = ROWS.indexOf(dragStart.row);
+  const endRowIdx = ROWS.indexOf(dragEnd.row);
+  const rowMin = Math.min(startRowIdx, endRowIdx);
+  const rowMax = Math.max(startRowIdx, endRowIdx);
+  const colMin = Math.min(dragStart.col, dragEnd.col);
+  const colMax = Math.max(dragStart.col, dragEnd.col);
+
+  // Add all wells in the rectangle to selection (don't clear — caller handles that)
+  for (let ri = rowMin; ri <= rowMax; ri++) {
+    for (let ci = colMin; ci <= colMax; ci++) {
+      selectedWells.add(`${ROWS[ri]}${ci}`);
+    }
+  }
+
+  // Update visual state
+  document.querySelectorAll('.well').forEach(el => {
+    el.classList.toggle('dragging', selectedWells.has(el.dataset.well));
+  });
+}
+
+function showMultiSelectDetail() {
+  const count = selectedWells.size;
+  const names = [...selectedWells].sort();
+  document.getElementById('wellDetail').innerHTML = `
+    <label>${count} wells selected</label>
+    <p class="hint">${names.slice(0, 12).join(', ')}${names.length > 12 ? '...' : ''}</p>
+    <label style="margin-top:8px;">Set role for all selected:</label>
+    <div style="display:flex; gap:4px; flex-wrap:wrap; margin-top:4px;">
+      <button class="btn btn-secondary" onclick="applyToSelected('role','measured')">Measured</button>
+      <button class="btn btn-secondary" onclick="applyToSelected('role','skipped')">Skipped</button>
+      <button class="btn btn-secondary" onclick="applyToSelected('role','excluded')">Excluded</button>
+    </div>
+    <label style="margin-top:8px;">Set control type for all selected:</label>
+    <div style="display:flex; gap:4px; flex-wrap:wrap; margin-top:4px;">
+      <button class="btn btn-secondary" onclick="applyToSelected('control_type','')">None</button>
+      <button class="btn btn-secondary" onclick="applyToSelected('control_type','blank')">Blank</button>
+      <button class="btn btn-secondary" onclick="applyToSelected('control_type','positive_control')">Pos. Ctrl</button>
+      <button class="btn btn-secondary" onclick="applyToSelected('control_type','negative_control')">Neg. Ctrl</button>
+    </div>
+    <label style="margin-top:8px;">Set replicate group for all selected:</label>
+    <input type="text" id="multiReplicateGroup" placeholder="e.g. G1" />
+    <button class="btn btn-secondary" style="margin-top:4px;" onclick="applyReplicateToSelected()">Apply</button>
+    <label style="margin-top:8px;">Set sample name for all selected:</label>
+    <input type="text" id="multiSampleName" placeholder="e.g. Sample A" />
+    <button class="btn btn-secondary" style="margin-top:4px;" onclick="applySampleToSelected()">Apply</button>
+  `;
+}
+
+function applyToSelected(field, value) {
+  for (const name of selectedWells) {
+    plateWells[name][field] = value;
+    if (field === 'control_type' && value) {
+      plateWells[name].role = 'measured';
+    }
+  }
+  renderPlate();
+  // Re-highlight selected wells
+  document.querySelectorAll('.well').forEach(el => {
+    el.classList.toggle('dragging', selectedWells.has(el.dataset.well));
+  });
+  if (selectedWells.size === 1) {
+    selectWell([...selectedWells][0]);
+  } else {
+    showMultiSelectDetail();
+  }
+}
+
+function applyReplicateToSelected() {
+  const val = document.getElementById('multiReplicateGroup').value;
+  for (const name of selectedWells) plateWells[name].replicate_group = val;
+  showStatus(`Set replicate group "${val}" on ${selectedWells.size} wells`, 'success');
+}
+
+function applySampleToSelected() {
+  const val = document.getElementById('multiSampleName').value;
+  for (const name of selectedWells) plateWells[name].sample_name = val;
+  showStatus(`Set sample name "${val}" on ${selectedWells.size} wells`, 'success');
 }
 
 function selectWell(name) {
   selectedWell = name;
-  document.querySelectorAll('.well').forEach(w => w.classList.remove('selected'));
-  document.querySelector(`[data-well="${name}"]`)?.classList.add('selected');
+  selectedWells.clear();
+  selectedWells.add(name);
+  document.querySelectorAll('.well').forEach(w => {
+    w.classList.remove('dragging');
+    w.classList.toggle('selected', w.dataset.well === name);
+  });
   const w = plateWells[name];
   document.getElementById('wellDetail').innerHTML = `
     <label>Well: ${name}</label>
@@ -531,17 +669,14 @@ function fillAll(role) {
 }
 
 function setSelectedRole(role) {
-  // If a well is selected, apply to it; otherwise apply to all
-  if (selectedWell) {
-    if (['measured','skipped','excluded'].includes(role)) {
-      plateWells[selectedWell].role = role;
-    } else {
-      plateWells[selectedWell].control_type = role;
-      plateWells[selectedWell].role = 'measured';
-    }
-    renderPlate();
-    selectWell(selectedWell);
+  // Apply to all currently selected wells (drag-selected or single)
+  if (selectedWells.size > 0) {
+    applyToSelected(
+      ['measured','skipped','excluded'].includes(role) ? 'role' : 'control_type',
+      role
+    );
   } else {
+    // No selection — apply to all
     for (const name in plateWells) {
       if (['measured','skipped','excluded'].includes(role)) {
         plateWells[name].role = role;
