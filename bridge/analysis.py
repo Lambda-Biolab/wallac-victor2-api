@@ -260,10 +260,11 @@ class AnalysisPipeline:
         result: AnalysisResult,
     ) -> None:
         """Steps 1-2: Load raw values, mark skipped wells, merge layout info."""
-        # vm-agent returns 'well', layout/analysis specs use 'well_name'
-        raw_by_name = {
-            (w.get("well_name") or w.get("well") or ""): w for w in raw_wells
-        }
+        from bridge.execution import _well_key
+
+        # vm-agent returns 'well' (e.g. 'A01'), layout/analysis specs use
+        # 'well_name' (e.g. 'A1'). _well_key normalizes both to 'A1'.
+        raw_by_name = {_well_key(w): w for w in raw_wells}
 
         # Include all 96 wells from the layout
         for well_name, layout_def in layout_wells.items():
