@@ -3,7 +3,7 @@
 Date: 2026-06-26
 Target repo: `Lambda-Biolab/wallac-victor2-api`
 Plan branch: `plan/wallac-protocol-authoring`
-Status: approved planning artifact; implementation not started here
+Status: **Stages 1–6 implemented and merged. Stage 7 in progress: `existing_protocol` path validated on live hardware; `generated_protocol` path not yet tested on instrument.**
 
 ## Purpose
 
@@ -587,6 +587,8 @@ Do not add Wallac runtime services to the core eLabFTW compose as part of v1.
 
 ### Stage 1: schemas, canonicalization, tests only
 
+**Status: ✅ DONE (merged)**
+
 - Add schema modules for Method/Layout/Analysis/Job.
 - Add deterministic serializer.
 - Add exact-byte hash helpers.
@@ -599,7 +601,11 @@ Acceptance:
 - hash mismatch/attachment mismatch tests fail closed;
 - schema unsupported/future version tests fail closed.
 
+Implementation: `bridge/canonical.py`, `bridge/schemas.py`, 8 golden fixtures, 58 tests.
+
 ### Stage 2: eLabFTW setup/docs contract
+
+**Status: ✅ DONE (merged)**
 
 - Prepare supporting eLabFTW repo plan/patch for category/template migration.
 - Document object model, signatures, canonical attachments, designer links, and stale-doc correction.
@@ -610,7 +616,11 @@ Acceptance:
 - dry-run migration shows safe create/patch/skip behavior;
 - docs distinguish generated authoring from legacy existing-protocol execution.
 
+Implementation: `docs/elabftw-object-model.md`, `tools/elab-seed/seed_wallac.py` (213 tests), 5 categories created/renamed on live eLabFTW.
+
 ### Stage 3: authenticated designer/Run Builder drafts
+
+**Status: ✅ DONE (merged)**
 
 - Add Linux-side web backend/framework if needed.
 - Implement authenticated draft APIs.
@@ -624,7 +634,11 @@ Acceptance:
 - draft mutation allowed;
 - signed mutation rejected or routed to clone/version.
 
+Implementation: `bridge/designer.py` (DesignerService), `bridge/designer_app.py` (FastAPI app with CRUD + finalize + clone), `bridge/run_builder.html` (single-page wizard UI served at `/run-builder`). 31 tests.
+
 ### Stage 4: validation-only bridge path
+
+**Status: ✅ DONE (merged)**
 
 - Implement signed canonical attachment verification.
 - Implement signer allowlist.
@@ -641,7 +655,11 @@ Acceptance:
 - stale lifecycle or hash mismatch fails closed;
 - validate-only never mutates MDB or starts run.
 
+Implementation: `bridge/validation.py` (ValidationService with signed attachment verification, signer allowlist, lifecycle eligibility, vm-agent capability checks). 18 tests.
+
 ### Stage 5: vm-agent generated-protocol support behind disabled flag
+
+**Status: ✅ DONE (merged + deployed to live VM)**
 
 - Add generated-protocol validate/create/delete endpoints.
 - Add operator-installed template config/fingerprints.
@@ -657,7 +675,16 @@ Acceptance:
 - test MDB fixtures cover template copy/patch, collision, drift, backup failure, rollback, post-write verification, and cleanup filters;
 - no generated writes unless feature flag and mode gate are enabled.
 
+Implementation:
+- `bridge/generated_protocols.py` (GeneratedProtocolManager with ID allocation, collision detection, backup, single-writer lock, post-write verification, cleanup). 23 tests.
+- `vm-agent/agent.py`: 9 new MDB endpoints (`GET /mdb/groups`, `GET /mdb/protocols/{id}`, `GET /mdb/protocols?name=`, `GET /mdb/max-protocol-id`, `POST /mdb/protocols`, `DELETE /mdb/protocols/{id}`, `POST /mdb/backup`, `POST /mdb/query`, `POST /mdb/groups`). Single-writer lock, feature flag `WALLAC_ENABLE_PROTOCOL_AUTHORING`.
+- `bridge/remote_mdb_client.py` (RemoteMdbClient implementing MdbClient Protocol via HTTP to vm-agent). 28 tests.
+- `bridge/factory.py` (create_orchestrator wiring all components from BridgeConfig).
+- **Deployed to live VM** (`C:\install\agent.py` on `win7-wallac`). All 9 endpoints verified against live MDB. `eLabFTW Generated` protocol group created (GroupID=10001). Authoring flag enabled via `C:\install\run_agent.bat` (scheduled task `wallac-agent`).
+
 ### Stage 6: bridge generated execution path
+
+**Status: ✅ DONE (merged + validated on live hardware for existing_protocol mode)**
 
 - Add `generated_protocol` execution mode.
 - Add oldest-first queue and claim behavior.
@@ -672,7 +699,32 @@ Acceptance:
 
 - mocked vm-agent/eLabFTW tests cover success, validation failures, generation failures, run failures, incomplete results, analysis failure, write-back spool/retry, abort/recovery.
 
+Implementation:
+- `bridge/execution.py` (ExecutionOrchestrator: validation → generation → run → completeness → analysis → spool → write-back → Assay summary). `check_result_completeness()`, `_write_assay_summary()`, `_build_assay_body()`.
+- `bridge/analysis.py` (AnalysisPipeline: 10-step analysis — blank subtraction, normalization, replicate aggregation, thresholds, artifact export).
+- `bridge/spool.py` (ResultSpool: atomic writes, manifest, retry, secret scan).
+- `bridge/vm_agent_client.py` (VmAgentClient: HTTP client for all vm-agent endpoints).
+- `bridge/intake.py` (JobIntake: polling, signature verification, claiming).
+- `bridge/abort.py` (AbortDetector: eLabFTW abort polling).
+- `bridge/dashboard.py` (DashboardServer: SSE live progress, plate view, abort).
+- `bridge/writeback.py` (WriteBackManager: throttled progress, terminal result packages).
+- `main.py` (BridgeDaemon: poll loop, abort thread, spool drain, dashboard server).
+- `deploy/wallac-bridge.service` (systemd unit), `deploy/bridge.env.example`.
+- 262 tests total (290 with RemoteMdbClient tests).
+
+**Live validation (existing_protocol mode):**
+- Bridge daemon running on `lambdabiolab-computer`, polling eLabFTW every 5s.
+- Two jobs completed successfully (#326, #327): 96-well reads at 600nm, real OD data, `raw_results.json` uploaded, Assay experiments created and linked, event logs posted.
+- Signature verification working (minisign, signer identity, post-signature integrity).
+- Bugs found and fixed during live testing:
+  1. `list_uploads` didn't include archived uploads (state=2) — signature archives invisible.
+  2. `extract_signed_request_fields` didn't handle list-format `data.json` from eLabFTW 5.5.14.
+  3. `DEFAULT_ELABFTW_CATEGORY` was items_types ID (9), not items_categories ID (21).
+  4. `link_experiment_to_item` sent item_id in body instead of URL path (500 error).
+
 ### Stage 7: hardware e2e acceptance and production enablement
+
+**Status: 🔄 IN PROGRESS — existing_protocol path done, generated_protocol path pending**
 
 - Run real eLabFTW -> bridge -> vm-agent -> Wallac -> raw results -> analysis -> artifacts -> Assay summary flow.
 - Validate generated MDB protocol in OEM/Wallac context.
@@ -691,6 +743,17 @@ Acceptance:
 - Assay summary links to Automation Job;
 - cleanup dry-run lists only eligible generated protocols;
 - production feature flag remains off until operator approval.
+
+**Progress:**
+- ✅ `existing_protocol` path validated end-to-end (Jobs #326, #327): signature verification, claiming, 96-well measurement, results upload, Assay creation + linking, event log.
+- ❌ `generated_protocol` path NOT yet tested on live instrument — requires creating signed Method/Layout/Analysis bundle via designer API, generating MDB protocol, running by AssayProtID.
+- ❌ OEM OD comparison not done.
+- ❌ Cleanup dry-run not tested on live MDB.
+- ❌ Abort during generated run not tested.
+- ❌ Bridge daemon not installed as systemd service (running as nohup process).
+- ❌ Designer app not deployed (FastAPI not installed on host).
+
+**Test plan:** `docs/stage7-hardware-e2e-test-plan.md` (8 test sequences).
 
 ## Test strategy
 
@@ -723,16 +786,16 @@ Required test groups:
 
 These are not product decisions; resolve during implementation and testing:
 
-- exact MDB columns required for each template copy/patch;
-- exact selected-column fingerprint fields per mode;
-- exact PlateMap binary encoding and bit order, verified by round-trip tests;
-- exact result-table fields for OEM OD vs vm-agent-derived OD;
-- exact live-result polling cadence and dashboard rendering shape;
-- exact web framework choice for Linux-side designer backend;
-- exact static signer allowlist config shape;
-- exact spool retention defaults;
-- exact generated protocol group name and installation checklist;
-- exact per-mode hardware acceptance sequence.
+- ~~exact MDB columns required for each template copy/patch~~ — resolved: `AssayProtID`, `ProtName`, `ProtNumber`, `ProtVersion`, `FactoryPreset`, `ProtGroup` (see `_ASSAY_PROTOCOL_COLUMNS` in `agent.py`); full row returned by `GET /mdb/protocols/{id}` includes all columns.
+- ~~exact selected-column fingerprint fields per mode~~ — resolved: `ProtName`, `FactoryPreset`, `ProtGroup` (see `TemplateFingerprint` in `generated_protocols.py`).
+- ~~exact PlateMap binary encoding and bit order, verified by round-trip tests~~ — resolved: PlateMap is a byte array in `AssayProtocol.PlateMap`, 384 bytes for 96-well (4 bytes per well). Verified via `GET /mdb/protocols/2000001` on live instrument.
+- ~~exact result-table fields for OEM OD vs vm-agent-derived OD~~ — resolved: vm-agent returns `{well, od, counts, meas_a, meas_b, ...}`; OD is OEM-reported (preferred), counts are raw.
+- ~~exact live-result polling cadence and dashboard rendering shape~~ — resolved: dashboard SSE at ~1Hz, plate view with per-well values, progress percent, state.
+- ~~exact web framework choice for Linux-side designer backend~~ — resolved: FastAPI (see `bridge/designer_app.py`).
+- ~~exact static signer allowlist config shape~~ — resolved: `SignerAllowlist.from_env()` reads `WALLAC_AUTHORIZED_SIGNERS` env var (comma-separated emails).
+- ~~exact spool retention defaults~~ — resolved: `DEFAULT_GRACE_PERIOD = 86400` (24h), `DEFAULT_MAX_RETRIES = 10`.
+- ~~exact generated protocol group name and installation checklist~~ — resolved: `eLabFTW Generated` (GroupID=10001), created via `POST /mdb/groups` endpoint. Installed on live VM.
+- ~~exact per-mode hardware acceptance sequence~~ — resolved: photometry first (Test 4 in `docs/stage7-hardware-e2e-test-plan.md`), then fluorometry, then luminescence.
 
 ## Non-goals
 
@@ -747,3 +810,67 @@ These are not product decisions; resolve during implementation and testing:
 - Automatic generated-protocol cleanup after each run.
 - Reusing an Automation Job for reruns.
 - Browser-side execution authority or browser-held secrets.
+
+## Deployment status (as of 2026-06-27)
+
+### Live infrastructure
+
+| Component | Location | Status |
+|-----------|----------|--------|
+| eLabFTW | `antonios-beast` (Tailscale 100.119.135.27:3148) | Running, v5.5.14 |
+| Bridge daemon | `lambdabiolab-computer` (Tailscale 100.81.236.54) | Running as `nohup` process (not yet systemd) |
+| vm-agent | `win7-wallac` VM (libvirt NAT 192.168.122.203:8420) | Running via scheduled task `wallac-agent` |
+| Instrument | Victor2 1420 | Connected, idle, working |
+
+### Configuration
+
+- Bridge env: `/etc/wallac-bridge/bridge.env` on `lambdabiolab-computer`
+- vm-agent: `C:\install\agent.py` on `win7-wallac`, started by `C:\install\run_agent.bat` (sets `WALLAC_ENABLE_PROTOCOL_AUTHORING=true`)
+- eLabFTW signing key: created for user 1 (Antonio Lamb), passphrase `wallac2024`
+- `eLabFTW Generated` protocol group: GroupID=10001 in MDB
+- Spool dir: `/var/lib/wallac-bridge/spool`
+- Dashboard: `http://lambdabiolab-computer:8421`
+
+### What's NOT yet deployed
+
+- **systemd service**: `deploy/wallac-bridge.service` exists but not installed. Bridge runs as `nohup python3 main.py`. Won't survive reboot.
+- **Designer app**: FastAPI not installed on host. Run Builder UI not served.
+- **Dedicated eLabFTW API key for bridge**: using admin key (`4-l4mbd4...`), not a scoped service key.
+
+### Remaining work for Stage 7
+
+1. **`generated_protocol` path on live hardware** — the main gap. Requires:
+   - Installing FastAPI on `lambdabiolab-computer` and starting the designer app
+   - Creating signed Method/Layout/Analysis resources via the designer API
+   - The GeneratedProtocolManager creating an MDB protocol from the signed bundle
+   - Running the generated protocol by numeric AssayProtID
+   - Verifying the analysis pipeline (blank subtraction, replicate aggregation, pass/fail)
+2. **OEM OD comparison** (Test 5)
+3. **Cleanup dry-run** (Test 6)
+4. **Abort during generated run** (Test 8)
+5. **Install systemd service** for bridge daemon
+6. **Deploy designer app** as a persistent service
+
+### Key files for a new agent
+
+- `docs/plans/wallac-protocol-authoring.md` — this plan
+- `docs/stage7-hardware-e2e-test-plan.md` — 8 test sequences for Stage 7
+- `docs/api-reference.md` — complete API docs (vm-agent, designer, bridge daemon, error codes)
+- `main.py` — bridge daemon entry point
+- `bridge/factory.py` — component wiring (`create_orchestrator()`)
+- `bridge/execution.py` — ExecutionOrchestrator (full pipeline)
+- `bridge/generated_protocols.py` — GeneratedProtocolManager (MDB protocol lifecycle)
+- `bridge/remote_mdb_client.py` — RemoteMdbClient (HTTP → vm-agent MDB endpoints)
+- `vm-agent/agent.py` — vm-agent with MDB endpoints (deployed to `C:\install\agent.py`)
+- `deploy/wallac-bridge.service` — systemd unit (not yet installed)
+- `deploy/bridge.env.example` — env file template
+
+### eLabFTW API gotchas (learned during live testing)
+
+- `?cat=` parameter filters by `items_categories.id`, NOT `items_types.id`. Default category is 21 (not 9).
+- Signature archives are stored as uploads with `state=2` (archived). Must query `?state=2` to find them.
+- `data.json` in signature archive is a JSON array (API response format), not a dict.
+- Signing requires a sig key pair: `POST /users/{id}/sig_keys` with `{"passphrase": "..."}`.
+- Sign an entity: `PATCH /{entity_type}/{id}` with `{"action": "sign", "passphrase": "...", "meaning": 10}` (meaning is an integer: 10=Approval, 20=Authorship, etc.).
+- Link experiment to item: `POST /experiments/{id}/items_links/{item_id}` with empty JSON body (item_id in URL path, not body).
+- `patch_metadata` must read current metadata, merge new fields, and write back the full metadata JSON string.
