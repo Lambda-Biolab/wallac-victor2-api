@@ -191,18 +191,26 @@ class BridgeDaemon:
                     {"Automation state": {"value": JobState.ABORTING.value}},
                 )
             except VmAgentError as e:
-                logger.error("Job %d: abort failed: %s", job.item_id, e)
-                self.elabftw.patch_metadata(
-                    job.item_id,
-                    {
-                        "Automation state": {
-                            "value": JobState.UNKNOWN_REQUIRES_OPERATOR_REVIEW.value
+                if e.status_code == 425:
+                    # Too early to abort — the Victor2 requires ~60s before
+                    # it honors abort. Retry on the next poll cycle.
+                    logger.info(
+                        "Job %d: abort too early (run age <60s), will retry next cycle",
+                        job.item_id,
+                    )
+                else:
+                    logger.error("Job %d: abort failed: %s", job.item_id, e)
+                    self.elabftw.patch_metadata(
+                        job.item_id,
+                        {
+                            "Automation state": {
+                                "value": JobState.UNKNOWN_REQUIRES_OPERATOR_REVIEW.value
+                            },
+                            "Operator hint": {
+                                "value": f"Abort failed: {e}. Use the OEM GUI to stop the run."
+                            },
                         },
-                        "Operator hint": {
-                            "value": f"Abort failed: {e}. Use the OEM GUI to stop the run."
-                        },
-                    },
-                )
+                    )
 
     def _drain_spool(self) -> None:
         """Retry spooled write-backs on startup."""
