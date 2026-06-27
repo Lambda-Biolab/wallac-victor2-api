@@ -13,6 +13,7 @@ Pass criteria (Stage 7 Test 5):
   - Well ordering matches (A1-H12, row-major)
   - No missing or extra wells
 """
+
 from __future__ import annotations
 
 import csv
@@ -74,7 +75,7 @@ def load_oem_export(path: str) -> dict[str, float]:
     data_start = 0
     if well_col is None or od_col is None:
         # Try first data row as a sample
-        for row_idx, row in enumerate(rows[:10]):
+        for _row_idx, row in enumerate(rows[:10]):
             for i, cell in enumerate(row):
                 cell_stripped = cell.strip()
                 # Check if this looks like a well address (A1-H12)
@@ -177,18 +178,22 @@ def compare(bridge: dict[str, float], oem: dict[str, float]) -> bool:
     oem_order = [w for w in expected_order if w in oem]
 
     if bridge_order == oem_order:
-        print(f"PASS: well ordering matches (A1-H12, row-major)")
+        print("PASS: well ordering matches (A1-H12, row-major)")
     else:
-        print(f"FAIL: well ordering mismatch")
+        print("FAIL: well ordering mismatch")
         all_pass = False
 
-    print(f"\nSummary: {len(common)} wells compared, {len(mismatches)} mismatches, max_diff={max_diff:.6f}")
+    print(
+        f"\nSummary: {len(common)} wells compared, {len(mismatches)} mismatches, max_diff={max_diff:.6f}"
+    )
     return all_pass
 
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <oem_export.csv> [--bridge <raw_results.json>]", file=sys.stderr)
+        print(
+            f"Usage: {sys.argv[0]} <oem_export.csv> [--bridge <raw_results.json>]", file=sys.stderr
+        )
         sys.exit(1)
 
     oem_path = sys.argv[1]

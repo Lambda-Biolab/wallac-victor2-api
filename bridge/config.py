@@ -45,6 +45,9 @@ ENV_SPOOL_DIR = "WALLAC_SPOOL_DIR"
 # Poll interval for eLabFTW job intake (seconds)
 ENV_POLL_INTERVAL = "WALLAC_POLL_INTERVAL"
 
+# Dry-run mode: validate signed bundles without touching the instrument
+ENV_DRY_RUN = "WALLAC_DRY_RUN"
+
 
 # --- Defaults ---------------------------------------------------------------
 
@@ -86,6 +89,7 @@ class BridgeConfig:
     device_identity: str
     spool_dir: str
     poll_interval: float
+    dry_run: bool = False
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> BridgeConfig:
@@ -121,6 +125,7 @@ class BridgeConfig:
             device_identity=e.get(ENV_DEVICE_IDENTITY, DEFAULT_DEVICE_IDENTITY),
             spool_dir=e.get(ENV_SPOOL_DIR, DEFAULT_SPOOL_DIR),
             poll_interval=float(e.get(ENV_POLL_INTERVAL, str(DEFAULT_POLL_INTERVAL))),
+            dry_run=e.get(ENV_DRY_RUN, "").lower() in ("1", "true", "yes"),
         )
 
     @property
@@ -152,4 +157,5 @@ class BridgeConfig:
             "device_identity": self.device_identity,
             "spool_dir": self.spool_dir,
             "poll_interval": str(self.poll_interval),
+            "dry_run": str(self.dry_run),
         }

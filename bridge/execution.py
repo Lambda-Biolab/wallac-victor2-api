@@ -193,6 +193,7 @@ class ExecutionOrchestrator:
         spool: ResultSpool | None = None,
         poll_interval: float = 2.0,
         poll_timeout: float = 600.0,
+        dry_run: bool = False,
     ) -> None:
         self.elabftw = elabftw_client
         self.vm_agent = vm_agent_client
@@ -202,6 +203,7 @@ class ExecutionOrchestrator:
         self.spool = spool or ResultSpool()
         self.poll_interval = poll_interval
         self.poll_timeout = poll_timeout
+        self.dry_run = dry_run
 
     def execute_job(
         self,
@@ -241,6 +243,12 @@ class ExecutionOrchestrator:
                 if result.final_state:
                     return result  # spec loading failed
 
+            # Dry-run: validation passed, specs loaded — stop here.
+            # Do NOT prepare protocol, touch the instrument, or generate MDB.
+            if self.dry_run:
+                self._handle_dry_run(job_item_id, execution_mode, parsed_specs, result)
+                return result
+
             assay_prot_id = self._prepare_protocol(
                 job_item_id, execution_mode, protocol_name, parsed_specs, result
             )
@@ -250,23 +258,9 @@ class ExecutionOrchestrator:
                 self._write_terminal_state(job_item_id, result)
                 return result
 
-            raw_wells = self._retrieve_results(job_item_id, result.run_id, result)
-            self._check_and_analyze(job_item_id, execution_mode, parsed_specs, raw_wells, result)
-
-            self._write_progress(job_item_id, 90, "Uploading artifacts")
-            self._upload_or_spool(job_item_id, result.run_id, assay_prot_id, raw_wells, result)
-
-            self._write_assay_summary(job_item_id, execution_mode, assay_prot_id, raw_wells, result)
-
-            result.success = result.final_state not in (
-                "failed",
-                "aborted",
-                "unknown_requires_operator_review",
+            self._finalize_execution(
+                job_item_id, execution_mode, parsed_specs, assay_prot_id, result
             )
-            if not result.final_state:
-                result.final_state = "completed"
-            result.add_event("execution_completed")
-            self._write_terminal_state(job_item_id, result)
 
         except VmAgentError as e:
             result.final_state = "failed"
@@ -298,6 +292,65 @@ class ExecutionOrchestrator:
             self._write_terminal_state(job_item_id, result)
             return
         result.add_event("validation_passed")
+
+    def _handle_dry_run(
+        self,
+        job_item_id: int,
+        execution_mode: str,
+        parsed_specs: dict[str, Any] | None,
+        result: ExecutionResult,
+    ) -> None:
+        """Dry-run: validation passed, specs loaded — stop without touching the instrument."""
+        import json as _json
+
+        result.success = True
+        result.final_state = "completed"
+        result.add_event("dry_run_validation_passed")
+        result.result_summary = (
+            "Dry-run: signed bundle validated successfully. No instrument execution was performed."
+        )
+        report: dict[str, Any] = {
+            "dry_run": True,
+            "job_id": job_item_id,
+            "execution_mode": execution_mode,
+            "validation": "passed",
+            "events": result.events,
+        }
+        if parsed_specs:
+            report["specs_loaded"] = list(parsed_specs.keys())
+        self.elabftw.upload_file(
+            job_item_id,
+            "dry_run_report.json",
+            _json.dumps(report, indent=2).encode(),
+            comment="Dry-run validation report (no instrument execution)",
+        )
+        self._write_terminal_state(job_item_id, result)
+
+    def _finalize_execution(
+        self,
+        job_item_id: int,
+        execution_mode: str,
+        parsed_specs: dict[str, Any] | None,
+        assay_prot_id: int,
+        result: ExecutionResult,
+    ) -> None:
+        """Post-run: retrieve results, analyze, upload artifacts, write terminal state."""
+        raw_wells = self._retrieve_results(job_item_id, result.run_id, result)
+        self._check_and_analyze(job_item_id, execution_mode, parsed_specs, raw_wells, result)
+
+        self._write_progress(job_item_id, 90, "Uploading artifacts")
+        self._upload_or_spool(job_item_id, result.run_id, assay_prot_id, raw_wells, result)
+        self._write_assay_summary(job_item_id, execution_mode, assay_prot_id, raw_wells, result)
+
+        result.success = result.final_state not in (
+            "failed",
+            "aborted",
+            "unknown_requires_operator_review",
+        )
+        if not result.final_state:
+            result.final_state = "completed"
+        result.add_event("execution_completed")
+        self._write_terminal_state(job_item_id, result)
 
     def _prepare_protocol(
         self,
