@@ -834,14 +834,14 @@ These are not product decisions; resolve during implementation and testing:
 | Component | Location | Status |
 |-----------|----------|--------|
 | eLabFTW | `antonios-beast` (Tailscale 100.119.135.27:3148) | Running, v5.5.14 |
-| Bridge daemon | `lambdabiolab-computer` (Tailscale 100.81.236.54) | Running as `nohup` process (not yet systemd) |
+| Bridge daemon | `lambdabiolab-computer` (Tailscale 100.81.236.54) | Running as `systemd` service (`wallac-bridge.service`, enabled for boot) |
 | vm-agent | `win7-wallac` VM (libvirt NAT 192.168.122.203:8420) | Running via scheduled task `wallac-agent` |
-| Designer app | `lambdabiolab-computer` (port 8422) | Running as `nohup` uvicorn process (not yet systemd) |
+| Designer app | `lambdabiolab-computer` (port 8422) | Running as `systemd` service (`wallac-designer.service`, enabled for boot) |
 | Instrument | Victor2 1420 | Connected, idle, working |
 
 ### Configuration
 
-- Bridge env: `/etc/wallac-bridge/bridge.env` on `lambdabiolab-computer` (includes `WALLAC_ENABLE_PROTOCOL_AUTHORING=true`, `WALLAC_ENABLE_PHOTOMETRY=true`, `WALLAC_PHOTOMETRY_TEMPLATE_ID=2000001`, `WALLAC_PHOTOMETRY_TEMPLATE_NAME="Absorbance @ 600 (0.1s)"`)
+- Bridge env: `/etc/wallac-bridge/bridge.env` on `lambdabiolab-computer` (includes `WALLAC_ENABLE_PROTOCOL_AUTHORING=true`, `WALLAC_ENABLE_PHOTOMETRY=true`, `WALLAC_PHOTOMETRY_TEMPLATE_ID=2000001`, `WALLAC_PHOTOMETRY_TEMPLATE_NAME="Absorbance @ 600 (0.1s)"`, `WALLAC_AUTHORIZED_SIGNERS=antonio@lambconsulting.bio`, `WALLAC_DESIGNER_TOKEN=`)
 - vm-agent: `C:\install\agent.py` on `win7-wallac`, started by `C:\install\run_agent.bat` (sets `WALLAC_ENABLE_PROTOCOL_AUTHORING=true`)
 - eLabFTW signing key: created for user 1 (Antonio Lamb), passphrase `wallac2024`
 - `eLabFTW Generated` protocol group: GroupID=10001 in MDB
@@ -851,18 +851,16 @@ These are not product decisions; resolve during implementation and testing:
 
 ### What's NOT yet deployed
 
-- **systemd service for bridge daemon**: `deploy/wallac-bridge.service` exists but not installed. Bridge runs as `nohup python3 main.py`. Won't survive reboot.
-- **systemd service for designer app**: running as `nohup uvicorn`. Won't survive reboot.
 - **Dedicated eLabFTW API key for bridge**: using admin key (`4-l4mbd4...`), not a scoped service key.
 
 ### Remaining work for Stage 7
 
-1. ~~**`generated_protocol` path on live hardware**~~ — ✅ DONE (Job #337 completed successfully: protocol generated, 96-well run, results analyzed, 5 artifacts uploaded, job marked `completed`).
-2. **OEM OD comparison** (Test 5) — compare vm-agent-derived OD against OEM/Wallac-reported OD values.
-3. **Cleanup dry-run** (Test 6) — test `DELETE /mdb/protocols` dry-run/confirm on live MDB.
-4. **Abort during generated run** (Test 8) — test eLabFTW abort mid-run.
-5. **Install systemd service** for bridge daemon — `deploy/wallac-bridge.service` exists, needs `systemctl enable`.
-6. **Deploy designer app** as a persistent service — currently nohup, needs systemd or similar.
+1. ~~**`generated_protocol` path on live hardware`**~~ — ✅ DONE (Job #337 completed successfully: protocol generated, 96-well run, results analyzed, 5 artifacts uploaded, job marked `completed`).
+2. **OEM OD comparison** (Test 5) — compare vm-agent-derived OD against OEM/Wallac-reported OD values. **Operator task: requires plate run + OEM GUI (MlrMgr) export.**
+3. ~~**Cleanup dry-run** (Test 6)~~ — ✅ DONE (predicate verified 2026-06-27: `ALIKE "ELAB-Job-%"` matches exactly the 1 generated protocol 2000002; 0 factory presets in generated group 10001; 0 user-GUI protocols match the prefix). **Defect found:** `GeneratedProtocolManager.cleanup_terminal()` only iterates in-memory `self._generated` dict — empty after bridge restart, so dry-run reports nothing-to-do despite the MDB row existing. Fix requires querying the MDB via `MdbClient.query("SELECT ... WHERE ProtName ALIKE 'ELAB-Job-%'")` instead of iterating `self._generated`. Documented in `AGENT_LEARNINGS.md`.
+4. **Abort during generated run** (Test 8) — test eLabFTW abort mid-run. **Operator task: requires live plate run + monitoring.**
+5. ~~**Install systemd service** for bridge daemon~~ — ✅ DONE (2026-06-27: `wallac-bridge.service` installed at `/etc/systemd/system/`, `active (running)`, `enabled` for boot. SELinux `bin_t` fcontext applied to `.venv/bin/` via `semanage fcontext` + `restorecon`. Security hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths=/var/lib/wallac-bridge`, `ProtectHome=read-only`).
+6. ~~**Deploy designer app** as a persistent service~~ — ✅ DONE (2026-06-27: `wallac-designer.service` installed at `/etc/systemd/system/`, `active (running)`, `enabled` for boot. Same SELinux `bin_t` fcontext. Hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-only`, no WritePaths — designer is FS read-only, talks to eLabFTW over HTTP).
 
 ### Key files for a new agent
 
@@ -876,7 +874,8 @@ These are not product decisions; resolve during implementation and testing:
 - `bridge/generated_protocols.py` — GeneratedProtocolManager (MDB protocol lifecycle). `generate_protocol()` clones template via INSERT INTO SELECT, overrides fields via UPDATE.
 - `bridge/remote_mdb_client.py` — RemoteMdbClient (HTTP → vm-agent MDB endpoints)
 - `vm-agent/agent.py` — vm-agent with MDB endpoints (deployed to `C:\install\agent.py`). `op_mdb_insert_protocol()` clones template row via SQL INSERT INTO SELECT (handles binary PlateMap/NormalizationInfo fields that can't be set via DAO AppendChunk on NULL fields).
-- `deploy/wallac-bridge.service` — systemd unit (not yet installed)
+- `deploy/wallac-bridge.service` — systemd unit (installed 2026-06-27, enabled for boot)
+- `deploy/wallac-designer.service` — designer systemd unit (installed 2026-06-27, enabled for boot)
 - `deploy/bridge.env.example` — env file template
 
 ### eLabFTW API gotchas (learned during live testing)
