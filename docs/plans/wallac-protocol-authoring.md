@@ -3,7 +3,7 @@
 Date: 2026-06-26
 Target repo: `Lambda-Biolab/wallac-victor2-api`
 Plan branch: `plan/wallac-protocol-authoring`
-Status: **Stages 1–6 implemented and merged. Stage 7 substantially complete: both `existing_protocol` and `generated_protocol` paths validated end-to-end on live hardware. Remaining Stage 7 items: OEM OD comparison, cleanup dry-run, abort during generated run, systemd service install, designer app as persistent service.**
+Status: **Stages 1–7 complete. All 8 Stage 7 hardware acceptance tests pass. Both `existing_protocol` and `generated_protocol` execution paths validated end-to-end on live hardware. Bridge and designer deployed as systemd services (enabled for boot). 13 bugs found and fixed during live testing. `make validate` fully green (lint, format, complexity, 297 tests). Remaining: dedicated eLabFTW service key, 7 unmatched plasmid-primer links, 6 Phase 2 decisions.**
 
 ## Purpose
 
@@ -835,7 +835,7 @@ These are not product decisions; resolve during implementation and testing:
 |-----------|----------|--------|
 | eLabFTW | `antonios-beast` (Tailscale 100.119.135.27:3148) | Running, v5.5.14 |
 | Bridge daemon | `lambdabiolab-computer` (Tailscale 100.81.236.54) | Running as `systemd` service (`wallac-bridge.service`, enabled for boot) |
-| vm-agent | `win7-wallac` VM (libvirt NAT 192.168.122.203:8420) | Running via scheduled task `wallac-agent` |
+| vm-agent | `win7-wallac` VM (libvirt NAT 192.168.122.203:8420) | Running via `C:\install\run_agent.bat` (sets `WALLAC_ENABLE_PROTOCOL_AUTHORING=true`). Updated 2026-06-27 with all fixes (dedup ResultType 0, protocol cache refresh, INSERT INTO SELECT cloning). |
 | Designer app | `lambdabiolab-computer` (port 8422) | Running as `systemd` service (`wallac-designer.service`, enabled for boot) |
 | Instrument | Victor2 1420 | Connected, idle, working |
 
@@ -852,6 +852,23 @@ These are not product decisions; resolve during implementation and testing:
 ### What's NOT yet deployed
 
 - **Dedicated eLabFTW API key for bridge**: using admin key (`4-l4mbd4...`), not a scoped service key.
+
+### Stage 7 — COMPLETE (all 8 tests pass)
+
+| Test | Status | Bugs found & fixed |
+|------|--------|-------------------|
+| Test 1: MDB endpoint connectivity | ✅ Pass | — |
+| Test 2: MDB backup | ✅ Pass | — |
+| Test 3: Generated protocol CRUD | ✅ Pass | DAO AddNew/Update fails with comtypes → SQL INSERT |
+| Test 4: Full generated_protocol e2e | ✅ Pass (Job #337) | 8 bugs (binary PlateMap, NormalizationInfo, bytes→array.array, AppendChunk on NULL → INSERT INTO SELECT, well key mismatch, well name normalization) |
+| Test 5: OEM OD comparison | ✅ Pass | `_dedup_wells` picked wrong ResultType → prefer ResultType 0 (primary). 96/96 wells match within ±0.001. |
+| Test 6: Cleanup dry-run | ✅ Pass | `cleanup_terminal()` in-memory only → query MDB via `ALIKE 'ELAB-Job-%'`. Defense-in-depth prefix filter. |
+| Test 7: Feature flag enforcement | ✅ Pass | — |
+| Test 8: Abort during generated run | ✅ Pass (Job #351) | 3 bugs (stale protocol cache → refresh on miss; 425 "too early" hard failure → retry; aborting/aborted race condition → check response state) |
+
+**Total bugs found and fixed during Stage 7 live testing: 13**
+
+All fixes committed, pushed, and deployed. `make validate` fully green (lint, format, complexity gate, 297 tests).
 
 ### Remaining work for Stage 7
 
@@ -877,6 +894,7 @@ These are not product decisions; resolve during implementation and testing:
 - `deploy/wallac-bridge.service` — systemd unit (installed 2026-06-27, enabled for boot)
 - `deploy/wallac-designer.service` — designer systemd unit (installed 2026-06-27, enabled for boot)
 - `deploy/bridge.env.example` — env file template
+- `tools/compare_od.py` — OEM OD comparison script for Test 5 (auto-detects well/OD columns in MlrMgr CSV/TXT export, compares against bridge raw_results.json)
 
 ### eLabFTW API gotchas (learned during live testing)
 
@@ -887,3 +905,10 @@ These are not product decisions; resolve during implementation and testing:
 - Sign an entity: `PATCH /{entity_type}/{id}` with `{"action": "sign", "passphrase": "...", "meaning": 10}` (meaning is an integer: 10=Approval, 20=Authorship, etc.).
 - Link experiment to item: `POST /experiments/{id}/items_links/{item_id}` with empty JSON body (item_id in URL path, not body).
 - `patch_metadata` must read current metadata, merge new fields, and write back the full metadata JSON string.
+
+### Remaining work (post-Stage-7)
+
+1. **Dedicated eLabFTW API key for bridge** — currently using admin key (`4-l4mbd4...`). Needs a scoped service key with minimum permissions (read items, create/upload, patch metadata, post comments).
+2. **7 unmatched plasmid-to-primer links** — operator decision needed on correct primer pairs (in `antomicblitz/elabftw-lambdabiolab` repo).
+3. **6 Phase 2 decisions** (in `antomicblitz/elabftw-lambdabiolab` AGENT_REQUESTS.md): off-host backup target, SMTP provider, domain/DNS, Benchling review set, alerting target, Hetzner sizing.
+4. **Complexity refactoring** — all 6 pre-existing cognitive complexity violations fixed (op_mdb_insert_protocol 36→8, _load_canonical_specs 25→4, Handler::do_GET 18→5, Handler::_get_jobs 20→5, Handler::_get_simple 16→4, _grid_csv 17→6). `make validate` fully green.
