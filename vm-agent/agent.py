@@ -930,11 +930,25 @@ def _open_mdb_w():
 
 
 def _rs_to_dict(rs):
-    """Convert a DAO recordset current row to a dict."""
+    """Convert a DAO recordset current row to a JSON-serializable dict.
+
+    DAO returns Python types that json.dumps can't handle (datetime,
+    Decimal, bytes). Convert them to strings/numbers.
+    """
+    import datetime
+    import decimal
+
     row = {}
     for i in range(rs.Fields.Count):
         f = rs.Fields.Item(i)
-        row[f.Name] = f.Value
+        val = f.Value
+        if isinstance(val, (datetime.datetime, datetime.date)):
+            val = val.isoformat()
+        elif isinstance(val, decimal.Decimal):
+            val = float(val)
+        elif isinstance(val, bytes):
+            val = val.decode("utf-8", errors="replace")
+        row[f.Name] = val
     return row
 
 
