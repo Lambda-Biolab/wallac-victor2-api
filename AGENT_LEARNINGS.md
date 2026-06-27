@@ -47,7 +47,55 @@ Creating an `items_type` via the API does NOT always create the
 corresponding `items_categories` entry. This is why `?cat=` filtering may not
 work for API-created categories. Use `?type=` instead.
 
-## Victor2 instrument — hardware notes
+## DAO/comtypes — binary field gotchas (Jet OLE Object columns)
+
+### 1. DAO AddNew/Update fails with comtypes on Jet
+
+Both `ProtocolGroup` and `AssayProtocol` inserts fail when using DAO
+Recordset `AddNew()` / `Update()`. Use SQL `INSERT INTO` instead.
+
+### 2. comtypes returns OLE Object fields as tuples of ints
+
+Reading a binary field (e.g. `PlateMap`) via DAO returns a `tuple` of
+ints, not `bytes`. Reading `NormalizationInfo` returns `None` when the
+field is NULL.
+
+### 3. DAO AppendChunk accepts only `array.array('B', ...)`
+
+comtypes cannot marshal `bytes` to a COM VARIANT — `AppendChunk(bytes)`
+raises `ArgumentError`. `list` raises `COMError`. Only `array.array('B')`
+works with `AppendChunk`.
+
+### 4. AppendChunk fails on NULL OLE Object fields
+
+DAO `AppendChunk` raises "Data type conversion error" when the target
+field was initialized as NULL by a prior SQL INSERT. Direct assignment
+(`fld.Value = arr`) also fails on NULL fields.
+
+**Solution:** clone the entire template row via `INSERT INTO ... SELECT`
+(which copies binary fields in one SQL step), then `UPDATE` only the
+non-binary override fields. This avoids AppendChunk entirely for
+protocol generation.
+
+See `op_mdb_insert_protocol()` in `vm-agent/agent.py`.
+
+## vm-agent result format — well name normalization
+
+### 1. vm-agent returns `{"well": "A01", ...}`, not `{"well_name": ...}`
+
+The vm-agent `_normalize_well()` produces keys `well`, `od`, `counts`.
+Layout/analysis specs use `well_name`. The bridge must check both keys
+via a `_well_key()` helper.
+
+### 2. vm-agent zero-pads well names (A01, A02, ..., A12)
+
+The vm-agent returns `A01`, `A02`, etc. (zero-padded), but layout specs
+use canonical non-padded names (`A1`, `A2`, ..., `A12`). The bridge
+normalizes both sides to non-padded form via `_normalize_well_name()`.
+
+See `bridge/execution.py` (`_well_key`, `_normalize_well_name`) and
+`bridge/analysis.py` (`_load_raw`).
+
 
 ### Plate presence detection
 
