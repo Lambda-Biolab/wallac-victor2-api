@@ -320,7 +320,9 @@ class ExecutionOrchestrator:
             mode = self._extract_mode(parsed_specs)
             spec_hash = self._extract_hash(parsed_specs)
 
-            proto = self.protocols.generate_protocol(job_item_id, mode, spec_hash, parsed_specs or {})
+            proto = self.protocols.generate_protocol(
+                job_item_id, mode, spec_hash, parsed_specs or {}
+            )
             result.assay_prot_id = proto.assay_prot_id
             result.add_event("protocol_generated", f"AssayProtID={proto.assay_prot_id}")
 
@@ -704,9 +706,7 @@ class ExecutionOrchestrator:
 
         # Download method.json if referenced
         if job_spec.method is not None:
-            method_spec = self._download_referenced_spec(
-                job_spec.method, "method", result
-            )
+            method_spec = self._download_referenced_spec(job_spec.method, "method", result)
             if method_spec is not None:
                 specs["method"] = method_spec
                 result.add_event("method_spec_loaded", f"mode={method_spec.get('mode', '?')}")
@@ -716,14 +716,10 @@ class ExecutionOrchestrator:
         # Download layout.json if referenced
         if job_spec.layout is not None:
             if job_spec.layout.source == "reusable" and job_spec.layout.object_id:
-                layout_spec = self._download_referenced_spec(
-                    job_spec.layout, "layout", result
-                )
+                layout_spec = self._download_referenced_spec(job_spec.layout, "layout", result)
             else:
                 # one-off: attachment is on the job itself
-                layout_spec = self._download_one_off_layout(
-                    job_item_id, job_spec.layout, result
-                )
+                layout_spec = self._download_one_off_layout(job_item_id, job_spec.layout, result)
             if layout_spec is not None:
                 specs["layout"] = layout_spec
                 result.add_event("layout_spec_loaded", f"wells={len(layout_spec.get('wells', []))}")
@@ -732,9 +728,7 @@ class ExecutionOrchestrator:
 
         # Download analysis.json if referenced
         if job_spec.analysis is not None:
-            analysis_spec = self._download_referenced_spec(
-                job_spec.analysis, "analysis", result
-            )
+            analysis_spec = self._download_referenced_spec(job_spec.analysis, "analysis", result)
             if analysis_spec is not None:
                 specs["analysis"] = analysis_spec
                 result.add_event("analysis_spec_loaded")

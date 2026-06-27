@@ -888,7 +888,6 @@ MDB_BACKUP_DIR = r"C:\Users\Public\mdb_backups"
 # clone operation and should not appear here.
 
 
-
 def _is_authoring_enabled():
     return os.environ.get(ENV_ENABLE_AUTHORING, "").lower() == "true"
 
@@ -1045,11 +1044,19 @@ def op_mdb_insert_protocol(protocol_row):
             - ProtGroup (int): protocol group ID
             - optional: LastRunDate, RunCount, CreatedTime, LastEditedTime
     """
-    _OVERRIDABLE_COLS = frozenset({
-        "ProtName", "ProtNumber", "ProtVersion", "FactoryPreset",
-        "ProtGroup", "LastRunDate", "RunCount",
-        "CreatedTime", "LastEditedTime",
-    })
+    _OVERRIDABLE_COLS = frozenset(
+        {
+            "ProtName",
+            "ProtNumber",
+            "ProtVersion",
+            "FactoryPreset",
+            "ProtGroup",
+            "LastRunDate",
+            "RunCount",
+            "CreatedTime",
+            "LastEditedTime",
+        }
+    )
 
     def _op(_srv):
         db = _open_mdb_w()
@@ -1064,8 +1071,7 @@ def op_mdb_insert_protocol(protocol_row):
             # This copies ALL columns including binary PlateMap.
             # Get column names from the template record.
             rs_cols = db.OpenRecordset(
-                "SELECT * FROM AssayProtocol WHERE AssayProtID = "
-                + str(template_id)
+                "SELECT * FROM AssayProtocol WHERE AssayProtID = " + str(template_id)
             )
             if rs_cols.EOF:
                 raise RuntimeError(f"Template protocol {template_id} not found")
@@ -1091,9 +1097,7 @@ def op_mdb_insert_protocol(protocol_row):
             try:
                 db.Execute(clone_sql)
             except Exception as exc:
-                raise RuntimeError(
-                    f"Clone INSERT failed: {exc}"
-                ) from exc
+                raise RuntimeError(f"Clone INSERT failed: {exc}") from exc
 
             # Step 2: UPDATE specific fields we want to override
             set_clauses = []
@@ -1121,9 +1125,7 @@ def op_mdb_insert_protocol(protocol_row):
                 try:
                     db.Execute(update_sql)
                 except Exception as exc:
-                    raise RuntimeError(
-                        f"Override UPDATE failed: {exc}"
-                    ) from exc
+                    raise RuntimeError(f"Override UPDATE failed: {exc}") from exc
 
             return new_id
         finally:

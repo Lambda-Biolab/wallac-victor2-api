@@ -341,27 +341,37 @@ class GeneratedProtocolManager:
     def delete_protocol(self, job_id: int, *, confirm: bool = False) -> CleanupResult:
         """Delete a generated protocol. Defaults to dry-run.
 
+        Looks up the protocol by job_id, checking the in-memory cache
+        first, then querying the MDB if not found (handles bridge restart).
+
         Args:
             job_id: The Automation Job ID whose generated protocol to delete.
             confirm: If False (default), only report what would be deleted.
         """
         result = CleanupResult(dry_run=not confirm)
 
+        # Fast path: check in-memory cache
         proto = self._generated.get(job_id)
-        if proto is None:
-            # Try to find by name pattern
-            # In production, we'd search the MDB for ELAB-Job-* protocols
-            result.errors.append(f"No generated protocol found for job {job_id}")
-            return result
+        if proto is not None:
+            assay_prot_id = proto.assay_prot_id
+            name = proto.name
+        else:
+            # Slow path: query the MDB (handles bridge restart)
+            row = self._find_generated_by_job_id(job_id)
+            if row is None:
+                result.errors.append(f"No generated protocol found for job {job_id}")
+                return result
+            assay_prot_id = row.get("AssayProtID", 0)
+            name = row.get("ProtName", "")
 
-        # Verify it's a generated protocol
-        if not proto.name.startswith(GENERATED_NAME_PREFIX):
-            result.errors.append(f"Protocol '{proto.name}' is not a generated protocol")
+        # Verify it's a generated protocol (defense-in-depth)
+        if not name.startswith(GENERATED_NAME_PREFIX):
+            result.errors.append(f"Protocol '{name}' is not a generated protocol")
             return result
 
         entry = {
-            "assay_prot_id": proto.assay_prot_id,
-            "name": proto.name,
+            "assay_prot_id": assay_prot_id,
+            "name": name,
             "job_id": job_id,
         }
 
@@ -369,12 +379,12 @@ class GeneratedProtocolManager:
             result.skipped.append(entry)
         else:
             with self._lock:
-                deleted = self.mdb.delete_protocol(proto.assay_prot_id)
+                deleted = self.mdb.delete_protocol(assay_prot_id)
                 if deleted:
                     result.deleted.append(entry)
-                    del self._generated[job_id]
+                    self._generated.pop(job_id, None)
                 else:
-                    result.errors.append(f"Failed to delete protocol {proto.assay_prot_id}")
+                    result.errors.append(f"Failed to delete protocol {assay_prot_id}")
 
         return result
 
@@ -384,34 +394,90 @@ class GeneratedProtocolManager:
         confirm: bool = False,
         older_than_days: int = 30,
     ) -> CleanupResult:
-        """Clean up generated protocols for terminal jobs older than N days.
+        """Clean up generated protocols for terminal jobs.
 
         Defaults to dry-run. Requires explicit confirm.
+
+        Queries the MDB directly (not just in-memory cache), so this
+        works correctly even after a bridge restart.
         """
         result = CleanupResult(dry_run=not confirm)
 
-        for job_id, proto in list(self._generated.items()):
+        rows = self._list_generated_protocols()
+        for row in rows:
+            assay_prot_id = row.get("AssayProtID", 0)
+            name = row.get("ProtName", "")
+            job_id = self._parse_job_id(name)
+
+            # Enrich with created_at if we have it in memory
+            in_mem = self._generated.get(job_id)
+            created_at = in_mem.created_at if in_mem else ""
+
             entry = {
-                "assay_prot_id": proto.assay_prot_id,
-                "name": proto.name,
+                "assay_prot_id": assay_prot_id,
+                "name": name,
                 "job_id": job_id,
-                "created_at": proto.created_at,
+                "created_at": created_at,
             }
 
             if not confirm:
                 result.skipped.append(entry)
             else:
                 with self._lock:
-                    deleted = self.mdb.delete_protocol(proto.assay_prot_id)
+                    deleted = self.mdb.delete_protocol(assay_prot_id)
                     if deleted:
                         result.deleted.append(entry)
-                        del self._generated[job_id]
+                        self._generated.pop(job_id, None)
                     else:
-                        result.errors.append(f"Failed to delete protocol {proto.assay_prot_id}")
+                        result.errors.append(f"Failed to delete protocol {assay_prot_id}")
 
         return result
 
     # --- Internal helpers ---
+
+    def _list_generated_protocols(self) -> list[dict[str, Any]]:
+        """Query the MDB for all generated protocols (ELAB-Job-* prefix).
+
+        Defense-in-depth: filters by GENERATED_NAME_PREFIX even though
+        the SQL query already filters by pattern. This protects against
+        SQL bugs, mock behavior, or MDB corruption from ever causing
+        cleanup to target non-generated protocols.
+        """
+        sql = (
+            "SELECT AssayProtID, ProtName FROM AssayProtocol "
+            "WHERE ProtName ALIKE '" + GENERATED_NAME_PREFIX + "%' "
+            "ORDER BY AssayProtID"
+        )
+        rows = self.mdb.query(sql)
+        return [r for r in rows if str(r.get("ProtName", "")).startswith(GENERATED_NAME_PREFIX)]
+
+    def _find_generated_by_job_id(self, job_id: int) -> dict[str, Any] | None:
+        """Find a generated protocol in the MDB by job_id."""
+        for row in self._list_generated_protocols():
+            if self._parse_job_id(row.get("ProtName", "")) == job_id:
+                return row
+        return None
+
+    @staticmethod
+    def _parse_job_id(name: str) -> int:
+        """Extract the job_id from a generated protocol name.
+
+        Name format: ELAB-Job-<job_id>-<8char_hash>
+        Returns 0 if the name doesn't match the expected format.
+        """
+        # Reason: GENERATED_NAME_PREFIX is "ELAB-Job-", so the name is
+        # "ELAB-Job-337-ecbf0c77". Strip the prefix, split on "-", first
+        # element is the job_id.
+        if not name.startswith(GENERATED_NAME_PREFIX):
+            return 0
+        remainder = name[len(GENERATED_NAME_PREFIX) :]
+        parts = remainder.split("-")
+        if not parts:
+            return 0
+        try:
+            return int(parts[0])
+        except ValueError:
+            return 0
 
     def _allocate_id(self) -> int:
         """Allocate the next available generated AssayProtID."""
