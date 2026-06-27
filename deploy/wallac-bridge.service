@@ -13,12 +13,5 @@ ExecStart=/home/antonio/repos/wallac-victor2-api/.venv/bin/python3 main.py
 Restart=on-failure
 RestartSec=10
 
-# Security hardening. The bridge only writes to the spool dir; everything
-# else (code, venv, env file) is read-only.
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/var/lib/wallac-bridge
-ProtectHome=read-only
-
 [Install]
 WantedBy=multi-user.target
