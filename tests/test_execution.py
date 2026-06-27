@@ -224,6 +224,8 @@ class MockElabftwClient:
         self._items: dict[int, dict[str, Any]] = {}
         self._uploads: dict[int, list[dict[str, Any]]] = {}
         self._comments: dict[int, list[str]] = {}
+        self._experiments: dict[int, dict[str, Any]] = {}
+        self._next_experiment_id = 1
 
     def add_item(self, item_id: int, extra_fields: dict[str, Any] | None = None) -> None:
         ef = extra_fields or {}
@@ -253,6 +255,15 @@ class MockElabftwClient:
 
     def post_comment(self, item_id: int, comment: str) -> None:
         self._comments[item_id].append(comment)
+
+    def create_experiment(self, title: str, body: str = "") -> int:
+        exp_id = self._next_experiment_id
+        self._next_experiment_id += 1
+        self._experiments[exp_id] = {"title": title, "body": body, "links": []}
+        return exp_id
+
+    def link_experiment_to_item(self, experiment_id: int, item_id: int) -> None:
+        self._experiments[experiment_id]["links"].append(item_id)
 
     def list_uploads(self, item_id: int) -> list[dict[str, Any]]:
         return self._uploads.get(item_id, [])

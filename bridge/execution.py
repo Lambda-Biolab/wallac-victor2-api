@@ -74,6 +74,10 @@ class ElabftwWritebackClient(Protocol):
 
     def post_comment(self, item_id: int, comment: str) -> None: ...
 
+    def create_experiment(self, title: str, body: str = "") -> int: ...
+
+    def link_experiment_to_item(self, experiment_id: int, item_id: int) -> None: ...
+
 
 # --- Execution result ------------------------------------------------------
 
@@ -207,6 +211,8 @@ class ExecutionOrchestrator:
 
             self._write_progress(job_item_id, 90, "Uploading artifacts")
             self._upload_or_spool(job_item_id, result.run_id, assay_prot_id, raw_wells, result)
+
+            self._write_assay_summary(job_item_id, execution_mode, assay_prot_id, raw_wells, result)
 
             result.success = result.final_state not in (
                 "failed",
@@ -490,6 +496,87 @@ class ExecutionOrchestrator:
             )
 
         return artifacts
+
+    def _write_assay_summary(
+        self,
+        job_item_id: int,
+        execution_mode: str,
+        assay_prot_id: int,
+        raw_wells: list[dict[str, Any]],
+        result: ExecutionResult,
+    ) -> None:
+        """Create a Wallac Victor2 Assay experiment with a readable summary.
+
+        Best-effort: if creation fails, the job is still considered complete
+        because the authoritative artifacts are already on the Automation Job.
+        The Assay is a human-readable narrative, not the source of truth.
+        """
+        try:
+            title = f"Assay for Automation Job #{job_item_id}"
+            body = self._build_assay_body(
+                job_item_id, execution_mode, assay_prot_id, raw_wells, result
+            )
+
+            experiment_id = self.elabftw.create_experiment(title, body)
+            result.add_event("assay_created", f"experiment_id={experiment_id}")
+
+            # Link the Assay back to the Automation Job
+            self.elabftw.link_experiment_to_item(experiment_id, job_item_id)
+            result.add_event("assay_linked", f"item_id={job_item_id}")
+
+            # Write the Assay experiment ID back to the Automation Job
+            self.elabftw.patch_metadata(
+                job_item_id,
+                {"Assay experiment ID": {"value": str(experiment_id)}},
+            )
+        except Exception as e:
+            logger.warning("Assay summary write-back failed for job %d: %s", job_item_id, e)
+            result.add_event("assay_writeback_failed", str(e))
+
+    def _build_assay_body(
+        self,
+        job_item_id: int,
+        execution_mode: str,
+        assay_prot_id: int,
+        raw_wells: list[dict[str, Any]],
+        result: ExecutionResult,
+    ) -> str:
+        """Build an HTML body for the Assay experiment."""
+        parts: list[str] = []
+        parts.append("<h2>Wallac Victor2 Assay Summary</h2>")
+        parts.append(f"<p><strong>Automation Job:</strong> #{job_item_id}</p>")
+        parts.append(f"<p><strong>Execution mode:</strong> {execution_mode}</p>")
+
+        if assay_prot_id:
+            parts.append(f"<p><strong>AssayProtID:</strong> {assay_prot_id}</p>")
+        if result.run_id:
+            parts.append(f"<p><strong>Run ID:</strong> {result.run_id}</p>")
+
+        parts.append(f"<p><strong>Wells measured:</strong> {len(raw_wells)}</p>")
+
+        if result.analysis_result is not None:
+            ar = result.analysis_result
+            parts.append("<h3>Analysis Results</h3>")
+            parts.append(f"<p><strong>Pass/Fail:</strong> {ar.pass_fail}</p>")
+            if ar.summary:
+                parts.append("<table border='1'><tr><th>Metric</th><th>Value</th></tr>")
+                for key, val in ar.summary.items():
+                    parts.append(f"<tr><td>{key}</td><td>{val}</td></tr>")
+                parts.append("</table>")
+
+        parts.append("<h3>Artifacts</h3>")
+        parts.append("<p>Raw results, analyzed data, and replicate summaries are attached ")
+        parts.append(f"to <a href='#'>Automation Job #{job_item_id}</a>.</p>")
+
+        if result.events:
+            parts.append("<h3>Execution Event Log</h3>")
+            parts.append("<ul>")
+            for e in result.events:
+                detail = f": {e['detail']}" if e.get("detail") else ""
+                parts.append(f"<li>[{e['ts']}] {e['event']}{detail}</li>")
+            parts.append("</ul>")
+
+        return "\n".join(parts)
 
     def _extract_mode(self, spec_dict: dict[str, Any] | None) -> str:
         """Extract measurement mode from job spec."""
