@@ -883,45 +883,10 @@ _mdb_write_lock = threading.Lock()
 ENV_ENABLE_AUTHORING = "WALLAC_ENABLE_PROTOCOL_AUTHORING"
 MDB_BACKUP_DIR = r"C:\Users\Public\mdb_backups"
 
-# Known AssayProtocol columns for insert (extra keys in the dict are ignored).
-_ASSAY_PROTOCOL_COLUMNS = frozenset(
-    {
-        "AssayProtID",
-        "ProtName",
-        "ProtNumber",
-        "ProtVersion",
-        "FactoryPreset",
-        "ProtGroup",
-        "MeasSequence",
-        "MeasHeight",
-        "PlateTypeID",
-        "RepCount",
-        "RepDelta",
-        "PlateMap",
-        "MeasurementMode",
-        "PlateHeating",
-        "Temperature",
-        "PrnOutput",
-        "PrnOutputFormat",
-        "PrnOutputWhen",
-        "FileOutput",
-        "FileOutputWhen",
-        "FileOutputType",
-        "FileOutputOptions",
-        "ApplOutput",
-        "ApplOutputArg",
-        "EditPassword",
-        "Notes",
-        "AssayBeginMacro",
-        "AssayEndMacro",
-        "PlateBeginMacro",
-        "PlateEndMacro",
-        "RepeatBeginMacro",
-        "RepeatEndMacro",
-        "ResultMacro",
-        "NormalizationInfo",
-    }
-)
+# Columns that can be overridden via SQL UPDATE after cloning a template protocol.
+# Binary/OLE Object fields (PlateMap, NormalizationInfo) are copied by the
+# clone operation and should not appear here.
+
 
 
 def _is_authoring_enabled():
@@ -1062,78 +1027,105 @@ def op_mdb_get_max_protocol_id():
 
 
 def op_mdb_insert_protocol(protocol_row):
-    """Insert a new AssayProtocol row.
+    """Insert a new AssayProtocol row by cloning a template via SQL.
 
-    Uses SQL INSERT for text/numeric columns, then DAO Edit/Update for
-    binary columns (PlateMap) that can't go through SQL.
+    Approach: INSERT INTO ... SELECT clones the template row including
+    binary fields (PlateMap, NormalizationInfo) that can't be set via
+    DAO AppendChunk on a NULL OLE Object field. Then SQL UPDATE
+    overrides the specific fields (AssayProtID, ProtName, etc.).
+
+    Args:
+        protocol_row: dict with keys:
+            - AssayProtID (int): new protocol ID
+            - _template_id (int): ID of the template to clone
+            - ProtName (str): new protocol name
+            - ProtNumber (int): protocol number
+            - ProtVersion (int): protocol version
+            - FactoryPreset (bool/int): factory preset flag
+            - ProtGroup (int): protocol group ID
+            - optional: LastRunDate, RunCount, CreatedTime, LastEditedTime
     """
-    # Columns that are binary/OLE Object and need DAO AppendChunk
-    _BINARY_COLS = frozenset({"PlateMap", "NormalizationInfo"})
+    _OVERRIDABLE_COLS = frozenset({
+        "ProtName", "ProtNumber", "ProtVersion", "FactoryPreset",
+        "ProtGroup", "LastRunDate", "RunCount",
+        "CreatedTime", "LastEditedTime",
+    })
 
     def _op(_srv):
         db = _open_mdb_w()
         try:
-            # Step 1: SQL INSERT for non-binary columns
-            sql_cols = []
-            sql_vals = []
-            binary_fields = {}
-            for key in _ASSAY_PROTOCOL_COLUMNS:
+            template_id = int(protocol_row.get("_template_id", 0))
+            new_id = int(protocol_row["AssayProtID"])
+
+            if template_id <= 0:
+                raise RuntimeError("_template_id is required for protocol cloning")
+
+            # Step 1: Clone the template row via INSERT INTO ... SELECT.
+            # This copies ALL columns including binary PlateMap.
+            # Get column names from the template record.
+            rs_cols = db.OpenRecordset(
+                "SELECT * FROM AssayProtocol WHERE AssayProtID = "
+                + str(template_id)
+            )
+            if rs_cols.EOF:
+                raise RuntimeError(f"Template protocol {template_id} not found")
+            col_names = []
+            for i in range(rs_cols.Fields.Count):
+                col_names.append(rs_cols.Fields.Item(i).Name)
+            rs_cols.Close()
+
+            build_select = []
+            for cn in col_names:
+                if cn == "AssayProtID":
+                    build_select.append(str(new_id))
+                else:
+                    build_select.append(cn)
+            clone_sql = (
+                "INSERT INTO AssayProtocol ("
+                + ", ".join(col_names)
+                + ") SELECT "
+                + ", ".join(build_select)
+                + " FROM AssayProtocol WHERE AssayProtID = "
+                + str(template_id)
+            )
+            try:
+                db.Execute(clone_sql)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Clone INSERT failed: {exc}"
+                ) from exc
+
+            # Step 2: UPDATE specific fields we want to override
+            set_clauses = []
+            for key in _OVERRIDABLE_COLS:
                 if key not in protocol_row:
                     continue
                 val = protocol_row[key]
                 if isinstance(val, bool):
                     val = -1 if val else 0
-                if key in _BINARY_COLS:
-                    # Defer binary fields to DAO Edit/Update
-                    binary_fields[key] = val
-                    continue
-                sql_cols.append(key)
-                if isinstance(val, (int, float)):
-                    sql_vals.append(str(val))
-                elif val is None:
-                    sql_vals.append("NULL")
+                if val is None:
+                    set_clauses.append(f"{key} = NULL")
+                elif isinstance(val, (int, float)):
+                    set_clauses.append(f"{key} = {val}")
                 else:
-                    sql_vals.append("'" + str(val).replace("'", "''") + "'")
+                    escaped = str(val).replace("'", "''")
+                    set_clauses.append(f"{key} = '{escaped}'")
 
-            if not sql_cols:
-                raise RuntimeError("no valid non-binary columns to insert")
-
-            sql = (
-                "INSERT INTO AssayProtocol ("
-                + ", ".join(sql_cols)
-                + ") VALUES ("
-                + ", ".join(sql_vals)
-                + ")"
-            )
-            db.Execute(sql)
-
-            # Step 2: DAO Edit/Update for binary fields (PlateMap)
-            if binary_fields:
-                import array as _array
-
-                new_id = int(protocol_row["AssayProtID"])
-                rs = db.OpenRecordset(
-                    "SELECT * FROM AssayProtocol WHERE AssayProtID = " + str(new_id),
-                    2,  # dbOpenDynaset
+            if set_clauses:
+                update_sql = (
+                    "UPDATE AssayProtocol SET "
+                    + ", ".join(set_clauses)
+                    + " WHERE AssayProtID = "
+                    + str(new_id)
                 )
-                if not rs.EOF:
-                    rs.Edit()
-                    for key, val in binary_fields.items():
-                        if val is None:
-                            continue  # Skip NULL binary fields
-                        # comtypes returns OLE Object fields as tuples of ints;
-                        # DAO AppendChunk accepts array.array('B', ...) only.
-                        if not isinstance(val, _array.array):
-                            val = _array.array("B", list(val))
-                        fld = rs.Fields(key)
-                        # AppendChunk writes binary data in chunks
-                        CHUNK = 32768
-                        for i in range(0, len(val), CHUNK):
-                            fld.AppendChunk(val[i:i + CHUNK])
-                    rs.Update()
-                rs.Close()
+                try:
+                    db.Execute(update_sql)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Override UPDATE failed: {exc}"
+                    ) from exc
 
-            return int(protocol_row["AssayProtID"])
+            return new_id
         finally:
             db.Close()
 
