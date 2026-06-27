@@ -1067,8 +1067,8 @@ def op_mdb_insert_protocol(protocol_row):
     Uses SQL INSERT for text/numeric columns, then DAO Edit/Update for
     binary columns (PlateMap) that can't go through SQL.
     """
-    # Columns that are binary/OLE Object and need DAO Edit/Update
-    _BINARY_COLS = frozenset({"PlateMap"})
+    # Columns that are binary/OLE Object and need DAO AppendChunk
+    _BINARY_COLS = frozenset({"PlateMap", "NormalizationInfo"})
 
     def _op(_srv):
         db = _open_mdb_w()
