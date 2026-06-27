@@ -170,12 +170,18 @@ def extract_signed_request_fields(data_json: bytes) -> RequestFields:
     """Extract request fields from the signed ``data.json`` snapshot.
 
     The ``data.json`` in the signature archive is a full JSON export of the
-    entity at sign time.  Its ``metadata`` field contains ``extra_fields``
-    (possibly double-encoded).
+    entity at sign time.  eLabFTW may store it as a dict (single entity) or
+    a list (API response with one item).  Its ``metadata`` field contains
+    ``extra_fields`` (possibly double-encoded).
     """
     from .elabftw import extract_extra_fields
 
     data = json.loads(data_json)
+    # Handle both dict and list (API response) formats
+    if isinstance(data, list):
+        if not data:
+            return RequestFields()
+        data = data[0]
     extra_fields = extract_extra_fields(data.get("metadata"))
     return RequestFields.from_extra_fields(extra_fields)
 
