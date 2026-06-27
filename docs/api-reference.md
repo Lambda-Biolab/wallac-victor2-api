@@ -327,3 +327,505 @@ Drop and recreate the COM connection to the OEM server:
 ```json
 {"reconnected": true}
 ```
+
+### MDB endpoints (generated-protocol support)
+
+These endpoints expose the instrument's Jet database (MDB) for the
+generated-protocol authoring pipeline. All write operations are guarded by a
+single-writer lock (`_mdb_write_lock`).
+
+Read operations are always permitted. Write operations require the
+`WALLAC_ENABLE_PROTOCOL_AUTHORING=true` environment variable on the vm-agent;
+without it they return `403 authoring_disabled`.
+
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| `GET` | `/mdb/groups?name=<name>` | token | Lookup a ProtocolGroup ID by exact GroupName |
+| `GET` | `/mdb/protocols?name=<name>` | token | Find an AssayProtocol row by exact ProtName |
+| `GET` | `/mdb/protocols/<id>` | token | Get a full AssayProtocol row by AssayProtID |
+| `GET` | `/mdb/max-protocol-id` | token | Highest AssayProtID in the database |
+| `POST` | `/mdb/protocols` | token + authoring | Insert a new AssayProtocol row |
+| `DELETE` | `/mdb/protocols/<id>` | token + authoring | Delete an AssayProtocol row by ID |
+| `POST` | `/mdb/backup` | token + authoring | Create a timestamped backup of the MDB |
+| `POST` | `/mdb/query` | token | Execute a read-only SELECT query |
+
+#### `GET /mdb/groups?name=<name>`
+
+Query parameter `name` (required, case-sensitive). Returns the ProtocolGroup ID:
+
+```json
+{"group_id": 3, "name": "Photometry"}
+```
+
+`400` if name is missing; `404` if no group matches.
+
+#### `GET /mdb/protocols?name=<name>`
+
+Returns the full AssayProtocol row for an exact `ProtName` match, or
+`404 protocol_not_found`:
+
+```json
+{
+  "AssayProtID": 2000001,
+  "ProtName": "ELAB-Job-1-abc12345",
+  "ProtNumber": null,
+  "ProtVersion": 1,
+  "FactoryPreset": false,
+  "ProtGroup": 3
+}
+```
+
+`400` if name is missing.
+
+#### `GET /mdb/protocols/<id>`
+
+Returns the full AssayProtocol row by numeric AssayProtID, or
+`404 protocol_not_found`. `400` if id is not an integer.
+
+#### `GET /mdb/max-protocol-id`
+
+```json
+{"max_assay_prot_id": 2000001}
+```
+
+Returns `0` if the table is empty.
+
+#### `POST /mdb/protocols`
+
+Requires `WALLAC_ENABLE_PROTOCOL_AUTHORING=true`. Acquires the write lock.
+
+Body — JSON dict with these known columns (extra keys ignored):
+
+| Field | Type | Required |
+|-------|------|----------|
+| `AssayProtID` | int | yes |
+| `ProtName` | string | yes |
+| `ProtNumber` | int\|null | no |
+| `ProtVersion` | int | no |
+| `FactoryPreset` | bool | no |
+| `ProtGroup` | int | no (ProtocolGroup ID) |
+
+Returns `201`:
+
+```json
+{"assay_prot_id": 2000001, "created": true}
+```
+
+`400` if `AssayProtID` or `ProtName` is missing; `403 authoring_disabled` if
+the feature flag is not set.
+
+#### `DELETE /mdb/protocols/<id>`
+
+Requires `WALLAC_ENABLE_PROTOCOL_AUTHORING=true`. Acquires the write lock.
+
+```json
+{"assay_prot_id": 2000001, "deleted": true}
+```
+
+`404 delete_failed` if the id does not exist; `403 authoring_disabled` if the
+feature flag is not set.
+
+#### `POST /mdb/backup`
+
+Requires `WALLAC_ENABLE_PROTOCOL_AUTHORING=true`. Acquires the write lock.
+
+Body:
+
+| Field | Type | Required |
+|-------|------|----------|
+| `name` | string | yes (backup filename) |
+
+```json
+{"backup_path": "C:\\Users\\Public\\mdb_backups\\mlr3_20260627_120000.mdb", "created": true}
+```
+
+`400` if name is missing.
+
+#### `POST /mdb/query`
+
+Execute an arbitrary SELECT query against the MDB. Only `SELECT` statements
+are allowed; any other SQL dialect returns `400 invalid_query`.
+
+Body:
+
+| Field | Type | Required |
+|-------|------|----------|
+| `sql` | string | yes (SELECT statement) |
+
+```json
+{
+  "count": 2,
+  "rows": [
+    {"AssayProtID": 1000003, "ProtName": "Absorbance 405", "ProtNumber": 3},
+    {"AssayProtID": 1000004, "ProtName": "Absorbance @ 600 (1.0s)", "ProtNumber": 4}
+  ]
+}
+```
+
+`400` if sql is missing or not a SELECT statement.
+
+---
+
+## Designer API
+
+FastAPI application served by the bridge daemon for the Run Builder UI and
+eLabFTW draft authoring. See `bridge/designer_app.py` and
+`bridge/designer.py`.
+
+| Property | Value |
+|----------|-------|
+| Base URL | `http://<host>:8422` (configurable, no default) |
+| Auth | Bearer token in `WALLAC_DESIGNER_TOKEN` env var (disabled if unset) |
+| OpenAPI docs | `GET /docs` (FastAPI Swagger UI) |
+
+### `GET /health`
+
+```json
+{"status": "ok"}
+```
+
+### `GET /run-builder`
+
+Serves the Run Builder single-page HTML application (`bridge/run_builder.html`).
+`404` if the HTML file is not found.
+
+### CRUD endpoints (all four kinds)
+
+The same CRUD pattern applies for **methods**, **layouts**, **analyses**, and
+**jobs**. Replace `{kind}` with one of `method`, `layout`, `analysis`, `job`.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/api/{kind}s` | Create a new draft |
+| `GET` | `/api/{kind}s` | List all drafts |
+| `GET` | `/api/{kind}s/{item_id}` | Get a draft |
+| `PATCH` | `/api/{kind}s/{item_id}` | Update draft spec |
+| `POST` | `/api/{kind}s/{item_id}/finalize` | Finalize (canonicalize + attach JSON + write hash) |
+| `POST` | `/api/{kind}s/{item_id}/clone` | Clone a signed object to a new draft |
+
+**Auth:** all CRUD endpoints require a valid Bearer token if
+`WALLAC_DESIGNER_TOKEN` is set.
+
+#### `POST /api/{kind}s` — create draft
+
+Body:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `title` | string | Human-readable title for the eLabFTW item |
+| `spec` | dict | Spec dict (schema-validated on finalize) |
+
+Response (`201`):
+
+```json
+{
+  "item_id": 42,
+  "title": "My Method",
+  "category_id": 7,
+  "lifecycle": "draft",
+  "spec": {},
+  "hash": "",
+  "json_attachment_id": 0
+}
+```
+
+#### `GET /api/{kind}s` — list drafts
+
+```json
+[
+  {
+    "item_id": 42,
+    "title": "My Method",
+    "category_id": 7,
+    "lifecycle": "draft",
+    "spec": {},
+    "hash": "",
+    "json_attachment_id": 0
+  }
+]
+```
+
+#### `GET /api/{kind}s/{item_id}` — get draft
+
+Single `DraftResponse` object (same shape as above). `404` if not found.
+
+#### `PATCH /api/{kind}s/{item_id}` — update draft spec
+
+Body:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `spec` | dict | Updated spec dict (replaces existing entirely) |
+
+Returns the updated `DraftResponse`. `403` if the item is not in draft state
+(only signed objects can be used as templates, via `/clone`).
+
+#### `POST /api/{kind}s/{item_id}/finalize` — finalize
+
+Canonicalizes the spec dict into JSON, computes the SHA-256 hash, uploads the
+JSON as an eLabFTW attachment, and writes hash + attachment ID into metadata.
+The object remains in `draft` state until the operator signs it in the eLabFTW
+UI.
+
+Response (`200`):
+
+```json
+{
+  "item_id": 42,
+  "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "json_attachment_id": 17,
+  "filename": "method.json"
+}
+```
+
+`403` if the item is not in draft state.
+
+#### `POST /api/{kind}s/{item_id}/clone` — clone signed object
+
+Creates a new draft from a signed/active object (immutable source). Body:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `new_title` | string | Title for the new draft |
+
+Returns a `DraftResponse` for the new draft (lifecycle: `draft`). `403` if the
+source object is not in `signed_active` lifecycle state.
+
+---
+
+## Bridge daemon
+
+The bridge daemon (`main.py`) runs on the Linux host and orchestrates the
+end-to-end Automation Job lifecycle:
+
+1. **Poll** eLabFTW for pending Automation Jobs every `WALLAC_POLL_INTERVAL` s
+2. **Verify** cryptographic signatures on job requests
+3. **Claim** jobs (write-back state + identity to eLabFTW)
+4. **Execute** — resolve/measure via the vm-agent (either an existing protocol
+   or a generated protocol written to the MDB)
+5. **Write back** results (CSV exports, artifacts) to eLabFTW
+
+It also runs:
+- A **dashboard server** background thread (default `0.0.0.0:8421`)
+- An **abort poller** background thread (5 s interval) that checks eLabFTW for
+  abort requests and signals the vm-agent
+
+### Configuration
+
+All configuration is via environment variables (see `bridge/config.py`).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WALLAC_ELABFTW_URL` | `https://localhost:3148` | eLabFTW server URL |
+| `WALLAC_ELABFTW_API_KEY` | _(required)_ | Dedicated bridge API key |
+| `WALLAC_ELABFTW_CATEGORY` | `9` | Automation Job resource category ID |
+| `WALLAC_VM_AGENT_URL` | `http://192.168.122.203:8420` | vm-agent REST API base |
+| `WALLAC_VM_AGENT_TOKEN` | `""` | vm-agent bearer token |
+| `WALLAC_DASHBOARD_HOST` | `0.0.0.0` | Dashboard listen address |
+| `WALLAC_DASHBOARD_PORT` | `8421` | Dashboard listen port |
+| `WALLAC_DASHBOARD_TOKEN` | `""` | Dashboard auth token (unset = open on LAN) |
+| `WALLAC_BRIDGE_IDENTITY` | `wallac-bridge` | Identity written to "Claimed by" field |
+| `WALLAC_DEVICE_IDENTITY` | `victor2-unknown` | Instrument identity for diagnostics |
+| `WALLAC_SPOOL_DIR` | `/var/lib/wallac-bridge/spool` | Result write-back spool directory |
+| `WALLAC_POLL_INTERVAL` | `5.0` | eLabFTW job poll interval (seconds) |
+| `WALLAC_ENABLE_PROTOCOL_AUTHORING` | `""` | Feature flag: set `true` to enable generated protocols |
+| `WALLAC_DESIGNER_TOKEN` | `""` | Bearer token for the Designer API (unset = no auth) |
+
+### Deployment
+
+The bridge runs as a systemd service. See `deploy/wallac-bridge.service` and
+`deploy/bridge.env.example`:
+
+```
+[Unit]
+Description=Wallac Victor2 eLabFTW Bridge
+After=network-online.target
+
+[Service]
+Type=simple
+User=antonio
+EnvironmentFile=/etc/wallac-bridge/bridge.env
+ExecStart=/usr/bin/python3 main.py
+Restart=on-failure
+RestartSec=10
+```
+
+The env file at `/etc/wallac-bridge/bridge.env` holds all secrets and is
+**never** committed to the repository.
+
+### Dashboard API
+
+Served on `WALLAC_DASHBOARD_HOST:WALLAC_DASHBOARD_PORT` (default
+`0.0.0.0:8421`). Auth via `WALLAC_DASHBOARD_TOKEN` (Bearer token). If the
+token is unset, the dashboard is open on the LAN.
+
+#### `GET /` — dashboard HTML
+
+The single-page dashboard UI (`bridge/dashboard.html`).
+
+#### `GET /api/jobs/{id}` — job state JSON
+
+Returns the full job state object for the dashboard panels:
+
+```json
+{
+  "item_id": 412,
+  "title": "Measure plate A",
+  "experiment_id": "",
+  "wallac_run_id": "r-ab12cd34ef56",
+  "requester": "operator@lab",
+  "operator": "wallac-bridge",
+  "device_identity": "victor2-1420",
+  "service_version": "0.1.0",
+  "state": "running",
+  "progress_percent": 55.0,
+  "current_step": "Measuring...",
+  "started_at": "2026-06-27T10:12:00+00:00",
+  "last_heartbeat": "2026-06-27T10:12:30+00:00",
+  "elapsed_seconds": 30.0,
+  "protocol_name": "Absorbance @ 600",
+  "plate_layout_reference": "",
+  "expected_outputs": "CSV with OD values",
+  "request_checksum": "",
+  "preflight": [{"name": "Lid closed", "passed": true, "detail": ""}],
+  "plate_wells": {},
+  "event_log": ["Job claimed", "Protocol resolved", "Measurement started"],
+  "artifacts": [{"filename": "results.csv", "comment": "OD table"}],
+  "result_summary": "",
+  "writeback_status": "pending",
+  "writeback_last_retry": "",
+  "writeback_operator_hint": "",
+  "last_error_code": "",
+  "operator_hint": ""
+}
+```
+
+`404` if the job is unknown.
+
+#### `GET /api/jobs/{id}/stream` — SSE live progress
+
+Server-Sent Events stream (`Content-Type: text/event-stream`) that pushes the
+full job state dict on every change. The browser `EventSource` auto-reconnects
+on interruption using the `retry: 3000` hint. Heartbeat comments (`: heartbeat`)
+are sent every second when no state change occurs. The stream ends when the job
+reaches a terminal state (`completed`, `failed`, `aborted`, or
+`unknown_requires_operator_review`).
+
+#### `POST /api/jobs/{id}/abort` — request abort
+
+Request a controlled abort of a running job. The bridge forwards the request to
+the vm-agent and updates eLabFTW metadata.
+
+```json
+{"ok": true}
+```
+
+`404` if the job is not active.
+
+#### `GET /api/jobs/{id}/artifacts/{filename}` — download artifact
+
+Download a result artifact (CSV, image, etc.) produced by the job execution.
+Content-Type is determined by the artifact. `404` if the artifact does not
+exist.
+
+---
+
+## Error codes
+
+### vm-agent error codes
+
+Returned by the instrument microservice (`agent.py`). These are the standard
+codes produced by `_classify_exc()` and the various endpoint handlers.
+
+| HTTP | Code | Description | Hint |
+|------|------|-------------|------|
+| 401 | `unauthorized` | Missing or invalid bearer token | Send `Authorization: Bearer <token>` |
+| 404 | `not_found` | Path does not match any endpoint | See `GET /docs` |
+| 404 | `protocol_not_found` | No protocol matches the given name or id | `GET /protocols` to list |
+| 404 | `run_not_found` | No run with that id | `GET /runs` to list |
+| 404 | `group_not_found` | No ProtocolGroup matches the name | Provide a valid GroupName |
+| 404 | `delete_failed` | AssayProtocol ID not found for deletion | Check the ID exists |
+| 409 | `instrument_not_ready` | Reader refused to start | Close lid, load a plate, clear MlrMgr errors |
+| 409 | `instrument_busy` | A run is already active | Wait for it, or abort/DELETE it first |
+| 409 | `protocol_ambiguous` | Name matches several protocols | Use a more specific name or numeric id |
+| 409 | `run_active` | Run is running and not forced | Abort first or pass `?force=1` |
+| 425 | `too early to abort` | Abort requested <60 s into the run | Wait and retry |
+| 500 | `internal_error` | Unexpected server bug | Check agent stderr log |
+| 503 | `instrument_not_connected` | MlrMgr not connected to the reader | Start OEM GUI and wait for connection |
+| 503 | `instrument_link_lost` | COM link dropped | `POST /admin/reconnect` |
+| 503 | `com_error` | Unexpected COM/instrument error | Check agent stderr log |
+| 504 | `measure_timeout` | Run did not finish within the timeout | Poll `GET /runs/{id}` |
+| — | `com_timeout` | Instrument did not respond in time | `POST /admin/reconnect` |
+| — | `authoring_disabled` | Write operation blocked by feature flag | Set `WALLAC_ENABLE_PROTOCOL_AUTHORING=true` |
+| — | `name_required` | Query parameter `name` is missing | Provide `?name=<value>` |
+| — | `sql_required` | Request body missing `sql` field | Provide `{"sql": "SELECT ..."}` |
+| — | `invalid_query` | SQL is not a SELECT statement | Only SELECT queries are allowed |
+| — | `missing_fields` | Required fields missing from POST body | Provide `AssayProtID` and `ProtName` |
+| — | `invalid_id` | `id` path parameter is not an integer | Use a numeric ID |
+
+### Bridge error codes
+
+Structured errors raised by the bridge daemon components (intake, execution,
+designer). These share a uniform JSON shape:
+
+```json
+{
+  "code": "signature_verification_failed",
+  "severity": "error",
+  "human_message": "Signature verification failed for Automation Job 42",
+  "operator_hint": "The signature archive may be corrupted or the signing key may have been revoked.",
+  "retryable": false,
+  "details": {"item_id": 42, "upload_id": 7}
+}
+```
+
+#### Intake & claim errors
+
+| Code | Severity | Description | Retryable |
+|------|----------|-------------|-----------|
+| `unsigned_job` | error | Automation Job has no signature archive | no |
+| `signature_verification_failed` | error | Cryptographic signature is invalid | no |
+| `request_modified_after_signature` | error | Request fields changed after signing | no |
+| `already_claimed` | error | Job is no longer in `requested` state (another bridge claimed it) | no |
+| `claim_failed` | error | Claim write-back to eLabFTW failed | depends |
+| `elabftw_error` | error | eLabFTW API error during intake | depends |
+
+#### Canonical spec & validation errors
+
+| Code | Severity | Description | Retryable |
+|------|----------|-------------|-----------|
+| `canonical_hash_mismatch` | error | Downloaded attachment SHA-256 does not match signed hash | no |
+| `canonical_attachment_mismatch` | error | Attachment metadata does not match | no |
+| `schema_unsupported` | error | Schema name or version is not in the supported set | no |
+| `signature_missing` | error | No signature archive found on the eLabFTW item | no |
+| `signature_invalid` | error | Cryptographic signature verification failed | no |
+| `signer_unauthorized` | error | Signing key is not in the authorized set | no |
+| `referenced_object_not_active` | error | Referenced method/layout/analysis is not in signed_active state | no |
+| `capability_unavailable` | warning | Required instrument capability is not available | yes |
+| `mode_not_enabled` | warning | Requested measurement mode is not enabled | no |
+| `template_missing_or_drifted` | error | eLabFTW template category missing or schema changed | no |
+
+#### MDB & generated-protocol errors
+
+| Code | Severity | Description | Retryable |
+|------|----------|-------------|-----------|
+| `mdb_id_collision` | error | Generated AssayProtID collides with existing row | no |
+| `mdb_backup_failed` | error | MDB backup could not be created | yes |
+| `mdb_write_failed` | error | MDB insert/delete failed | yes |
+| `post_write_verification_failed` | error | Verification read after write did not match | yes |
+
+#### Execution & write-back errors
+
+| Code | Severity | Description | Retryable |
+|------|----------|-------------|-----------|
+| `result_incomplete` | warning | Measurement completed but results are partial | yes |
+| `analysis_failed` | error | Post-measurement analysis step failed | yes |
+| `writeback_spooled` | info | Result write-back could not complete; spooled for retry | yes |
+| `operator_review_required` | error | Bridge cannot proceed automatically; operator must inspect | no |
+| `invalid_transition` | error | Invalid job state transition (bridge bug) | no |
+
+#### vm-agent proxied errors
+
+The bridge also surfaces vm-agent errors directly. When a vm-agent call fails,
+the error code and hint are forwarded to eLabFTW metadata and the job state.
+See the "vm-agent error codes" section above for the full list.
