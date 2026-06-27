@@ -184,7 +184,8 @@ class ElabftwClient:
         return jobs
 
     def list_uploads(self, item_id: int) -> list[dict[str, Any]]:
-        return self._request("GET", f"/items/{item_id}/uploads") or []
+        # Include archived uploads (state=2) so signature archives are visible.
+        return self._request("GET", f"/items/{item_id}/uploads?state=2") or []
 
     def download_upload(self, item_id: int, upload_id: int) -> bytes:
         """Download the raw bytes of an upload attachment.
