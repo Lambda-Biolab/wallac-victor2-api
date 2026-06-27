@@ -271,9 +271,9 @@ class GeneratedProtocolManager:
     ) -> GeneratedProtocol:
         """Generate a new MDB protocol for this job.
 
-        Copies the template protocol's full row (PlateMap, MeasurementMode,
-        etc.) and overrides only the ID, name, and group so the generated
-        protocol is a complete, runnable copy of the template.
+        Clones the template protocol via SQL INSERT INTO ... SELECT (which
+        copies binary fields like PlateMap), then overrides ID, name, and
+        group via SQL UPDATE.
 
         Raises:
             RuntimeError: if feature flag is off, mode is not enabled,
@@ -285,10 +285,8 @@ class GeneratedProtocolManager:
             raise RuntimeError(f"Cannot generate protocol: {validation['errors']}")
 
         with self._lock:
-            # Download the template protocol row to use as a base
             template = self.templates.get(mode)
-            template_row = self.mdb.get_protocol(template.assay_prot_id) if template else None
-            if template_row is None:
+            if template is None:
                 raise RuntimeError(f"Template protocol not found for mode '{mode}'")
 
             # Create backup
@@ -299,24 +297,25 @@ class GeneratedProtocolManager:
             # Allocate ID
             new_id = self._allocate_id()
 
-            # Build protocol row: copy template, override ID/name/group
+            # Build protocol row for the clone operation
             name = self._protocol_name(job_id, spec_hash)
             group_id = self.mdb.get_protocol_group_id(GENERATED_GROUP_NAME)
 
-            protocol_row = dict(template_row)
-            protocol_row["AssayProtID"] = new_id
-            protocol_row["ProtName"] = name
-            protocol_row["ProtNumber"] = new_id - GENERATED_ID_MIN + 1
-            protocol_row["ProtVersion"] = 1
-            protocol_row["FactoryPreset"] = False
-            protocol_row["ProtGroup"] = group_id
-            # Clear run-specific fields from template
-            protocol_row["LastRunDate"] = None
-            protocol_row["RunCount"] = 0
-            protocol_row["CreatedTime"] = None
-            protocol_row["LastEditedTime"] = None
+            protocol_row = {
+                "AssayProtID": new_id,
+                "_template_id": template.assay_prot_id,
+                "ProtName": name,
+                "ProtNumber": new_id - GENERATED_ID_MIN + 1,
+                "ProtVersion": 1,
+                "FactoryPreset": False,
+                "ProtGroup": group_id,
+                "LastRunDate": None,
+                "RunCount": 0,
+                "CreatedTime": None,
+                "LastEditedTime": None,
+            }
 
-            # Insert
+            # Insert (clones template via SQL, then overrides fields)
             actual_id = self.mdb.insert_protocol(protocol_row)
             if actual_id != new_id:
                 # ID collision — should not happen after collision check
