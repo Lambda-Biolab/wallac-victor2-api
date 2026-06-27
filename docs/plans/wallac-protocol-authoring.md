@@ -3,7 +3,7 @@
 Date: 2026-06-26
 Target repo: `Lambda-Biolab/wallac-victor2-api`
 Plan branch: `plan/wallac-protocol-authoring`
-Status: **Stages 1–7 complete. All 8 Stage 7 hardware acceptance tests pass. Both `existing_protocol` and `generated_protocol` execution paths validated end-to-end on live hardware. Bridge and designer deployed as systemd services (enabled for boot). 13 bugs found and fixed during live testing. `make validate` fully green (lint, format, complexity, 297 tests). Remaining: dedicated eLabFTW service key, 7 unmatched plasmid-primer links, 6 Phase 2 decisions.**
+Status: **Stages 1–6 implemented and tested. `existing_protocol` execution path validated end-to-end on live hardware (eLabFTW → bridge → vm-agent → instrument → results → write-back). `generated_protocol` path has all components built but not yet tested with a real plate. Run Builder UI (`bridge/run_builder.html`) implemented with drag-select plate layout editor and eLabFTW integration links. 4 e2e bugs found and fixed during live testing. `make validate` green (299 tests). Remaining: generated_protocol e2e with real plate, dedicated eLabFTW service key, 7 unmatched plasmid-primer links, 6 Phase 2 decisions.**
 
 ## Purpose
 
@@ -634,7 +634,7 @@ Acceptance:
 - draft mutation allowed;
 - signed mutation rejected or routed to clone/version.
 
-Implementation: `bridge/designer.py` (DesignerService), `bridge/designer_app.py` (FastAPI app with CRUD + finalize + clone), `bridge/run_builder.html` (single-page wizard UI served at `/run-builder`). 31 tests.
+Implementation: `bridge/designer.py` (DesignerService), `bridge/designer_app.py` (FastAPI app with CRUD + finalize + clone, served at `/run-builder`), `bridge/run_builder.html` (single-page wizard UI with 5-step flow: Method → Plate Layout → Analysis → Job → Review & Finalize; drag-select plate grid; eLabFTW URL config + "Open in eLabFTW" links; next-steps panel after finalization). 31 tests.
 
 ### Stage 4: validation-only bridge path
 
@@ -724,7 +724,7 @@ Implementation:
 
 ### Stage 7: hardware e2e acceptance and production enablement
 
-**Status: ✅ MOSTLY DONE — both execution paths validated end-to-end on live hardware**
+**Status: ⏳ PARTIALLY DONE — `existing_protocol` path validated end-to-end on live hardware (no plate loaded; results were air readings). `generated_protocol` path not yet tested with real plate.**
 
 - Run real eLabFTW -> bridge -> vm-agent -> Wallac -> raw results -> analysis -> artifacts -> Assay summary flow.
 - Validate generated MDB protocol in OEM/Wallac context.
