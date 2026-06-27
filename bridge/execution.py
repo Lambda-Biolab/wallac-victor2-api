@@ -108,12 +108,31 @@ class ExecutionResult:
 # --- Result completeness checker -------------------------------------------
 
 
+def _normalize_well_name(name: str) -> str:
+    """Normalize a well name to canonical form (e.g. 'A01' -> 'A1').
+
+    The vm-agent returns zero-padded names (A01, A02, ..., A12), while
+    layout/analysis specs use non-padded names (A1, A2, ..., A12).
+    Normalize to non-padded form for consistent comparison.
+    """
+    if not name:
+        return ""
+    # Match A01 -> A1, H12 -> H12 (no change), A1 -> A1 (no change)
+    import re
+
+    m = re.match(r"^([A-H])(\d{1,2})$", name.upper().strip())
+    if m:
+        return f"{m.group(1)}{int(m.group(2))}"
+    return name
+
+
 def _well_key(w: dict[str, Any]) -> str:
-    """Extract the well address from a raw result dict.
+    """Extract and normalize the well address from a raw result dict.
 
     The vm-agent uses 'well', layout/analysis specs use 'well_name'.
+    Normalizes to non-padded form (A1, not A01).
     """
-    return w.get("well_name") or w.get("well") or ""
+    return _normalize_well_name(w.get("well_name") or w.get("well") or "")
 
 
 def check_result_completeness(
