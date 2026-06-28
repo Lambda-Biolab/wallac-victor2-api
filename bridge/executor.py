@@ -359,12 +359,10 @@ class BridgeExecutor:
             state = run.get("state", "").lower()
 
             # Fetch live results every ~3s for real-time heatmap.
-            # The vm-agent now skips stale wells from the previous run's
-            # live buffer, so we can just replace live_wells each poll.
-            # Accumulate across polls because the live buffer may only
-            # contain recently measured wells.
+            # The vm-agent skips stale wells from the previous run's
+            # live buffer, so we can just accumulate fresh ones.
             now = time.monotonic()
-            if now - last_live_fetch >= 3.0 and state == "running":
+            if now - last_live_fetch >= 3.0:
                 last_live_fetch = now
                 try:
                     live = self.vm_agent.get_run_results(run_id)
