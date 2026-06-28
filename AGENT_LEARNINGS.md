@@ -278,3 +278,74 @@ the root cause is resolved.
 - Git repo on host: `~/repos/wallac-victor2-api/`
 - Git repo for ops: `~/repos/wallac-victor2-linux/` (see
   `host-config/VM-OPERATIONS.md` for full VM access reference)
+
+## VM Process Spawning from SSH — use `wmic process call create`, NOT `Start-Process`
+
+**Symptom:** `lid_watcher.py` (launched as `pythonw.exe` from an SSH
+session) consistently died ~5-30 seconds after the SSH session closed.
+`lid_watcher.log` showed `lid_watcher started` correctly, and the process
+even did its job when alive (the log captured a real `auto-Ignored`
+event), but the process was gone within seconds of every SSH disconnect.
+Meanwhile, `start_agent.bat` launched at boot (from the Windows Startup
+folder) kept `lid_watcher` alive indefinitely.
+
+**Root cause:** SSH session teardown kills the entire process tree.
+`Start-Process -FilePath pythonw.exe -ArgumentList lid_watcher.py`
+spawned `pythonw.exe` as a child of the SSH-spawned PowerShell. When the
+SSH channel closed, Windows tore down the whole session — including the
+`lid_watcher` we just started. The Linux-side `nohup`/`setsid` reflex
+doesn't apply on Win7; `Start-Process` does not detach the process from
+the SMB session that spawned it.
+
+The boot-launched `start-stack.bat` (in the Startup folder) has no SSH
+parent session, so its `start "" pythonw.exe lid_watcher.py` invocations
+survive. That is the only reason the system worked at all previously.
+
+**Fix — use `wmic process call create`:**
+
+```
+ssh -J antonio@lambdabiolab-computer lambda@192.168.122.203 \
+  'wmic process call create "C:\Users\lambda\AppData\Local\Programs\Python\Python38-32\pythonw.exe C:\install\lid_watcher.py"'
+```
+
+`wmic process call create` runs the Win32 `Create()` method via the WMI
+provider service, which is detached from the calling SSH session's
+process tree. The new process survives SSH disconnect indefinitely.
+Returns `ProcessId` and `ReturnValue=0` on success.
+
+Same pattern for restarting the agent:
+
+```
+ssh -J antonio@lambdabiolab-computer lambda@192.168.122.203 \
+  'wmic process call create "C:\Users\lambda\AppData\Local\Programs\Python\Python38-32\python.exe C:\install\agent.py"'
+```
+
+**Verified:** Both processes (`python.exe` agent + `pythonw.exe`
+lid_watcher) survived 15+ seconds after the SSH session closed, and
+remained alive across subsequent SSH disconnects.
+
+**Anti-patterns that DON'T work from SSH:**
+- `Start-Process -FilePath pythonw.exe -ArgumentList lid_watcher.py` —
+  killed when SSH session closes
+- `Start-Process -FilePath python.exe -ArgumentList lid_watcher.py
+  -WindowStyle Hidden` — same; killed on SSH teardown, despite the
+  hidden window style
+- Running `start_agent.bat` via `Start-Process -WindowStyle Hidden` —
+  the bat's internal `start ""` calls are still children of the SSH
+  session and die with it
+- `python.exe lid_watcher.py` run in foreground — dies immediately when
+  the SSH command times out or is cancelled
+
+**Bottom line:** From within an SSH session to the VM, ALWAYS use
+`wmic process call create` to spawn any process that needs to survive
+the SSH disconnect. `Start-Process` does not detach on Win7 the way
+`setsid`/`nohup` do on Linux.
+
+**Also: `wmic process call create` does NOT kill existing processes.**
+Unlike `start_agent.bat` which does `taskkill /F /IM python.exe` first,
+`wmic` just spawns a new process. Before running it, you must
+explicitly kill the prior instance or you'll end up with duplicate
+`python.exe` processes (both binding to port 8420, second one fails to
+listen). Use `taskkill /F /PID <pid>` on the specific PID, or run
+`start_agent.bat` first to do the kill-then-spawn dance, then start
+`lid_watcher` separately via `wmic`.
