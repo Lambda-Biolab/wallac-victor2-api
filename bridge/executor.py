@@ -191,17 +191,19 @@ class BridgeExecutor:
             job.add_event("dry_run_complete", "Specs validated, would run on instrument")
             return
 
-        # For v1 generated_protocol, we need a protocol name to run on the instrument.
-        # The method spec may contain a protocol_name field, or we use the
-        # job's protocol_name field.
-        protocol_name = job.protocol_name or method_spec.get("protocol_name", "")
+        # Match the method spec to a factory preset protocol on the instrument.
+        # The method spec defines mode (photometry/fluorometry/luminescence)
+        # and filter/wavelength parameters. We map these to the closest
+        # factory preset protocol name.
+        protocol_name = self._match_protocol_from_method(method_spec)
         if not protocol_name:
             job.status = "failed"
-            job.error = "No protocol_name in method spec or job for generated_protocol mode"
+            job.error = "Could not match method spec to an instrument protocol"
             job.add_event("execution_failed", job.error)
             return
+        job.add_event("protocol_matched", protocol_name)
 
-        # Start the run
+        # Resolve and start the run
         job.add_event("starting_run", protocol_name)
         try:
             run_resp = self.vm_agent.start_run(protocol_name)
@@ -510,7 +512,93 @@ class BridgeExecutor:
         object_id = ref.get("object_id", 0)
         attachment_id = ref.get("attachment_id", 0)
         if not object_id or not attachment_id:
+            logger.warning("download_ref: missing object_id or attachment_id in ref: %s", ref)
             return {}
 
-        data = self.elabftw.download_upload(object_id, attachment_id)
-        return json.loads(data)
+        try:
+            data = self.elabftw.download_upload(object_id, attachment_id)
+            return json.loads(data)
+        except Exception as e:
+            logger.warning(
+                "download_ref failed for object=%s attachment=%s: %s", object_id, attachment_id, e
+            )
+            return {}
+
+    def _match_protocol_from_method(self, method_spec: dict[str, Any]) -> str:
+        """Match a method spec to a factory preset protocol name on the instrument.
+
+        The method spec has a "mode" field (photometry/fluorometry/luminescence)
+        and mode-specific settings with filter/wavelength and read time info.
+        We map these to the closest factory preset protocol.
+
+        Returns the protocol name, or "" if no match found.
+        """
+        mode = method_spec.get("mode", "")
+
+        # Get the list of factory presets from the vm-agent
+        try:
+            prots_resp = self.vm_agent.get_protocols()
+            prots = (
+                prots_resp.get("protocols", prots_resp)
+                if isinstance(prots_resp, dict)
+                else prots_resp
+            )
+            factory_presets = [p for p in prots if p.get("factory_preset")]
+        except Exception:
+            return ""
+
+        if mode == "photometry":
+            photo = method_spec.get("photometry", {})
+            filter_name = photo.get("filter_name", "")
+            read_time = photo.get("read_time_seconds", 1.0)
+
+            # Extract wavelength from filter name (e.g. "OD600" → 600, "405nm" → 405)
+            import re
+
+            wl_match = re.search(r"(\d+)", filter_name)
+            wavelength = wl_match.group(1) if wl_match else ""
+
+            # Match: "Absorbance @ {wl} ({time}s)"
+            time_str = f"{read_time:.1f}" if read_time == int(read_time) else f"{read_time}"
+            target = f"Absorbance @ {wavelength} ({time_str}s)"
+
+            for p in factory_presets:
+                if p["name"] == target:
+                    return p["name"]
+            # Fallback: match by wavelength only
+            for p in factory_presets:
+                if "Absorbance" in p["name"] and f"@ {wavelength}" in p["name"]:
+                    return p["name"]
+
+        elif mode == "fluorometry":
+            fluoro = method_spec.get("fluorometry", {})
+            ex_name = fluoro.get("excitation_filter_name", "")
+            em_name = fluoro.get("emission_filter_name", "")
+            read_time = fluoro.get("read_time_seconds", 1.0)
+
+            # Extract wavelengths from filter names
+            import re
+
+            ex_match = re.search(r"(\d+)", ex_name)
+            em_match = re.search(r"(\d+)", em_name)
+            ex_wl = ex_match.group(1) if ex_match else ""
+            em_wl = em_match.group(1) if em_match else ""
+
+            time_str = f"{read_time:.1f}" if read_time == int(read_time) else f"{read_time}"
+            target = f"({ex_wl}nm/{em_wl}nm, {time_str}s)"
+
+            for p in factory_presets:
+                if target in p["name"]:
+                    return p["name"]
+            # Fallback: match by filter names
+            for p in factory_presets:
+                if ex_wl and em_wl and ex_wl in p["name"] and em_wl in p["name"]:
+                    return p["name"]
+
+        elif mode == "luminescence":
+            # Single luminescence protocol
+            for p in factory_presets:
+                if p["name"] == "Luminescence":
+                    return p["name"]
+
+        return ""
