@@ -640,12 +640,55 @@ async function saveMethod() {
   const title = document.getElementById('methodTitle').value;
   if (!title) { showStatus('Enter a method title', 'error'); return; }
   const spec = buildMethodSpec();
+
+  // Validate method spec before saving
+  const errors = validateMethodSpec(spec);
+  if (errors.length > 0) {
+    showStatus('Cannot save method: ' + errors.join('; '), 'error');
+    return;
+  }
+
   try {
     const result = await api('POST', '/api/methods', { title, spec });
     savedMethod = result;
     showStatus(`Method saved: id=${result.item_id}`, 'success');
     loadMethods();
   } catch (e) { showStatus('Failed: ' + e.message, 'error'); }
+}
+
+function validateMethodSpec(spec) {
+  const errors = [];
+  if (spec.schema_name !== 'wallac.method') {
+    errors.push('Wrong schema_name (expected wallac.method)');
+  }
+  if (!spec.mode) {
+    errors.push('No measurement mode selected');
+  }
+  if (spec.mode === 'photometry') {
+    if (!spec.photometry || !spec.photometry.filter_id) {
+      errors.push('No photometry filter selected');
+    }
+    if (!spec.photometry || !spec.photometry.read_time_seconds || spec.photometry.read_time_seconds <= 0) {
+      errors.push('Invalid read time for photometry');
+    }
+  } else if (spec.mode === 'fluorometry') {
+    if (!spec.fluorometry || !spec.fluorometry.excitation_filter_id) {
+      errors.push('No excitation filter selected');
+    }
+    if (!spec.fluorometry || !spec.fluorometry.emission_filter_id) {
+      errors.push('No emission filter selected');
+    }
+    if (!spec.fluorometry || !spec.fluorometry.read_time_seconds || spec.fluorometry.read_time_seconds <= 0) {
+      errors.push('Invalid read time for fluorometry');
+    }
+  } else if (spec.mode === 'luminescence') {
+    if (!spec.luminescence || !spec.luminescence.integration_time_seconds || spec.luminescence.integration_time_seconds <= 0) {
+      errors.push('Invalid integration time for luminescence');
+    }
+  } else {
+    errors.push(`Unknown measurement mode: ${spec.mode}`);
+  }
+  return errors;
 }
 
 async function loadMethods() {
@@ -1029,6 +1072,37 @@ function renderReview() {
 async function finalizeAll() {
   const results = document.getElementById('finalizeResults');
   results.innerHTML = '';
+
+  // Validate specs before finalizing
+  const validations = [
+    ['Method', savedMethod, 'methods', 'wallac.method', validateMethodSpec],
+    ['Plate Layout', savedLayout, 'layouts', 'wallac.layout', validateLayoutSpec],
+    ['Analysis Plan', savedAnalysis, 'analyses', 'wallac.analysis', validateAnalysisSpec],
+    ['Automation Job', savedJob, 'jobs', 'wallac.job', () => []],
+  ];
+
+  // Check each spec exists and has correct schema
+  for (const [label, obj, prefix, expectedSchema, validator] of validations) {
+    if (!obj) {
+      results.innerHTML += `<div class="status-msg error">${label}: not saved yet. Complete Step ${validations.indexOf([label, obj, prefix, expectedSchema, validator]) + 1} first.</div>`;
+      return;
+    }
+    // Verify the spec has the correct schema_name
+    const spec = obj.spec || obj.spec_dict || {};
+    if (spec.schema_name && spec.schema_name !== expectedSchema) {
+      results.innerHTML += `<div class="status-msg error">${label}: spec has wrong schema_name '${spec.schema_name}' (expected '${expectedSchema}'). Re-save the ${label.toLowerCase()}.</div>`;
+      return;
+    }
+    // Run spec-specific validation
+    if (validator) {
+      const errors = validator(spec);
+      if (errors.length > 0) {
+        results.innerHTML += `<div class="status-msg error">${label}: ${errors.join('; ')}</div>`;
+        return;
+      }
+    }
+  }
+
   const items = [
     ['Method', savedMethod, 'methods'],
     ['Plate Layout', savedLayout, 'layouts'],
@@ -1052,6 +1126,23 @@ async function finalizeAll() {
     document.getElementById('submitBtn').disabled = false;
   }
   renderReview();
+}
+
+function validateLayoutSpec(spec) {
+  const errors = [];
+  if (!spec.wells || spec.wells.length === 0) {
+    errors.push('No wells defined in layout');
+  }
+  return errors;
+}
+
+function validateAnalysisSpec(spec) {
+  const errors = [];
+  // Analysis spec can be minimal — just check it exists
+  if (!spec.schema_name) {
+    errors.push('No schema_name in analysis spec');
+  }
+  return errors;
 }
 
 // --- Submit to bridge ---
