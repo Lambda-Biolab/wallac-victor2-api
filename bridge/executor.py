@@ -274,8 +274,8 @@ class BridgeExecutor:
                     # run_proto_id stays 0 — fall back to original protocol.
         # Resolve and start the run — use cloned protocol ID only if the
         # clone AND PlateMap update both succeeded. Otherwise fall back to
-        # the original protocol (which measures its default well set).
-        run_protocol = run_proto_id if run_proto_id else protocol_name
+        # the original protocol ID (never the name, which can be ambiguous).
+        run_protocol = run_proto_id if run_proto_id else protocol_id
         try:
             job.add_event("starting_run", str(run_protocol))
             run_resp = self.vm_agent.start_run(run_protocol)
@@ -694,10 +694,10 @@ class BridgeExecutor:
         """
         mode = method_spec.get("mode", "")
 
-        # Get the list of all protocols from the vm-agent
-        # (includes both factory presets and custom protocols like OD600)
+        # Get the list of all protocols from the vm-agent, forcing a cache
+        # refresh so deleted clones from previous runs don't appear.
         try:
-            prots_resp = self.vm_agent.get_protocols()
+            prots_resp = self.vm_agent.get_protocols(refresh=True)
             prots = (
                 prots_resp.get("protocols", prots_resp)
                 if isinstance(prots_resp, dict)
