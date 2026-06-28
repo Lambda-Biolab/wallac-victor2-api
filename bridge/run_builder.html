@@ -1172,20 +1172,11 @@ async function finalizeAndSubmit() {
       return;
     }
   }
-  showStatus('Specs finalized. Updating job spec...', 'info');
+  showStatus('Specs finalized. Submitting to bridge...', 'info');
 
-  // Step 2: Re-save the job spec with updated refs (finalization populated hash + attachment_id)
-  const updatedJobSpec = buildJobSpec();
-  try {
-    await api('PATCH', `/api/jobs/${savedJob.item_id}`, { spec: updatedJobSpec });
-  } catch (e) {
-    showStatus(`Failed to update job spec: ${e.message}`, 'error');
-    return;
-  }
-
-  showStatus('Submitting to bridge...', 'info');
-
-  // Step 3: Build the bridge job spec and submit
+  // Step 2: Build the bridge job spec and submit
+  // The refs are sent directly in the HTTP POST body — no need to
+  // re-save the job spec in eLabFTW (the bridge reads refs from the POST body)
   const jobSpec = {
     title: savedJob ? savedJob.title : (savedMethod ? savedMethod.title : 'Untitled Run'),
     execution_mode: mode,
