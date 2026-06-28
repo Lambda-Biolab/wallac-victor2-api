@@ -234,7 +234,8 @@ class BridgeExecutor:
         # The OEM software (MlrMgr) caches protocols in memory and doesn't
         # re-read the PlateMap from the MDB when a run starts. By cloning
         # with a new ID, the OEM software is forced to read it fresh.
-        cloned_proto_id = 0
+        cloned_proto_id = 0  # for cleanup (orphaned clone if PlateMap fails)
+        run_proto_id = 0  # for start_run (only set if clone + PlateMap both succeed)
         if layout_spec:
             # Only include wells with role "measured" — skip "excluded" and "skipped"
             wells = [
@@ -247,21 +248,24 @@ class BridgeExecutor:
                     proto = self.vm_agent.get_protocol(protocol_name)
                     template_id = proto.get("id", 0)
                     if template_id:
-                        cloned_proto_id = int(time.time()) % 100000 + 2001000
-                        clone_name = f"ELAB-Run-{cloned_proto_id}"
-                        self.vm_agent.clone_protocol(template_id, cloned_proto_id, clone_name)
-                        self.vm_agent.update_plate_map(cloned_proto_id, wells)
-                        job.add_event("protocol_cloned", f"id={cloned_proto_id} wells={len(wells)}")
+                        new_id = int(time.time()) % 100000 + 2001000
+                        clone_name = f"ELAB-Run-{new_id}"
+                        self.vm_agent.clone_protocol(template_id, new_id, clone_name)
+                        # Track for cleanup even if PlateMap update fails below.
+                        cloned_proto_id = new_id
+                        self.vm_agent.update_plate_map(new_id, wells)
+                        # Both succeeded — use the cloned protocol for the run.
+                        run_proto_id = new_id
+                        job.add_event("protocol_cloned", f"id={new_id} wells={len(wells)}")
                 except Exception as e:
                     job.add_event("protocol_clone_failed", str(e))
                     logger.warning("Protocol clone failed for %s: %s", protocol_name, e)
-                    # Don't reset cloned_proto_id to 0 — if the clone was
-                    # created but PlateMap update failed, we still want to
-                    # clean it up later.
-
-        # Resolve and start the run — use cloned protocol ID if available,
-        # otherwise fall back to the original protocol name.
-        run_protocol = cloned_proto_id if cloned_proto_id else protocol_name
+                    # cloned_proto_id stays set if clone succeeded (for cleanup).
+                    # run_proto_id stays 0 — fall back to original protocol.
+        # Resolve and start the run — use cloned protocol ID only if the
+        # clone AND PlateMap update both succeeded. Otherwise fall back to
+        # the original protocol (which measures its default well set).
+        run_protocol = run_proto_id if run_proto_id else protocol_name
         try:
             job.add_event("starting_run", str(run_protocol))
             run_resp = self.vm_agent.start_run(run_protocol)
