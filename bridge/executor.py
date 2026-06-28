@@ -291,8 +291,17 @@ class BridgeExecutor:
             # Clear live_wells from previous run
             job.live_wells = []
 
+            # Build the set of measured well names for live filtering
+            measured_well_names: set[str] = set()
+            if layout_spec:
+                for w in layout_spec.get("wells", []):
+                    if w.get("role", "measured") == "measured":
+                        name = w.get("well_name", w.get("name", ""))
+                        if name:
+                            measured_well_names.add(_normalize_well_name(name))
+
             # Poll for completion
-            self._poll_run(job, run_id)
+            self._poll_run(job, run_id, measured_well_names)
             if job.status in ("failed", "aborted"):
                 return
 
@@ -314,7 +323,7 @@ class BridgeExecutor:
         except Exception as e:
             logger.warning("Failed to clean up cloned protocol %s: %s", proto_id, e)
 
-    def _poll_run(self, job: Job, run_id: str) -> None:
+    def _poll_run(self, job: Job, run_id: str, measured_wells: set[str] | None = None) -> None:
         """Poll vm-agent for run completion. Updates job.status.
 
         Also fetches live results every few seconds so the Run Builder
@@ -359,8 +368,9 @@ class BridgeExecutor:
             state = run.get("state", "").lower()
 
             # Fetch live results every ~3s for real-time heatmap.
-            # The vm-agent skips stale wells from the previous run's
-            # live buffer, so we can just accumulate fresh ones.
+            # The vm-agent's live buffer shows only the most recently measured
+            # well, so we accumulate across polls. Filter to only accept wells
+            # in the measured set to avoid stale data from the previous run.
             now = time.monotonic()
             if now - last_live_fetch >= 3.0:
                 last_live_fetch = now
@@ -372,6 +382,9 @@ class BridgeExecutor:
                         for w in wells:
                             name = _normalize_well_name(w.get("well", w.get("well_name", "")))
                             if not name or name[0] not in "ABCDEFGH":
+                                continue
+                            # Only accept wells in the measured set
+                            if measured_wells and name not in measured_wells:
                                 continue
                             existing[name] = {
                                 "well": name,
