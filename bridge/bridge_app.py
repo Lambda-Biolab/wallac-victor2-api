@@ -21,6 +21,7 @@ import os
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from .config import BridgeConfig
@@ -130,6 +131,14 @@ def create_bridge_app(
         title="Wallac Victor2 Bridge",
         description="Direct-submit HTTP API for instrument execution",
         version="2.0.0",
+    )
+
+    # Allow the Run Builder (different port) to call the bridge API
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["GET", "POST"],
+        allow_headers=["*"],
     )
 
     # Store references for closures
