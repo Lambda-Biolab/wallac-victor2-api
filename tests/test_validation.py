@@ -497,3 +497,272 @@ class TestValidationServiceMissingAttachment:
         service = ValidationService(elabftw, vm_agent)
         report = service.validate_job(job_id)
         assert report.valid is False
+
+
+# --- Layout content validation (Stage 3 — Run Builder semantic rules) ---
+
+
+def _make_layout(wells: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a layout dict from a list of well dicts."""
+    return {
+        "schema_name": "wallac.layout",
+        "schema_version": 1,
+        "plate_type": "96-well",
+        "wells": wells,
+    }
+
+
+def _setup_with_layout(
+    elabftw: MockValidationElabftwClient,
+    vm_agent: MockVmAgentClient,
+    layout_spec_dict: dict[str, Any],
+) -> int:
+    """Set up a valid bundle, then replace the layout with a custom one.
+
+    Updates the layout attachment and metadata hash, AND re-canonicalizes
+    the job spec to reference the new layout hash — otherwise the bundle
+    would be invalid (layout drifted after job finalization).
+    """
+    job_id = setup_valid_bundle(elabftw, vm_agent)
+
+    # Re-upload layout bytes + update layout metadata hash
+    layout_bytes, layout_hash = canonicalize_and_hash(layout_spec_dict)
+    elabftw.add_upload(11, 5002, layout_bytes)
+    elabftw.patch_metadata(11, {"Layout hash": {"value": layout_hash}})
+
+    # Re-canonicalize the job spec with the new layout hash, and update
+    # the job attachment + metadata so the bundle stays consistent.
+    job_spec = make_job_spec_dict(layout_hash=layout_hash)
+    job_bytes, job_hash = canonicalize_and_hash(job_spec)
+    elabftw.add_upload(job_id, 5004, job_bytes)
+    elabftw.patch_metadata(job_id, {"Job hash": {"value": job_hash}})
+
+    return job_id
+
+
+class TestLayoutContentValidation:
+    """Tests for the 9 semantic layout rules."""
+
+    def test_valid_layout_passes_all_rules(
+        self,
+        service: ValidationService,
+        elabftw: MockValidationElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        layout = _make_layout(
+            [
+                {"well_name": "A1", "role": "measured", "replicate_group": "G1"},
+                {"well_name": "A2", "role": "measured", "replicate_group": "G1"},
+                {"well_name": "B1", "role": "measured", "control_type": "blank"},
+            ]
+        )
+        job_id = _setup_with_layout(elabftw, vm_agent, layout)
+        report = service.validate_job(job_id)
+
+        # All layout_content checks must pass
+        layout_checks = [c for c in report.checks if c["name"].startswith("layout_")]
+        assert len(layout_checks) >= 9, f"expected >=9 layout checks, got {len(layout_checks)}"
+        for c in layout_checks:
+            assert c["passed"], f"layout check failed: {c}"
+
+    # Rule 1: empty layout (no wells)
+    def test_rule1_empty_layout_fails(
+        self,
+        service: ValidationService,
+        elabftw: MockValidationElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        layout = _make_layout([])
+        job_id = _setup_with_layout(elabftw, vm_agent, layout)
+        report = service.validate_job(job_id)
+
+        assert report.valid is False
+        assert any(c["name"] == "layout_empty" and not c["passed"] for c in report.checks)
+
+    # Rule 2: no measured wells (all skipped/excluded)
+    def test_rule2_no_measured_wells_fails(
+        self,
+        service: ValidationService,
+        elabftw: MockValidationElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        layout = _make_layout(
+            [
+                {"well_name": "A1", "role": "skipped"},
+                {"well_name": "A2", "role": "excluded"},
+            ]
+        )
+        job_id = _setup_with_layout(elabftw, vm_agent, layout)
+        report = service.validate_job(job_id)
+
+        assert report.valid is False
+        assert any(c["name"] == "layout_no_measured" and not c["passed"] for c in report.checks)
+
+    # Rule 3: duplicate well_name entries
+    def test_rule3_duplicate_well_names_fails(
+        self,
+        service: ValidationService,
+        elabftw: MockValidationElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        layout = _make_layout(
+            [
+                {"well_name": "A1", "role": "measured"},
+                {"well_name": "A1", "role": "measured"},  # dup
+                {"well_name": "A2", "role": "measured"},
+            ]
+        )
+        job_id = _setup_with_layout(elabftw, vm_agent, layout)
+        report = service.validate_job(job_id)
+
+        assert report.valid is False
+        assert any(c["name"] == "layout_duplicate_wells" and not c["passed"] for c in report.checks)
+
+    # Rule 4: skipped well with sample_name
+    def test_rule4_skipped_with_sample_name_fails(
+        self,
+        service: ValidationService,
+        elabftw: MockValidationElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        layout = _make_layout(
+            [
+                {"well_name": "A1", "role": "measured"},
+                {"well_name": "A2", "role": "skipped", "sample_name": "Sample X"},
+            ]
+        )
+        job_id = _setup_with_layout(elabftw, vm_agent, layout)
+        report = service.validate_job(job_id)
+
+        assert report.valid is False
+        assert any(
+            c["name"] == "layout_skipped_with_sample" and not c["passed"] for c in report.checks
+        )
+
+    # Rule 5: excluded well with sample_label
+    def test_rule5_excluded_with_sample_label_fails(
+        self,
+        service: ValidationService,
+        elabftw: MockValidationElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        layout = _make_layout(
+            [
+                {"well_name": "A1", "role": "measured"},
+                {"well_name": "A2", "role": "excluded", "sample_label": "label"},
+            ]
+        )
+        job_id = _setup_with_layout(elabftw, vm_agent, layout)
+        report = service.validate_job(job_id)
+
+        assert report.valid is False
+        assert any(
+            c["name"] == "layout_excluded_with_sample" and not c["passed"] for c in report.checks
+        )
+
+    # Rule 6: control_type set but role != measured
+    def test_rule6_control_on_non_measured_fails(
+        self,
+        service: ValidationService,
+        elabftw: MockValidationElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        layout = _make_layout(
+            [
+                {"well_name": "A1", "role": "measured"},
+                {"well_name": "A2", "role": "excluded", "control_type": "blank"},
+            ]
+        )
+        job_id = _setup_with_layout(elabftw, vm_agent, layout)
+        report = service.validate_job(job_id)
+
+        assert report.valid is False
+        assert any(c["name"] == "layout_control_role" and not c["passed"] for c in report.checks)
+
+    # Rule 7: blank well that's not measured (special case of rule 6)
+    def test_rule7_blank_not_measured_fails(
+        self,
+        service: ValidationService,
+        elabftw: MockValidationElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        layout = _make_layout(
+            [
+                {"well_name": "A1", "role": "measured"},
+                {"well_name": "A2", "role": "skipped", "control_type": "blank"},
+            ]
+        )
+        job_id = _setup_with_layout(elabftw, vm_agent, layout)
+        report = service.validate_job(job_id)
+
+        assert report.valid is False
+        assert any(
+            c["name"] == "layout_blank_not_measured" and not c["passed"] for c in report.checks
+        )
+
+    # Rule 8: replicate group with only 1 well
+    def test_rule8_replicate_group_with_one_well_fails(
+        self,
+        service: ValidationService,
+        elabftw: MockValidationElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        layout = _make_layout(
+            [
+                {"well_name": "A1", "role": "measured", "replicate_group": "G1"},
+                # Group G1 has only 1 member — replicate implies >=2
+                {"well_name": "A2", "role": "measured"},
+            ]
+        )
+        job_id = _setup_with_layout(elabftw, vm_agent, layout)
+        report = service.validate_job(job_id)
+
+        assert report.valid is False
+        assert any(
+            c["name"] == "layout_replicate_group_size" and not c["passed"] for c in report.checks
+        )
+
+    # Rule 9: replicate group made entirely of excluded wells
+    def test_rule9_replicate_group_all_excluded_fails(
+        self,
+        service: ValidationService,
+        elabftw: MockValidationElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        layout = _make_layout(
+            [
+                {"well_name": "A1", "role": "measured"},
+                {"well_name": "A2", "role": "excluded", "replicate_group": "G1"},
+                {"well_name": "A3", "role": "excluded", "replicate_group": "G1"},
+            ]
+        )
+        job_id = _setup_with_layout(elabftw, vm_agent, layout)
+        report = service.validate_job(job_id)
+
+        assert report.valid is False
+        assert any(
+            c["name"] == "layout_replicate_group_all_excluded" and not c["passed"]
+            for c in report.checks
+        )
+
+    # Edge case: layout schema parse failure
+    def test_layout_schema_parse_failure_fails_closed(
+        self,
+        service: ValidationService,
+        elabftw: MockValidationElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        # Invalid schema_version — LayoutSpec.from_dict will raise
+        bad_layout = {
+            "schema_name": "wallac.layout",
+            "schema_version": 999,
+            "plate_type": "96-well",
+            "wells": [{"well_name": "A1", "role": "measured"}],
+        }
+        job_id = _setup_with_layout(elabftw, vm_agent, bad_layout)
+        report = service.validate_job(job_id)
+
+        assert report.valid is False
+        # layout_schema check fails (or another name depending on which error)
+        # The complaint will be either parse failure or downstream effect
+        assert any("layout" in c["name"] and not c["passed"] for c in report.checks)
