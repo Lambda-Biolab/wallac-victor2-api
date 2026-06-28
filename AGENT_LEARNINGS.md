@@ -279,73 +279,121 @@ the root cause is resolved.
 - Git repo for ops: `~/repos/wallac-victor2-linux/` (see
   `host-config/VM-OPERATIONS.md` for full VM access reference)
 
-## VM Process Spawning from SSH — use `wmic process call create`, NOT `Start-Process`
+## VM Process Spawning from SSH — TWO requirements, both mandatory
 
-**Symptom:** `lid_watcher.py` (launched as `pythonw.exe` from an SSH
-session) consistently died ~5-30 seconds after the SSH session closed.
-`lid_watcher.log` showed `lid_watcher started` correctly, and the process
-even did its job when alive (the log captured a real `auto-Ignored`
-event), but the process was gone within seconds of every SSH disconnect.
-Meanwhile, `start_agent.bat` launched at boot (from the Windows Startup
-folder) kept `lid_watcher` alive indefinitely.
+Starting `lid_watcher.py` (or `agent.py`) from an SSH session to the
+Win7 VM has **two** independent requirements. Get either one wrong and
+the system fails, each in a different confusing way.
+
+### Requirement 1: The process must survive SSH session teardown
+
+**Symptom:** `lid_watcher.py` started via `Start-Process` from SSH
+consistently died ~5-30 seconds after the SSH session closed.
+`lid_watcher.log` correctly shows `lid_watcher started`, but the
+process was gone within seconds of every SSH disconnect.
 
 **Root cause:** SSH session teardown kills the entire process tree.
 `Start-Process -FilePath pythonw.exe -ArgumentList lid_watcher.py`
-spawned `pythonw.exe` as a child of the SSH-spawned PowerShell. When the
-SSH channel closed, Windows tore down the whole session — including the
-`lid_watcher` we just started. The Linux-side `nohup`/`setsid` reflex
-doesn't apply on Win7; `Start-Process` does not detach the process from
-the SMB session that spawned it.
+spawns `pythonw.exe` as a child of the SSH-spawned PowerShell. When
+the SSH channel closed, Windows tore down the whole session —
+including the `lid_watcher` we just started. The Linux-side
+`nohup`/`setsid` reflex doesn't apply on Win7; `Start-Process` does
+NOT detach the process from the SSH session that spawned it, with or
+without `-WindowStyle Hidden`.
 
-The boot-launched `start-stack.bat` (in the Startup folder) has no SSH
-parent session, so its `start "" pythonw.exe lid_watcher.py` invocations
-survive. That is the only reason the system worked at all previously.
+### Requirement 2: `lid_watcher` MUST run in session 1 (interactive console)
 
-**Fix — use `wmic process call create`:**
+**Symptom:** `lid_watcher` was alive (verified by `Get-Process`) and
+had been running for minutes, but `lid_watcher.log` showed no scan
+activity at all. Meanwhile, the live run was wedged indefinitely on a
+lid error dialog. `EnumWindows` from inside lid_watcher returned 0
+windows total.
+
+**Root cause:** On Windows, processes run in a "session" which has
+its own window station/desktop. `MlrMgr.exe` (the Wallac OEM software
+that POPS the lid error dialog) runs in session 1 (the interactive
+console where user `lambda` is logged in). `lid_watcher` can only see
+windows in ITS OWN session — if it's in session 0 (services), it
+cannot see ANY of MlrMgr's windows, and therefore cannot detect nor
+dismiss the lid dialog. The dialog stays up forever, the run wedges.
+
+**`wmic process call create` solves req. 1, but BREAKS req. 2.** It
+spawns via the WMI provider service, which runs in session 0. So:
+the process survives SSH teardown, but it's blind — it lives in
+session 0 and cannot see any of MlrMgr.exe's dialogs. This is the
+worst kind of failure because lid_watcher APPEARS healthy (alive,
+logging "started") but does nothing useful. Do NOT use `wmic process
+call create` to launch lid_watcher. Period.
+
+### The fix: `schtasks /Create /IT /RU lambda`
+
+`schtasks` with `/IT` ("interactive task") launches the process in
+the active console session of the specified user (`/RU lambda`). This
+satisfies requirement 2 (lands in session 1) AND requirement 1
+(survives SSH disconnect because the Task Scheduler service, not
+the SSH session, owns the spawned process).
+
+**lid_watcher — correct one-shot launch from SSH:**
+
+```
+# Kill any prior lid_watcher first
+ssh -J antonio@lambdabiolab-computer lambda@192.168.122.203 \
+  'taskkill /F /IM pythonw.exe 2>nul'
+
+# Create + run a one-shot task as lambda in the interactive session
+ssh -J antonio@lambdabiolab-computer lambda@192.168.122.203 \
+  'schtasks /Create /TN "lid_watcher_interactive" \
+     /TR "C:\Users\lambda\AppData\Local\Programs\Python\Python38-32\pythonw.exe C:\install\lid_watcher.py" \
+     /SC ONCE /ST 23:59 /RU lambda /IT /F'
+
+ssh -J antonio@lambdabiolab-computer lambda@192.168.122.203 \
+  'schtasks /Run /TN "lid_watcher_interactive"'
+```
+
+**Verify it landed in session 1 (NOT session 0):**
 
 ```
 ssh -J antonio@lambdabiolab-computer lambda@192.168.122.203 \
-  'wmic process call create "C:\Users\lambda\AppData\Local\Programs\Python\Python38-32\pythonw.exe C:\install\lid_watcher.py"'
+  'powershell -NoProfile -Command "Get-Process pythonw,MlrMgr -ErrorAction SilentlyContinue | Select Id,ProcessName,SessionId"'
 ```
 
-`wmic process call create` runs the Win32 `Create()` method via the WMI
-provider service, which is detached from the calling SSH session's
-process tree. The new process survives SSH disconnect indefinitely.
-Returns `ProcessId` and `ReturnValue=0` on success.
+Both `MlrMgr` and `pythonw` MUST show `SessionId` = 1 (console).
+If `pythonw` shows `SessionId` = 0 (services), it's blind and useless
+— re-do the launch. (When working: at 22:28:59 the lid_watcher
+correctly caught and `auto-Ignored` a real A/R/I exception, while
+MlrMgr.exe continued the run.)
 
-Same pattern for restarting the agent:
+**Smoke test:** Run `lid_watcher.log | Select-Object -Last 3` after
+a few seconds. If the latest line is `lid_watcher started` and there
+are no further entries over the next 1-2 minutes during a real run,
+the watcher is NOT in session 1. Run `EnumWindows` from inside
+lid_watcher — if it returns 0 windows, lid_watcher is in a session
+that can't see MlrMgr.
 
-```
-ssh -J antonio@lambdabiolab-computer lambda@192.168.122.203 \
-  'wmic process call create "C:\Users\lambda\AppData\Local\Programs\Python\Python38-32\python.exe C:\install\agent.py"'
-```
+### Anti-patterns that DON'T work from SSH
 
-**Verified:** Both processes (`python.exe` agent + `pythonw.exe`
-lid_watcher) survived 15+ seconds after the SSH session closed, and
-remained alive across subsequent SSH disconnects.
+- **`Start-Process` from a SSH-spawned PowerShell** — dies with SSH
+  teardown (fails req. 1).
+- **`wmic process call create`** — survives SSH disconnect BUT lands
+  in session 0 (services) and cannot see MlrMgr's dialogs in session 1
+  (fails req. 2). The deceptive case: lid_watcher looks healthy and
+  logs `started`, but does zero useful work. **Never use this for
+  lid_watcher.**
+- **Running `start_agent.bat` via `Start-Process -WindowStyle Hidden`**
+  from SSH — the bat's internal `start ""` calls inherit the SSH
+  session and die on teardown (fails req. 1).
+- **Foreground `python lid_watcher.py`** — dies immediately when the
+  SSH command times out or is cancelled (fails req. 1).
 
-**Anti-patterns that DON'T work from SSH:**
-- `Start-Process -FilePath pythonw.exe -ArgumentList lid_watcher.py` —
-  killed when SSH session closes
-- `Start-Process -FilePath python.exe -ArgumentList lid_watcher.py
-  -WindowStyle Hidden` — same; killed on SSH teardown, despite the
-  hidden window style
-- Running `start_agent.bat` via `Start-Process -WindowStyle Hidden` —
-  the bat's internal `start ""` calls are still children of the SSH
-  session and die with it
-- `python.exe lid_watcher.py` run in foreground — dies immediately when
-  the SSH command times out or is cancelled
+### Bottom line
 
-**Bottom line:** From within an SSH session to the VM, ALWAYS use
-`wmic process call create` to spawn any process that needs to survive
-the SSH disconnect. `Start-Process` does not detach on Win7 the way
-`setsid`/`nohup` do on Linux.
+For any process that needs to (a) survive SSH disconnect AND (b)
+see / interact with `MlrMgr.exe` windows (lid_watcher, anything that
+dismisses modal dialogs): **use `schtasks /Create /IT /RU lambda`**.
+For long-running services that don't need to see the desktop (the
+agent itself can run in session 0), `wmic` is fine, but `schtasks /IT`
+works for both, so default to it.
 
-**Also: `wmic process call create` does NOT kill existing processes.**
-Unlike `start_agent.bat` which does `taskkill /F /IM python.exe` first,
-`wmic` just spawns a new process. Before running it, you must
-explicitly kill the prior instance or you'll end up with duplicate
-`python.exe` processes (both binding to port 8420, second one fails to
-listen). Use `taskkill /F /PID <pid>` on the specific PID, or run
-`start_agent.bat` first to do the kill-then-spawn dance, then start
-`lid_watcher` separately via `wmic`.
+Verify `SessionId = 1` after EVERY launch. Do not skip this step.
+The lid_watcher "looks alive but does nothing" failure mode is silent
+and the run will wedge for hours with no obvious cause.
