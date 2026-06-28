@@ -286,26 +286,43 @@ class ElabftwClient:
         all_items = self._request("GET", f"/items?type={category_id}") or []
         result = []
         for item in all_items:
-            meta = normalize_metadata(item.get("metadata"))
-            if meta is None:
+            if not self._item_has_designer_spec(item):
                 continue
-            ef = meta.get("extra_fields") or {}
-            if "Designer spec" not in ef:
+            if expected_schema and not self._item_matches_schema(item, expected_schema):
                 continue
-            if expected_schema:
-                spec_json = ""
-                ds = ef.get("Designer spec")
-                if isinstance(ds, dict):
-                    spec_json = ds.get("value", "")
-                if spec_json:
-                    try:
-                        spec = json.loads(spec_json)
-                        if spec.get("schema_name") != expected_schema:
-                            continue
-                    except (json.JSONDecodeError, TypeError):
-                        continue
             result.append(item)
         return result
+
+    @staticmethod
+    def _item_has_designer_spec(item: dict[str, Any]) -> bool:
+        """Return True if the item has a 'Designer spec' extra_field."""
+        meta = normalize_metadata(item.get("metadata"))
+        if meta is None:
+            return False
+        ef = meta.get("extra_fields") or {}
+        return "Designer spec" in ef
+
+    @staticmethod
+    def _item_matches_schema(item: dict[str, Any], expected_schema: str) -> bool:
+        """Return True if the item's Designer spec matches the schema name.
+
+        On parse failure (corrupt JSON, missing field), returns False so the
+        caller can ``continue`` past the item without polluting downstream
+        filter logic.
+        """
+        meta = normalize_metadata(item.get("metadata"))
+        if meta is None:
+            return False
+        ef = meta.get("extra_fields") or {}
+        ds = ef.get("Designer spec")
+        spec_json = ds.get("value", "") if isinstance(ds, dict) else ""
+        if not spec_json:
+            return False
+        try:
+            spec = json.loads(spec_json)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        return spec.get("schema_name") == expected_schema
 
     def get_item(self, item_id: int) -> dict[str, Any]:
         """Get a single item by ID."""

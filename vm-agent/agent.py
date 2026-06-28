@@ -286,73 +286,8 @@ class Monitor(threading.Thread):
             snap = {"ts": now_iso(), "error": None, "live_wells": []}
             try:
                 srv = self._ensure()
-                st = srv.GetState
-                snap.update(
-                    connected=bool(st.IsConnected),
-                    state=str(st.GetStateText),
-                    state_code=int(st.GetStateCode),
-                    is_running=bool(st.IsRunning),
-                    is_error=bool(st.IsError),
-                    is_idle=bool(st.IsIdle),
-                )
-                # Temperature changes slowly; only poll every ~1s (every 10th
-                # cycle at 100ms) to keep the tight poll loop focused on
-                # GetLiveResult.
-                if cycle % 10 == 0:
-                    try:
-                        snap["target_temperature"] = float(srv.GetTargetTemperature)
-                    except Exception:  # noqa: BLE001
-                        snap["target_temperature"] = _monitor.get("target_temperature")
-                else:
-                    with _monitor_lock:
-                        snap["target_temperature"] = _monitor.get("target_temperature")
-                # Poll live results from the monitor thread (separate COM
-                # connection that is NOT blocked by the worker thread's
-                # running assay). The live buffer only holds the MOST RECENT
-                # well measured, so we accumulate across polls and reset when
-                # the assay_id changes (= new run started).
-                try:
-                    live = srv.GetLiveResult
-                    _ = live.Top
-                    current_wells = []
-                    while bool(live.IsValid):
-                        current_wells.append(
-                            {
-                                "well": str(live.GetWellAddress),
-                                "counts": int(live.GetCounts),
-                                "result_type": int(live.GetResultType),
-                                "plate": int(live.GetPlateIndex),
-                                "plate_repeat": int(live.GetPlateRepeatIndex),
-                                "assay_id": int(live.GetAssayID),
-                            }
-                        )
-                        if not bool(live.Next):
-                            break
-                    if current_wells:
-                        latest = current_wells[0]
-                        latest_assay = latest.get("assay_id", 0)
-                        with _monitor_lock:
-                            prev = list(_monitor.get("live_wells", []))
-                            prev_assay = prev[0].get("assay_id", 0) if prev else 0
-                        if latest_assay != prev_assay:
-                            # New run started; reset accumulation
-                            snap["live_wells"] = current_wells
-                        elif snap.get("is_running"):
-                            # Same run; merge new wells (dedup by well name)
-                            seen = {w["well"] for w in prev}
-                            merged = list(prev)
-                            for w in current_wells:
-                                if w["well"] not in seen:
-                                    merged.append(w)
-                                    seen.add(w["well"])
-                            snap["live_wells"] = merged
-                        else:
-                            snap["live_wells"] = current_wells
-                    else:
-                        with _monitor_lock:
-                            snap["live_wells"] = _monitor.get("live_wells", [])
-                except Exception:  # noqa: BLE001
-                    pass
+                self._snapshot_state(srv, snap, cycle)
+                self._snapshot_live_wells(srv, snap)
             except Exception as exc:  # noqa: BLE001
                 self._srv = None
                 snap.update(connected=False, error=f"{type(exc).__name__}: {exc}")
@@ -361,6 +296,97 @@ class Monitor(threading.Thread):
                 _monitor.clear()
                 _monitor.update(snap)
             time.sleep(self.interval)
+
+    def _snapshot_state(self, srv, snap: dict, cycle: int) -> None:
+        """Read instrument state + target temperature (throttled)."""
+        st = srv.GetState
+        snap.update(
+            connected=bool(st.IsConnected),
+            state=str(st.GetStateText),
+            state_code=int(st.GetStateCode),
+            is_running=bool(st.IsRunning),
+            is_error=bool(st.IsError),
+            is_idle=bool(st.IsIdle),
+        )
+        # Temperature changes slowly; only poll every ~1s (every 10th
+        # cycle at 100ms) to keep the tight poll loop focused on
+        # GetLiveResult.
+        if cycle % 10 == 0:
+            try:
+                snap["target_temperature"] = float(srv.GetTargetTemperature)
+            except Exception:  # noqa: BLE001
+                with _monitor_lock:
+                    snap["target_temperature"] = _monitor.get("target_temperature")
+        else:
+            with _monitor_lock:
+                snap["target_temperature"] = _monitor.get("target_temperature")
+
+    def _snapshot_live_wells(self, srv, snap: dict) -> None:
+        """Poll live results and merge with previous run's accumulation.
+
+        The live buffer only holds the MOST RECENT well measured, so we
+        accumulate across polls and reset when the assay_id changes
+        (= new run started).
+        """
+        try:
+            live = srv.GetLiveResult
+            _ = live.Top
+            current_wells = self._read_live_buffer(live)
+            if current_wells:
+                self._merge_live_wells(snap, current_wells)
+            else:
+                with _monitor_lock:
+                    snap["live_wells"] = _monitor.get("live_wells", [])
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _read_live_buffer(live) -> list:
+        """Iterate the COM GetLiveResult buffer, returning wells as dicts."""
+        current_wells = []
+        while bool(live.IsValid):
+            current_wells.append(
+                {
+                    "well": str(live.GetWellAddress),
+                    "counts": int(live.GetCounts),
+                    "result_type": int(live.GetResultType),
+                    "plate": int(live.GetPlateIndex),
+                    "plate_repeat": int(live.GetPlateRepeatIndex),
+                    "assay_id": int(live.GetAssayID),
+                }
+            )
+            if not bool(live.Next):
+                break
+        return current_wells
+
+    @staticmethod
+    def _merge_live_wells(snap: dict, current_wells: list) -> None:
+        """Merge current poll's wells with the previous accumulated snapshot.
+
+        - New assay_id → reset accumulation (start of a new run)
+        - Same assay_id + is_running → dedup-merge (avoid double-counting)
+        - Otherwise → use current poll as-is
+        """
+        latest = current_wells[0]
+        latest_assay = latest.get("assay_id", 0)
+        with _monitor_lock:
+            prev = list(_monitor.get("live_wells", []))
+        prev_assay = prev[0].get("assay_id", 0) if prev else 0
+
+        if latest_assay != prev_assay:
+            # New run started; reset accumulation
+            snap["live_wells"] = current_wells
+        elif snap.get("is_running"):
+            # Same run; merge new wells (dedup by well name)
+            seen = {w["well"] for w in prev}
+            merged = list(prev)
+            for w in current_wells:
+                if w["well"] not in seen:
+                    merged.append(w)
+                    seen.add(w["well"])
+            snap["live_wells"] = merged
+        else:
+            snap["live_wells"] = current_wells
 
 
 # --------------------------------------------------------------------------
