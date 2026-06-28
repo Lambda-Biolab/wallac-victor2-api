@@ -1,5 +1,11 @@
 # wallac-victor2-api
 
+[![License](https://img.shields.io/badge/license-Apache--2.0-58f4c2.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.8-58f4c2.svg)](https://www.python.org/)
+[![CI](https://github.com/Lambda-Biolab/wallac-victor2-api/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/wallac-victor2-api/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/Lambda-Biolab/wallac-victor2-api/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/wallac-victor2-api/actions/workflows/codeql.yml)
+[![CodeFactor](https://www.codefactor.io/repository/github/lambda-biolab/wallac-victor2-api/badge/main)](https://www.codefactor.io/repository/github/lambda-biolab/wallac-victor2-api)
+
 A **REST/JSON API** for the PerkinElmer **Wallac Victor2 (1420)** multimode
 microplate reader — start assays, stream live status, and pull results over
 HTTP, driven from Linux.
@@ -15,6 +21,13 @@ photometry, luminescence, fluorescence polarization).
 > documentation. It does **not** contain or redistribute any PerkinElmer /
 > Wallac software, firmware, or installation media — you must supply a
 > legitimately licensed OEM installation in the VM.
+
+## Demo
+
+![Wallac Victor2 API and run-builder UI demonstration](gif/wallac-api.gif)
+
+The HTTP API driving the Victor2 / 1420 from Linux, with the run-builder UI
+assembling a protocol and streaming live results back over SSE.
 
 ## Architecture
 

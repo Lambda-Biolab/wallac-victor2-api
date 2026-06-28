@@ -7,6 +7,7 @@ __pycache__/
 .idea/
 *.swp
 .DS_Store
+._*
 
 # Never commit private keys / tokens
 *.pem
