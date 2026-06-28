@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_METHOD_CATEGORY = 10
 DEFAULT_LAYOUT_CATEGORY = 11
 DEFAULT_ANALYSIS_CATEGORY = 12
-DEFAULT_JOB_CATEGORY = 9  # existing category, renamed
+DEFAULT_JOB_CATEGORY = 4  # Default category (id=9 was deleted by seed_wallac.py)
 
 
 # --- Draft object types -----------------------------------------------------
