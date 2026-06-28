@@ -222,13 +222,13 @@ class BridgeExecutor:
         # The method spec defines mode (photometry/fluorometry/luminescence)
         # and filter/wavelength parameters. We map these to the closest
         # factory preset protocol name.
-        protocol_name = self._match_protocol_from_method(method_spec)
+        protocol_name, protocol_id = self._match_protocol_from_method(method_spec)
         if not protocol_name:
             job.status = "failed"
             job.error = "Could not match method spec to an instrument protocol"
             job.add_event("execution_failed", job.error)
             return
-        job.add_event("protocol_matched", protocol_name)
+        job.add_event("protocol_matched", f"{protocol_name} (id={protocol_id})")
 
         # Clone the matched protocol with a new ID and update its PlateMap.
         # The OEM software (MlrMgr) caches protocols in memory and doesn't
@@ -254,8 +254,9 @@ class BridgeExecutor:
             )
             if wells:
                 try:
-                    proto = self.vm_agent.get_protocol(protocol_name)
-                    template_id = proto.get("id", 0)
+                    # Use the protocol ID directly (avoids ambiguous name
+                    # lookup when cloned protocols with the same name exist)
+                    template_id = protocol_id
                     if template_id:
                         new_id = int(time.time()) % 100000 + 2001000
                         clone_name = f"ELAB-Run-{new_id}"
@@ -684,17 +685,12 @@ class BridgeExecutor:
             )
             return {}
 
-    def _match_protocol_from_method(self, method_spec: dict[str, Any]) -> str:
-        """Match a method spec to a factory preset protocol name on the instrument.
+    def _match_protocol_from_method(self, method_spec: dict[str, Any]) -> tuple[str, int]:
+        """Match a method spec to a protocol on the instrument.
 
-        The method spec has a "mode" field (photometry/fluorometry/luminescence)
-        and mode-specific settings with filter IDs and read time.
-
-        Uses the filter_id (e.g. P610, F485) for deterministic matching
-        to instrument protocol names. The filter_id is the physical filter
-        identity, which maps to a specific wavelength in the protocol name.
-
-        Returns the protocol name, or "" if no match found.
+        Returns (protocol_name, protocol_id), or ("", 0) if no match found.
+        Prefers factory presets over custom protocols to avoid matching
+        leftover clones from previous runs.
         """
         mode = method_spec.get("mode", "")
 
@@ -709,7 +705,7 @@ class BridgeExecutor:
             )
             all_protocols = prots
         except Exception:
-            return ""
+            return "", 0
 
         if mode == "photometry":
             photo = method_spec.get("photometry", {})
@@ -731,22 +727,26 @@ class BridgeExecutor:
             wavelength = filter_to_wavelength.get(filter_id, "")
             if not wavelength:
                 logger.warning("Unknown photometry filter_id: %s", filter_id)
-                return ""
+                return "", 0
 
             # Build the expected protocol name: "Absorbance @ {wl} ({time}s)"
             # The instrument uses 1.0s or 0.1s — format to match exactly
             time_str = f"{read_time:.1f}"
             target = f"Absorbance @ {wavelength} ({time_str}s)"
 
-            # Try exact match first
-            for p in all_protocols:
-                if p["name"] == target:
-                    return p["name"]
+            # Try exact match first, preferring factory presets
+            factory = [p for p in all_protocols if p.get("factory_preset")]
+            custom = [p for p in all_protocols if not p.get("factory_preset")]
+            for pool in (factory, custom):
+                for p in pool:
+                    if p["name"] == target:
+                        return p["name"], p["id"]
 
             # Fallback: match by wavelength only (ignore read time)
-            for p in all_protocols:
-                if "Absorbance" in p["name"] and f"@ {wavelength}" in p["name"]:
-                    return p["name"]
+            for pool in (factory, custom):
+                for p in pool:
+                    if "Absorbance" in p["name"] and f"@ {wavelength}" in p["name"]:
+                        return p["name"], p["id"]
 
             logger.warning(
                 "No photometry protocol found for filter_id=%s wavelength=%s time=%s",
@@ -774,7 +774,7 @@ class BridgeExecutor:
                     ex_filter_id,
                     em_filter_id,
                 )
-                return ""
+                return "", 0
 
             # Build expected protocol name: "{dye} ({ex}nm/{em}nm, {time}s)"
             # Extract wavelengths from filter IDs (F485 → 485, F355 → 355)
@@ -783,26 +783,31 @@ class BridgeExecutor:
             time_str = f"{read_time:.1f}"
             target = f"{dye_name} ({ex_wl}nm/{em_wl}nm, {time_str}s)"
 
-            # Try exact match first
-            for p in all_protocols:
-                if p["name"] == target:
-                    return p["name"]
+            # Try exact match first, preferring factory presets
+            factory = [p for p in all_protocols if p.get("factory_preset")]
+            custom = [p for p in all_protocols if not p.get("factory_preset")]
+            for pool in (factory, custom):
+                for p in pool:
+                    if p["name"] == target:
+                        return p["name"], p["id"]
 
             # Fallback: match by dye name + wavelengths (ignore read time)
-            for p in all_protocols:
-                if (
-                    dye_name in p["name"]
-                    and ex_wl in p["name"]
-                    and em_wl in p["name"]
-                    and "Bottom" not in p["name"]
-                    and "High Count" not in p["name"]
-                ):
-                    return p["name"]
+            for pool in (factory, custom):
+                for p in pool:
+                    if (
+                        dye_name in p["name"]
+                        and ex_wl in p["name"]
+                        and em_wl in p["name"]
+                        and "Bottom" not in p["name"]
+                        and "High Count" not in p["name"]
+                    ):
+                        return p["name"], p["id"]
 
             # Last resort: any match with dye name + wavelengths
-            for p in all_protocols:
-                if dye_name in p["name"] and ex_wl in p["name"] and em_wl in p["name"]:
-                    return p["name"]
+            for pool in (factory, custom):
+                for p in pool:
+                    if dye_name in p["name"] and ex_wl in p["name"] and em_wl in p["name"]:
+                        return p["name"], p["id"]
 
             logger.warning(
                 "No fluorometry protocol found for dye=%s ex=%s em=%s time=%s",
@@ -814,8 +819,11 @@ class BridgeExecutor:
 
         elif mode == "luminescence":
             # Single luminescence protocol
-            for p in all_protocols:
-                if p["name"] == "Luminescence":
-                    return p["name"]
+            factory = [p for p in all_protocols if p.get("factory_preset")]
+            custom = [p for p in all_protocols if not p.get("factory_preset")]
+            for pool in (factory, custom):
+                for p in pool:
+                    if p["name"] == "Luminescence":
+                        return p["name"], p["id"]
 
-        return ""
+        return "", 0
