@@ -173,6 +173,20 @@ class BridgeExecutor:
         job.add_event("downloading_specs", "")
         try:
             method_spec = self._download_ref(method_ref)
+            # If we got a job spec instead of a method spec (refs were mixed up),
+            # follow the method.object_id reference to get the actual method spec
+            if method_spec.get("schema_name") == "wallac.job":
+                inner_method_ref = method_spec.get("method", {})
+                if inner_method_ref.get("object_id") and inner_method_ref.get("json_attachment_id"):
+                    job.add_event(
+                        "following_method_ref", f"object_id={inner_method_ref['object_id']}"
+                    )
+                    method_spec = self._download_ref(inner_method_ref)
+                else:
+                    job.add_event(
+                        "method_ref_incomplete", "method ref has no object_id or attachment_id"
+                    )
+
             layout_spec = self._download_ref(layout_ref) if layout_ref else {}
             analysis_spec = self._download_ref(analysis_ref) if analysis_ref else {}
         except Exception as e:
