@@ -189,8 +189,7 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
     </div>
 
     <div class="btn-row">
-      <button class="btn btn-primary" onclick="saveMethod()">Save Method</button>
-      <button class="btn btn-primary" onclick="goToStep(2)">Next →</button>
+      <button class="btn btn-primary" onclick="saveMethodAndNext()">Save & Next →</button>
     </div>
 
     <div id="methodList"></div>
@@ -240,6 +239,9 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
             <button class="btn btn-secondary" onclick="setSelectedRole('positive_control')">Pos. Ctrl</button>
             <button class="btn btn-secondary" onclick="setSelectedRole('negative_control')">Neg. Ctrl</button>
           </div>
+        </div>
+        <div id="sampleLegend" style="margin-top:12px; padding:8px; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
+          <span class="hint">No samples or groups assigned yet</span>
         </div>
       </div>
     </div>
@@ -627,14 +629,14 @@ function buildMethodSpec() {
 
 async function saveMethod() {
   const title = document.getElementById('methodTitle').value;
-  if (!title) { showStatus('Enter a method title', 'error'); return; }
+  if (!title) { showStatus('Enter a method title', 'error'); return false; }
   const spec = buildMethodSpec();
 
   // Validate method spec before saving
   const errors = validateMethodSpec(spec);
   if (errors.length > 0) {
     showStatus('Cannot save method: ' + errors.join('; '), 'error');
-    return;
+    return false;
   }
 
   try {
@@ -642,7 +644,13 @@ async function saveMethod() {
     savedMethod = result;
     showStatus(`Method saved: id=${result.item_id}`, 'success');
     loadMethods();
-  } catch (e) { showStatus('Failed: ' + e.message, 'error'); }
+    return true;
+  } catch (e) { showStatus('Failed: ' + e.message, 'error'); return false; }
+}
+
+async function saveMethodAndNext() {
+  const ok = await saveMethod();
+  if (ok) goToStep(2);
 }
 
 function validateMethodSpec(spec) {
@@ -715,16 +723,16 @@ const SAMPLE_COLORS = [
   '#9a6324', '#fffac8', '#800000', '#aaffc3', '#808000', '#ffd8b1',
   '#000075', '#808080',
 ];
-const sampleColorMap = {};
-let sampleColorIdx = 0;
 
-function colorForSample(sampleName) {
+function getSampleColor(sampleName) {
   if (!sampleName) return null;
-  if (!(sampleName in sampleColorMap)) {
-    sampleColorMap[sampleName] = SAMPLE_COLORS[sampleColorIdx % SAMPLE_COLORS.length];
-    sampleColorIdx++;
+  // Use a hash of the sample name to pick a consistent color
+  let hash = 0;
+  for (let i = 0; i < sampleName.length; i++) {
+    hash = ((hash << 5) - hash) + sampleName.charCodeAt(i);
+    hash |= 0;
   }
-  return sampleColorMap[sampleName];
+  return SAMPLE_COLORS[Math.abs(hash) % SAMPLE_COLORS.length];
 }
 
 function renderPlate() {
@@ -741,13 +749,13 @@ function renderPlate() {
 
       // If well has a sample name, color by sample
       if (w.sample_name && w.role !== 'skipped') {
-        const color = colorForSample(w.sample_name);
+        const color = getSampleColor(w.sample_name);
         style = ` style="background:${color}; color:#fff;"`;
         cls = 'well';
       }
       // If well has a replicate group (but no sample name), color by group
       else if (w.replicate_group && w.role !== 'skipped') {
-        const color = colorForSample('group:' + w.replicate_group);
+        const color = getSampleColor('group:' + w.replicate_group);
         style = ` style="background:${color}; color:#fff;"`;
         cls = 'well';
       }
@@ -763,6 +771,46 @@ function renderPlate() {
     el.addEventListener('mouseenter', onWellMouseEnter);
   });
   document.addEventListener('mouseup', onDocMouseUp);
+
+  // Update the sample legend
+  updateSampleLegend();
+}
+
+function updateSampleLegend() {
+  const legendDiv = document.getElementById('sampleLegend');
+  if (!legendDiv) return;
+
+  // Collect all unique sample names and replicate groups
+  const samples = new Map(); // name → color
+  const groups = new Map();  // group → color
+  for (const name in plateWells) {
+    const w = plateWells[name];
+    if (w.role === 'skipped') continue;
+    if (w.sample_name && !samples.has(w.sample_name)) {
+      samples.set(w.sample_name, getSampleColor(w.sample_name));
+    } else if (!w.sample_name && w.replicate_group && !groups.has(w.replicate_group)) {
+      groups.set(w.replicate_group, getSampleColor('group:' + w.replicate_group));
+    }
+  }
+
+  let html = '';
+  if (samples.size > 0) {
+    html += '<div style="font-weight:600; margin-bottom:4px;">Samples</div>';
+    for (const [name, color] of samples) {
+      html += `<div style="display:flex; align-items:center; gap:6px; margin-bottom:2px;"><div style="width:12px; height:12px; border-radius:2px; background:${color};"></div>${name}</div>`;
+    }
+  }
+  if (groups.size > 0) {
+    if (samples.size > 0) html += '<div style="margin-top:8px;"></div>';
+    html += '<div style="font-weight:600; margin-bottom:4px;">Replicate Groups</div>';
+    for (const [name, color] of groups) {
+      html += `<div style="display:flex; align-items:center; gap:6px; margin-bottom:2px;"><div style="width:12px; height:12px; border-radius:2px; background:${color};"></div>${name}</div>`;
+    }
+  }
+  if (html === '') {
+    html = '<span class="hint">No samples or groups assigned yet</span>';
+  }
+  legendDiv.innerHTML = html;
 }
 
 function onWellMouseDown(e) {
@@ -1124,9 +1172,20 @@ async function finalizeAndSubmit() {
       return;
     }
   }
-  showStatus('Specs finalized. Submitting to bridge...', 'info');
+  showStatus('Specs finalized. Updating job spec...', 'info');
 
-  // Step 2: Build job spec and submit to bridge
+  // Step 2: Re-save the job spec with updated refs (finalization populated hash + attachment_id)
+  const updatedJobSpec = buildJobSpec();
+  try {
+    await api('PATCH', `/api/jobs/${savedJob.item_id}`, { spec: updatedJobSpec });
+  } catch (e) {
+    showStatus(`Failed to update job spec: ${e.message}`, 'error');
+    return;
+  }
+
+  showStatus('Submitting to bridge...', 'info');
+
+  // Step 3: Build the bridge job spec and submit
   const jobSpec = {
     title: savedJob ? savedJob.title : (savedMethod ? savedMethod.title : 'Untitled Run'),
     execution_mode: mode,
@@ -1134,7 +1193,7 @@ async function finalizeAndSubmit() {
     expected_outputs: document.getElementById('jobExpectedOutputs') ? document.getElementById('jobExpectedOutputs').value : '',
   };
 
-  // Add references for generated_protocol
+  // Add references for generated_protocol — use the finalized refs directly
   if (jobSpec.execution_mode === 'generated_protocol') {
     if (savedMethod) jobSpec.method_ref = { object_id: savedMethod.item_id, hash: savedMethod.hash, attachment_id: savedMethod.json_attachment_id };
     if (savedLayout) jobSpec.layout_ref = { source: 'reusable', object_id: savedLayout.item_id, hash: savedLayout.hash, attachment_id: savedLayout.json_attachment_id };
