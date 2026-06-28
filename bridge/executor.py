@@ -542,8 +542,11 @@ class BridgeExecutor:
         """Match a method spec to a factory preset protocol name on the instrument.
 
         The method spec has a "mode" field (photometry/fluorometry/luminescence)
-        and mode-specific settings with filter/wavelength and read time info.
-        We map these to the closest factory preset protocol.
+        and mode-specific settings with filter IDs and read time.
+
+        Uses the filter_id (e.g. P610, F485) for deterministic matching
+        to instrument protocol names. The filter_id is the physical filter
+        identity, which maps to a specific wavelength in the protocol name.
 
         Returns the protocol name, or "" if no match found.
         """
@@ -563,51 +566,103 @@ class BridgeExecutor:
 
         if mode == "photometry":
             photo = method_spec.get("photometry", {})
-            filter_name = photo.get("filter_name", "")
+            filter_id = photo.get("filter_id", "")
             read_time = photo.get("read_time_seconds", 1.0)
 
-            # Extract wavelength from filter name (e.g. "OD600" → 600, "405nm" → 405)
-            import re
+            # Map filter_id to the wavelength used in the protocol name.
+            # P610 is the physical 610nm bandpass filter, but the protocol
+            # is named "@ 600" (OD600). All others use the filter number directly.
+            filter_to_wavelength = {
+                "P610": "600",  # OD600 — 610nm filter, protocol named @ 600
+                "P405": "405",
+                "P450": "450",
+                "P490": "490",
+                "P260": "260",
+                "P280": "280",
+            }
+            wavelength = filter_to_wavelength.get(filter_id, "")
+            if not wavelength:
+                logger.warning("Unknown photometry filter_id: %s", filter_id)
+                return ""
 
-            wl_match = re.search(r"(\d+)", filter_name)
-            wavelength = wl_match.group(1) if wl_match else ""
-
-            # Match: "Absorbance @ {wl} ({time}s)"
-            time_str = f"{read_time:.1f}" if read_time == int(read_time) else f"{read_time}"
+            # Build the expected protocol name: "Absorbance @ {wl} ({time}s)"
+            # The instrument uses 1.0s or 0.1s — format to match exactly
+            time_str = f"{read_time:.1f}"
             target = f"Absorbance @ {wavelength} ({time_str}s)"
 
+            # Try exact match first
             for p in factory_presets:
                 if p["name"] == target:
                     return p["name"]
-            # Fallback: match by wavelength only
+
+            # Fallback: match by wavelength only (ignore read time)
             for p in factory_presets:
                 if "Absorbance" in p["name"] and f"@ {wavelength}" in p["name"]:
                     return p["name"]
 
+            logger.warning(
+                "No photometry protocol found for filter_id=%s wavelength=%s time=%s",
+                filter_id,
+                wavelength,
+                time_str,
+            )
+
         elif mode == "fluorometry":
             fluoro = method_spec.get("fluorometry", {})
-            ex_name = fluoro.get("excitation_filter_name", "")
-            em_name = fluoro.get("emission_filter_name", "")
+            ex_filter_id = fluoro.get("excitation_filter_id", "")
+            em_filter_id = fluoro.get("emission_filter_id", "")
             read_time = fluoro.get("read_time_seconds", 1.0)
 
-            # Extract wavelengths from filter names
-            import re
+            # Map filter_id pairs to protocol names.
+            # The instrument has Fluorescein (485/535) and Umbelliferone (355/460).
+            filter_pair_to_protocol = {
+                ("F485", "F535"): "Fluorescein",
+                ("F355", "F460"): "Umbelliferone",
+            }
+            dye_name = filter_pair_to_protocol.get((ex_filter_id, em_filter_id), "")
+            if not dye_name:
+                logger.warning(
+                    "Unknown fluorometry filter pair: ex=%s em=%s",
+                    ex_filter_id,
+                    em_filter_id,
+                )
+                return ""
 
-            ex_match = re.search(r"(\d+)", ex_name)
-            em_match = re.search(r"(\d+)", em_name)
-            ex_wl = ex_match.group(1) if ex_match else ""
-            em_wl = em_match.group(1) if em_match else ""
+            # Build expected protocol name: "{dye} ({ex}nm/{em}nm, {time}s)"
+            # Extract wavelengths from filter IDs (F485 → 485, F355 → 355)
+            ex_wl = ex_filter_id[1:] if ex_filter_id.startswith("F") else ""
+            em_wl = em_filter_id[1:] if em_filter_id.startswith("F") else ""
+            time_str = f"{read_time:.1f}"
+            target = f"{dye_name} ({ex_wl}nm/{em_wl}nm, {time_str}s)"
 
-            time_str = f"{read_time:.1f}" if read_time == int(read_time) else f"{read_time}"
-            target = f"({ex_wl}nm/{em_wl}nm, {time_str}s)"
-
+            # Try exact match first
             for p in factory_presets:
-                if target in p["name"]:
+                if p["name"] == target:
                     return p["name"]
-            # Fallback: match by filter names
+
+            # Fallback: match by dye name + wavelengths (ignore read time)
             for p in factory_presets:
-                if ex_wl and em_wl and ex_wl in p["name"] and em_wl in p["name"]:
+                if (
+                    dye_name in p["name"]
+                    and ex_wl in p["name"]
+                    and em_wl in p["name"]
+                    and "Bottom" not in p["name"]
+                    and "High Count" not in p["name"]
+                ):
                     return p["name"]
+
+            # Last resort: any match with dye name + wavelengths
+            for p in factory_presets:
+                if dye_name in p["name"] and ex_wl in p["name"] and em_wl in p["name"]:
+                    return p["name"]
+
+            logger.warning(
+                "No fluorometry protocol found for dye=%s ex=%s em=%s time=%s",
+                dye_name,
+                ex_wl,
+                em_wl,
+                time_str,
+            )
 
         elif mode == "luminescence":
             # Single luminescence protocol
