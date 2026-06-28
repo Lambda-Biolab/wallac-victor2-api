@@ -32,6 +32,8 @@ from .schemas import (
     EXECUTABLE_LIFECYCLE_STATES,
     ExecutionMode,
     JobSpec,
+    LayoutSpec,
+    WellRole,
 )
 
 logger = logging.getLogger(__name__)
@@ -243,9 +245,10 @@ class ValidationService:
             )
 
         # --- Validate Layout reference ---
+        layout_spec_dict: dict[str, Any] | None = None
         if job.layout is not None:
             if job.layout.source == "reusable" and job.layout.object_id:
-                self._validate_referenced_object(
+                layout_spec_dict = self._validate_referenced_object(
                     "layout",
                     job.layout.object_id,
                     job.layout.hash,
@@ -254,13 +257,22 @@ class ValidationService:
                 )
             else:
                 # one-off layout: attachment is on the job itself
-                self._download_and_verify(
+                layout_spec_dict = self._download_and_verify(
                     job_item_id,
                     str(job.layout.json_attachment_id),
                     job.layout.hash,
                     "layout",
                     report,
                 )
+
+        # --- Validate Layout content (semantic rules) ---
+        # Reason: schema validation only checks structure (well names are
+        # A1..H12, role is a valid enum). It does NOT catch invalid
+        # combinations like a replicate group with only one well, or an
+        # excluded well carrying sample metadata — those are semantic
+        # rules that would produce nonsense at analysis time.
+        if layout_spec_dict is not None:
+            self._validate_layout_content(layout_spec_dict, report)
 
         # --- Validate Analysis reference ---
         if job.analysis is not None:
@@ -285,8 +297,12 @@ class ValidationService:
         expected_hash: str,
         json_attachment_id: int,
         report: ValidationReport,
-    ) -> None:
-        """Validate a referenced signed object (Method, Layout, Analysis)."""
+    ) -> dict[str, Any] | None:
+        """Validate a referenced signed object (Method, Layout, Analysis).
+
+        Returns the parsed spec dict on success (so callers can run
+        content-specific checks), or None on any failure.
+        """
         from .elabftw import extract_extra_fields, get_field_value
 
         # Get the referenced item
@@ -294,7 +310,7 @@ class ValidationService:
             item = self.elabftw.get_item(object_id)
         except Exception as e:
             report.add_check(f"{kind}_exists", False, f"Failed to get {kind} item {object_id}: {e}")
-            return
+            return None
 
         ef = extract_extra_fields(item.get("metadata"))
 
@@ -306,11 +322,13 @@ class ValidationService:
                 False,
                 f"{kind} {object_id} lifecycle is '{lifecycle}', not in {EXECUTABLE_LIFECYCLE_STATES}",
             )
-            return
+            return None
         report.add_check(f"{kind}_lifecycle", True, f"{kind} {object_id} is signed/active")
 
-        # Download and verify the canonical JSON attachment
-        self._download_and_verify(object_id, str(json_attachment_id), expected_hash, kind, report)
+        # Download and verify the canonical JSON attachment, return parsed dict
+        return self._download_and_verify(
+            object_id, str(json_attachment_id), expected_hash, kind, report
+        )
 
     def _download_and_verify(
         self,
@@ -438,3 +456,190 @@ class ValidationService:
                         False,
                         f"Failed to check instrument capabilities: {e}",
                     )
+
+    # --- Layout content validation (semantic rules) -------------------------
+
+    def _validate_layout_content(
+        self,
+        layout_dict: dict[str, Any],
+        report: ValidationReport,
+    ) -> None:
+        """Run semantic checks on a parsed layout spec.
+
+        Schema validation (LayoutSpec.from_dict) catches structurally
+        invalid layouts (bad well names, unknown roles). These checks
+        catch invalid **combinations** that would produce nonsense at
+        analysis time or an inconsistent MDB PlateMap.
+
+        Rules (9):
+          1. Empty layout (no wells at all)
+          2. No measured wells (nothing to put in PlateMap)
+          3. Duplicate well_name entries
+          4. Skipped well with sample_name / sample_label set
+          5. Excluded well with sample_name / sample_label set
+          6. Well with control_type but role != measured
+          7. Blank well (control_type=blank) that is not measured
+          8. Replicate group with only 1 well (replicate implies >=2)
+          9. Replicate group made up entirely of excluded wells
+        """
+        # Parse first — schema errors are also content errors here.
+        try:
+            layout = LayoutSpec.from_dict(layout_dict)
+        except Exception as e:
+            report.add_check("layout_schema", False, f"Failed to parse layout spec: {e}")
+            return
+        report.add_check("layout_schema", True, "layout spec parsed")
+
+        wells = layout.wells
+        self._check_layout_population(wells, report)
+        # Skip per-well rules if there are no wells — they'd all be vacuous.
+        if not wells:
+            return
+        self._check_layout_duplicates(wells, report)
+        self._check_layout_role_metadata(wells, report)
+        self._check_layout_replicate_groups(wells, report)
+
+    def _check_layout_population(self, wells: list, report: ValidationReport) -> None:
+        """Rules 1 (empty) + 2 (no measured wells)."""
+        if not wells:
+            report.add_check("layout_empty", False, "Layout has no wells")
+            return
+        report.add_check("layout_empty", True, f"Layout has {len(wells)} wells")
+
+        measured = [w for w in wells if w.role == WellRole.MEASURED.value]
+        if not measured:
+            report.add_check(
+                "layout_no_measured",
+                False,
+                "Layout has no 'measured' wells — nothing to put in the MDB PlateMap",
+            )
+        else:
+            report.add_check(
+                "layout_no_measured",
+                True,
+                f"{len(measured)} measured well(s)",
+            )
+
+    @staticmethod
+    def _check_layout_duplicates(wells: list, report: ValidationReport) -> None:
+        """Rule 3: duplicate well_name entries."""
+        seen: set[str] = set()
+        dups: list[str] = []
+        for w in wells:
+            if w.well_name in seen:
+                dups.append(w.well_name)
+            seen.add(w.well_name)
+        if dups:
+            report.add_check(
+                "layout_duplicate_wells",
+                False,
+                f"Duplicate well_name entries: {sorted(set(dups))}",
+            )
+        else:
+            report.add_check(
+                "layout_duplicate_wells",
+                True,
+                "All well_name entries are unique",
+            )
+
+    def _check_layout_role_metadata(self, wells: list, report: ValidationReport) -> None:
+        """Rules 4-7: per-well role vs metadata contradictions."""
+        offenders_skip_sample: list[str] = []
+        offenders_excl_sample: list[str] = []
+        offenders_ctrl_role: list[str] = []
+        offenders_blank_not_measured: list[str] = []
+        for w in wells:
+            has_sample_meta = bool(w.sample_name or w.sample_label)
+            if w.role == WellRole.SKIPPED.value and has_sample_meta:
+                offenders_skip_sample.append(w.well_name)
+            if w.role == WellRole.EXCLUDED.value and has_sample_meta:
+                offenders_excl_sample.append(w.well_name)
+            if w.control_type and w.role != WellRole.MEASURED.value:
+                offenders_ctrl_role.append(w.well_name)
+            if w.control_type == "blank" and w.role != WellRole.MEASURED.value:
+                offenders_blank_not_measured.append(w.well_name)
+
+        self._emit_offenders_check(
+            report,
+            "layout_skipped_with_sample",
+            offenders_skip_sample,
+            "No skipped wells carry sample metadata",
+            "Skipped wells should not carry sample_name/sample_label",
+        )
+        self._emit_offenders_check(
+            report,
+            "layout_excluded_with_sample",
+            offenders_excl_sample,
+            "No excluded wells carry sample metadata",
+            "Excluded wells should not carry sample_name/sample_label",
+        )
+        self._emit_offenders_check(
+            report,
+            "layout_control_role",
+            offenders_ctrl_role,
+            "All control wells are 'measured' role",
+            "Wells with control_type set must have role='measured'",
+        )
+        self._emit_offenders_check(
+            report,
+            "layout_blank_not_measured",
+            offenders_blank_not_measured,
+            "All blank wells are 'measured' role",
+            "Blank wells must have role='measured'",
+        )
+
+    @staticmethod
+    def _emit_offenders_check(
+        report: ValidationReport,
+        name: str,
+        offenders: list[str],
+        ok_msg: str,
+        err_msg: str,
+    ) -> None:
+        """Emit a pass/fail check with either the ok message or offenders list."""
+        # Reason: 4 nearly-identical role/metadata checks share this emit
+        # pattern; dedup keeps _check_layout_role_metadata readable.
+        if offenders:
+            report.add_check(name, False, f"{err_msg}: {offenders}")
+        else:
+            report.add_check(name, True, ok_msg)
+
+    @staticmethod
+    def _check_layout_replicate_groups(wells: list, report: ValidationReport) -> None:
+        """Rules 8 (replicate group with <2 wells) + 9 (group all excluded)."""
+        groups: dict[str, list[str]] = {}
+        for w in wells:
+            if w.replicate_group:
+                groups.setdefault(w.replicate_group, []).append(w.well_name)
+
+        too_small = sorted(g for g, names in groups.items() if len(names) < 2)
+        if too_small:
+            report.add_check(
+                "layout_replicate_group_size",
+                False,
+                f"Replicate groups must have >=2 wells: {too_small}",
+            )
+        else:
+            report.add_check(
+                "layout_replicate_group_size",
+                True,
+                f"{len(groups)} replicate group(s), all with >=2 wells",
+            )
+
+        all_excluded_groups: list[str] = []
+        for gname in groups:
+            wells_in_group = [w for w in wells if w.replicate_group == gname]
+            if wells_in_group and all(w.role == WellRole.EXCLUDED.value for w in wells_in_group):
+                all_excluded_groups.append(gname)
+        if all_excluded_groups:
+            report.add_check(
+                "layout_replicate_group_all_excluded",
+                False,
+                f"Replicate groups made up entirely of 'excluded' wells: {all_excluded_groups}",
+            )
+        else:
+            report.add_check(
+                "layout_replicate_group_all_excluded",
+                True,
+                "No replicate group is entirely 'excluded' wells",
+            )
