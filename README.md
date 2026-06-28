@@ -4,7 +4,6 @@
 [![Python](https://img.shields.io/badge/python-3.8-58f4c2.svg)](https://www.python.org/)
 [![CI](https://github.com/Lambda-Biolab/wallac-victor2-api/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/wallac-victor2-api/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/Lambda-Biolab/wallac-victor2-api/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/wallac-victor2-api/actions/workflows/codeql.yml)
-[![CodeFactor](https://www.codefactor.io/repository/github/lambda-biolab/wallac-victor2-api/badge/main)](https://www.codefactor.io/repository/github/lambda-biolab/wallac-victor2-api)
 
 A **REST/JSON API** for the PerkinElmer **Wallac Victor2 (1420)** multimode
 microplate reader — start assays, stream live status, and pull results over
