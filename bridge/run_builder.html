@@ -368,6 +368,13 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
       <div id="statusEvents" style="margin-top:12px; max-height:200px; overflow-y:auto; font-family:monospace; font-size:0.8rem;"></div>
       <div id="liveHeatmap" class="hidden" style="margin-top:12px;">
         <h3>Live Heatmap</h3>
+        <div style="display:flex; gap:12px; align-items:center; margin-bottom:8px; font-size:0.85rem;">
+          <label>Color range:</label>
+          <input type="number" id="heatmapMin" step="0.01" placeholder="auto" style="width:80px; padding:2px 6px; border:1px solid var(--border); border-radius:4px; background:var(--bg); color:var(--fg);" onchange="renderLiveHeatmap(lastLiveWells)" />
+          <span>to</span>
+          <input type="number" id="heatmapMax" step="0.01" placeholder="auto" style="width:80px; padding:2px 6px; border:1px solid var(--border); border-radius:4px; background:var(--bg); color:var(--fg);" onchange="renderLiveHeatmap(lastLiveWells)" />
+          <button class="btn btn-secondary" style="padding:2px 8px; font-size:0.8rem;" onclick="document.getElementById('heatmapMin').value=''; document.getElementById('heatmapMax').value=''; renderLiveHeatmap(lastLiveWells);">Reset</button>
+        </div>
         <div id="liveHeatmapGrid"></div>
       </div>
       <div style="margin-top:8px;">
@@ -1285,11 +1292,13 @@ async function pollJobStatus() {
   } catch {}
 }
 
+let lastLiveWells = [];
 function renderLiveHeatmap(wells) {
   const container = document.getElementById('liveHeatmap');
   const grid = document.getElementById('liveHeatmapGrid');
   if (!container || !grid) return;
   container.classList.remove('hidden');
+  lastLiveWells = wells;
 
   // Build well value map
   const vals = {};
@@ -1300,8 +1309,11 @@ function renderLiveHeatmap(wells) {
   }
 
   const allVals = Object.values(vals);
-  const vmin = allVals.length ? Math.min(...allVals) : 0;
-  const vmax = allVals.length ? Math.max(...allVals) : 1;
+  // Use user-defined range if set, otherwise auto-scale
+  const minInput = document.getElementById('heatmapMin');
+  const maxInput = document.getElementById('heatmapMax');
+  const vmin = (minInput && minInput.value !== '') ? parseFloat(minInput.value) : (allVals.length ? Math.min(...allVals) : 0);
+  const vmax = (maxInput && maxInput.value !== '') ? parseFloat(maxInput.value) : (allVals.length ? Math.max(...allVals) : 1);
   const vrange = vmax > vmin ? vmax - vmin : 1;
 
   function colorFor(val) {
