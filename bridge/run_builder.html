@@ -1300,25 +1300,32 @@ function renderLiveHeatmap(wells) {
   container.classList.remove('hidden');
   lastLiveWells = wells;
 
-  // Build well value map
+  // Build well value map — prefer od, fall back to counts
   const vals = {};
+  let usingCounts = false;
   for (const w of wells) {
     const name = w.well || '';
-    const v = w.od != null ? w.od : w.counts;
-    if (name && v != null) vals[name] = parseFloat(v);
+    if (!name) continue;
+    if (w.od != null) {
+      vals[name] = parseFloat(w.od);
+    } else if (w.counts != null) {
+      vals[name] = parseFloat(w.counts);
+      usingCounts = true;
+    }
   }
 
   const allVals = Object.values(vals);
   // Use user-defined range if set, otherwise auto-scale
   const minInput = document.getElementById('heatmapMin');
   const maxInput = document.getElementById('heatmapMax');
-  const vmin = (minInput && minInput.value !== '') ? parseFloat(minInput.value) : (allVals.length ? Math.min(...allVals) : 0);
-  const vmax = (maxInput && maxInput.value !== '') ? parseFloat(maxInput.value) : (allVals.length ? Math.max(...allVals) : 1);
-  const vrange = vmax > vmin ? vmax - vmin : 1;
+  const userMin = (minInput && minInput.value !== '') ? parseFloat(minInput.value) : null;
+  const userMax = (maxInput && maxInput.value !== '') ? parseFloat(maxInput.value) : null;
+  const vmin = userMin !== null ? userMin : (allVals.length ? Math.min(...allVals) : 0);
+  const vmax = userMax !== null ? userMax : (allVals.length ? Math.max(...allVals) : 1);
+  const vrange = (vmax - vmin) || 1;
 
   function colorFor(val) {
-    if (vrange === 0) return '#ffffff';
-    const t = (val - vmin) / vrange;
+    const t = Math.max(0, Math.min(1, (val - vmin) / vrange));
     if (t < 0.5) {
       const r = Math.round(255 * t * 2);
       const g = Math.round(255 * t * 2);
@@ -1350,7 +1357,8 @@ function renderLiveHeatmap(wells) {
     html += '</tr>';
   }
   html += '</table>';
-  html += `<p style="font-size:0.8rem;color:var(--muted);margin-top:4px;">${allVals.length} wells measured</p>`;
+  const unitLabel = usingCounts ? 'counts' : 'OD';
+  html += `<p style="font-size:0.8rem;color:var(--muted);margin-top:4px;">${allVals.length} wells measured (showing ${unitLabel})</p>`;
   grid.innerHTML = html;
 }
 
