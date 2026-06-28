@@ -68,6 +68,7 @@ class JobResponse(BaseModel):
     artifacts: list[dict[str, Any]]
     spooled: bool
     expected_outputs: str
+    live_wells: list[dict[str, Any]] = []
 
 
 class AbortResponse(BaseModel):
@@ -93,6 +94,7 @@ def _job_to_response(job: Job) -> JobResponse:
         artifacts=list(job.artifacts),
         spooled=job.spooled,
         expected_outputs=job.expected_outputs,
+        live_wells=list(job.live_wells),
     )
 
 

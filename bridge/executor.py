@@ -38,6 +38,19 @@ POLL_INTERVAL = 2.0
 POLL_TIMEOUT = 600.0
 
 
+def _normalize_well_name(name: str) -> str:
+    """Normalize a well address to non-zero-padded form: A01 → A1, H12 → H12."""
+    name = name.strip().upper()
+    if len(name) >= 2 and name[0].isalpha():
+        row = name[0]
+        try:
+            col = int(name[1:])
+            return f"{row}{col}"
+        except ValueError:
+            pass
+    return name
+
+
 class BridgeExecutor:
     """Executes direct-submit jobs through the vm-agent and writes results to eLabFTW.
 
@@ -217,6 +230,26 @@ class BridgeExecutor:
             return
         job.add_event("protocol_matched", protocol_name)
 
+        # Update the protocol's PlateMap to match the layout spec's wells.
+        # The protocol's default PlateMap may only enable a subset of wells;
+        # the layout spec defines which wells the user actually selected.
+        if layout_spec:
+            wells = [
+                w.get("well_name", w.get("name", ""))
+                for w in layout_spec.get("wells", [])
+                if w.get("well_name", w.get("name", ""))
+            ]
+            if wells:
+                try:
+                    proto = self.vm_agent.get_protocol(protocol_name)
+                    proto_id = proto.get("id", 0)
+                    if proto_id:
+                        self.vm_agent.update_plate_map(proto_id, wells)
+                        job.add_event("plate_map_updated", f"{len(wells)} wells")
+                except Exception as e:
+                    job.add_event("plate_map_update_failed", str(e))
+                    logger.warning("PlateMap update failed for %s: %s", protocol_name, e)
+
         # Resolve and start the run
         job.add_event("starting_run", protocol_name)
         try:
@@ -246,8 +279,13 @@ class BridgeExecutor:
     # --- Shared helpers ---
 
     def _poll_run(self, job: Job, run_id: str) -> None:
-        """Poll vm-agent for run completion. Updates job.status."""
+        """Poll vm-agent for run completion. Updates job.status.
+
+        Also fetches live results every few seconds so the Run Builder
+        can display a real-time heatmap of wells as they are measured.
+        """
         deadline = time.monotonic() + POLL_TIMEOUT
+        last_live_fetch = 0.0
         while time.monotonic() < deadline:
             if job.abort_requested:
                 try:
@@ -268,6 +306,25 @@ class BridgeExecutor:
                 return
 
             state = run.get("state", "").lower()
+
+            # Fetch live results every ~3s for real-time heatmap
+            now = time.monotonic()
+            if now - last_live_fetch >= 3.0:
+                last_live_fetch = now
+                try:
+                    live = self.vm_agent.get_run_results(run_id)
+                    wells = live.get("wells", live.get("data", []))
+                    if wells:
+                        job.live_wells = [
+                            {
+                                "well": _normalize_well_name(w.get("well", w.get("well_name", ""))),
+                                "od": w.get("od"),
+                                "counts": w.get("counts"),
+                            }
+                            for w in wells
+                        ]
+                except Exception:
+                    pass  # live fetch is best-effort
 
             # vm-agent terminal states: "measured" (completed successfully),
             # "completed", "done", "finished"
@@ -316,7 +373,13 @@ class BridgeExecutor:
                 for well in layout_spec.get("wells", []):
                     name = well.get("well_name", well.get("name", ""))
                     if name:
-                        layout_wells[name] = well
+                        layout_wells[_normalize_well_name(name)] = well
+
+                # Normalize raw well names too so they match layout keys
+                for w in raw_wells:
+                    wn = w.get("well", "")
+                    if wn:
+                        w["well"] = _normalize_well_name(wn)
 
                 spec = AnalysisSpec.from_dict(analysis_spec_dict)
                 analysis_result = self.analysis.run(raw_wells, layout_wells, spec)
@@ -392,12 +455,14 @@ class BridgeExecutor:
         """Build a rich HTML body with plate heatmap and results table."""
         import html as html_mod
 
-        # Extract well values into a dict keyed by well name
+        # Extract well values into a dict keyed by normalized well name.
+        # vm-agent returns zero-padded names (A01, A12); heatmap uses A1, A12.
         well_values: dict[str, float] = {}
         for w in raw_wells:
             name = w.get("well_name", w.get("name", w.get("well", "")))
             if not name:
                 continue
+            name = _normalize_well_name(name)
             # Try common value field names
             val = (
                 w.get("primary_value")

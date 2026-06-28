@@ -69,6 +69,7 @@ class Job:
     events: list[dict[str, str]] = field(default_factory=list)
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     spooled: bool = False
+    live_wells: list[dict[str, Any]] = field(default_factory=list)
 
     # Abort
     abort_requested: bool = False
@@ -94,6 +95,7 @@ class Job:
             "artifacts": list(self.artifacts),
             "spooled": self.spooled,
             "expected_outputs": self.expected_outputs,
+            "live_wells": list(self.live_wells),
         }
 
 
