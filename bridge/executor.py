@@ -327,7 +327,6 @@ class BridgeExecutor:
         accept the result.
         """
         deadline = time.monotonic() + POLL_TIMEOUT
-        run_start = time.monotonic()
         last_live_fetch = 0.0
         abort_tried = False
         while time.monotonic() < deadline:
@@ -359,30 +358,34 @@ class BridgeExecutor:
             state = run.get("state", "").lower()
 
             # Fetch live results every ~3s for real-time heatmap.
-            # The vm-agent's live buffer may only contain recently measured
-            # wells, so we accumulate across polls to build the full picture.
-            # Skip the first few seconds while the instrument is still
-            # initializing — the live buffer may contain stale data from
-            # the previous run until the new run starts writing to it.
+            # Only fetch when the run is actively "running" (not "starting")
+            # to avoid stale data from the previous run's live buffer.
+            # The vm-agent's GetLiveResult buffer is not cleared between
+            # runs, so we track which wells we've seen in THIS run and
+            # only accumulate new ones.
             now = time.monotonic()
-            if now - last_live_fetch >= 3.0 and now - run_start > 5.0:
+            if now - last_live_fetch >= 3.0 and state == "running":
                 last_live_fetch = now
                 try:
                     live = self.vm_agent.get_run_results(run_id)
                     wells = live.get("wells", live.get("data", []))
                     if wells:
-                        # Merge new wells into existing live_wells (new overwrites old)
+                        # Merge new wells into existing live_wells.
+                        # Only accept wells not already seen (prevents
+                        # stale data from overwriting fresh measurements).
                         existing = {w["well"]: w for w in job.live_wells}
                         for w in wells:
                             name = _normalize_well_name(w.get("well", w.get("well_name", "")))
                             # Skip non-well entries (BKG, empty, etc.)
                             if not name or name[0] not in "ABCDEFGH":
                                 continue
-                            existing[name] = {
-                                "well": name,
-                                "od": w.get("od"),
-                                "counts": w.get("counts"),
-                            }
+                            # Only add if not already seen (first measurement wins)
+                            if name not in existing:
+                                existing[name] = {
+                                    "well": name,
+                                    "od": w.get("od"),
+                                    "counts": w.get("counts"),
+                                }
                         job.live_wells = list(existing.values())
                 except Exception:
                     pass  # live fetch is best-effort
