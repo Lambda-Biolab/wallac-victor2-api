@@ -116,6 +116,39 @@ class VmAgentClient:
         """GET /protocols/{name|id} — resolve a single protocol."""
         return self._request("GET", f"/protocols/{name_or_id}")
 
+    # --- Protocol PlateMap ---
+
+    def update_plate_map(self, protocol_id: int, wells: list[str]) -> dict[str, Any]:
+        """PATCH /mdb/protocols/{id}/plate_map — set which wells to measure.
+
+        Builds the 108-byte PlateMap binary (12-byte header + 96-byte 8x12
+        grid) from a list of well names (e.g. ["A1", "A2", "B1", ...]).
+        Must be called before start_run() to override the protocol's default
+        well selection.
+        """
+        # 12-byte header: version=1, cols=12, rows=8 (little-endian int32)
+        header = [1, 0, 0, 0, 12, 0, 0, 0, 8, 0, 0, 0]
+        # 96-byte grid: row-major A1..A12, B1..B12, ... H1..H12
+        grid = [0] * 96
+        rows = "ABCDEFGH"
+        for well in wells:
+            well = well.strip().upper()
+            if len(well) < 2 or well[0] not in rows:
+                continue
+            try:
+                col = int(well[1:])
+            except ValueError:
+                continue
+            if 1 <= col <= 12:
+                row_idx = rows.index(well[0])
+                grid[row_idx * 12 + (col - 1)] = 1
+        plate_map = header + grid
+        return self._request(
+            "PATCH",
+            f"/mdb/protocols/{protocol_id}/plate_map",
+            body={"plate_map": plate_map},
+        )
+
     # --- Runs ---
 
     def start_run(

@@ -366,6 +366,10 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
         </div>
       </div>
       <div id="statusEvents" style="margin-top:12px; max-height:200px; overflow-y:auto; font-family:monospace; font-size:0.8rem;"></div>
+      <div id="liveHeatmap" class="hidden" style="margin-top:12px;">
+        <h3>Live Heatmap</h3>
+        <div id="liveHeatmapGrid"></div>
+      </div>
       <div style="margin-top:8px;">
         <button class="btn btn-danger" id="abortBtn" onclick="abortJob()" disabled>Request Abort</button>
       </div>
@@ -1252,6 +1256,11 @@ async function pollJobStatus() {
     eventsDiv.innerHTML = job.events.map(e => `<div>[${e.ts.slice(0,19)}] ${e.event}: ${e.detail}</div>`).join('');
     eventsDiv.scrollTop = eventsDiv.scrollHeight;
 
+    // Update live heatmap during run
+    if (job.live_wells && job.live_wells.length > 0) {
+      renderLiveHeatmap(job.live_wells);
+    }
+
     // Stop polling on terminal states
     if (['completed', 'failed', 'aborted', 'unknown_requires_operator_review'].includes(job.status)) {
       clearInterval(statusPollTimer);
@@ -1274,6 +1283,63 @@ async function pollJobStatus() {
       }
     }
   } catch {}
+}
+
+function renderLiveHeatmap(wells) {
+  const container = document.getElementById('liveHeatmap');
+  const grid = document.getElementById('liveHeatmapGrid');
+  if (!container || !grid) return;
+  container.classList.remove('hidden');
+
+  // Build well value map
+  const vals = {};
+  for (const w of wells) {
+    const name = w.well || '';
+    const v = w.od != null ? w.od : w.counts;
+    if (name && v != null) vals[name] = parseFloat(v);
+  }
+
+  const allVals = Object.values(vals);
+  const vmin = allVals.length ? Math.min(...allVals) : 0;
+  const vmax = allVals.length ? Math.max(...allVals) : 1;
+  const vrange = vmax > vmin ? vmax - vmin : 1;
+
+  function colorFor(val) {
+    if (vrange === 0) return '#ffffff';
+    const t = (val - vmin) / vrange;
+    if (t < 0.5) {
+      const r = Math.round(255 * t * 2);
+      const g = Math.round(255 * t * 2);
+      return `rgb(${r},${g},255)`;
+    } else {
+      const g = Math.round(255 * (1 - (t - 0.5) * 2));
+      const b = Math.round(255 * (1 - (t - 0.5) * 2));
+      return `rgb(255,${g},${b})`;
+    }
+  }
+
+  const rows = 'ABCDEFGH';
+  let html = '<table style="border-collapse:collapse; font-size:0.75rem;">';
+  html += '<tr><td></td>';
+  for (let c = 1; c <= 12; c++) html += `<td style="text-align:center;padding:2px 6px;font-weight:bold;">${c}</td>`;
+  html += '</tr>';
+  for (const r of rows) {
+    html += `<tr><td style="font-weight:bold;padding:2px 6px;">${r}</td>`;
+    for (let c = 1; c <= 12; c++) {
+      const well = `${r}${c}`;
+      const val = vals[well];
+      if (val != null) {
+        const color = colorFor(val);
+        html += `<td style="background:${color};text-align:center;padding:2px 6px;border:1px solid #ccc;">${val.toFixed(3)}</td>`;
+      } else {
+        html += `<td style="background:#f0f0f0;text-align:center;padding:2px 6px;border:1px solid #ccc;color:#999;">—</td>`;
+      }
+    }
+    html += '</tr>';
+  }
+  html += '</table>';
+  html += `<p style="font-size:0.8rem;color:var(--muted);margin-top:4px;">${allVals.length} wells measured</p>`;
+  grid.innerHTML = html;
 }
 
 async function abortJob() {
