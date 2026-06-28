@@ -101,6 +101,16 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
   <h1>Wallac Victor2 — Run Builder</h1>
   <p class="subtitle">Create a signed protocol bundle: Method → Plate Layout → Analysis Plan → Automation Job</p>
 
+  <!-- Instrument status banner -->
+  <div id="instrumentBanner" class="panel" style="padding:8px 16px; display:flex; align-items:center; gap:12px; margin-bottom:16px;">
+    <div id="instrumentDot" style="width:12px; height:12px; border-radius:50%; background:var(--muted); flex-shrink:0;"></div>
+    <div style="flex:1;">
+      <span id="instrumentState" style="font-weight:600;">Checking…</span>
+      <span id="instrumentDetail" style="color:var(--muted); font-size:0.85rem; margin-left:8px;"></span>
+    </div>
+    <div id="queueInfo" style="font-size:0.85rem; color:var(--muted);"></div>
+  </div>
+
   <!-- Auth -->
   <div class="auth-bar">
     <input type="text" id="elabftwUrl" placeholder="eLabFTW URL (e.g. https://100.119.135.27:3148)" style="flex:2;" />
@@ -346,6 +356,14 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
 
     <div id="jobStatus" class="hidden" style="margin-top:16px;">
       <h2>Job Status</h2>
+
+      <!-- Progress bar -->
+      <div style="margin-bottom:12px;">
+        <div id="progressBar" style="width:100%; height:24px; background:var(--bg); border-radius:12px; overflow:hidden; border:1px solid var(--border);">
+          <div id="progressFill" style="width:0%; height:100%; background:var(--accent); transition:width 0.5s ease; display:flex; align-items:center; justify-content:center; font-size:0.8rem; color:#fff; font-weight:600;"></div>
+        </div>
+      </div>
+
       <div class="summary-grid">
         <div class="summary-item">
           <div class="summary-label">Job ID</div>
@@ -388,6 +406,8 @@ let savedJob = null;
 let selectedWell = null;
 let submittedJobId = null;
 let statusPollTimer = null;
+let instrumentPollTimer = null;
+let instrumentBusy = false;
 const plateWells = {};
 
 // --- Init plate (all measured by default) ---
@@ -412,6 +432,62 @@ function saveSettings() {
   localStorage.setItem('wallacBridgeUrl', bridgeUrl);
   showStatus('Settings saved', 'success');
   checkBookingStatus();
+  startInstrumentPolling();
+}
+
+// --- Instrument status polling ---
+function startInstrumentPolling() {
+  if (instrumentPollTimer) clearInterval(instrumentPollTimer);
+  pollInstrumentStatus();
+  instrumentPollTimer = setInterval(pollInstrumentStatus, 3000);
+}
+
+async function pollInstrumentStatus() {
+  if (!bridgeUrl) return;
+  try {
+    const resp = await fetch(`${bridgeUrl}/health`, { headers: authHeaders() });
+    if (!resp.ok) return;
+    const health = await resp.json();
+
+    const dot = document.getElementById('instrumentDot');
+    const stateEl = document.getElementById('instrumentState');
+    const detailEl = document.getElementById('instrumentDetail');
+    const queueEl = document.getElementById('queueInfo');
+    const submitBtn = document.getElementById('submitBtn');
+
+    const workerRunning = health.worker_running;
+    const currentJob = health.current_job;
+
+    if (currentJob && submittedJobId !== currentJob) {
+      // Another job is running
+      instrumentBusy = true;
+      dot.style.background = 'var(--yellow)';
+      stateEl.textContent = 'Instrument busy';
+      stateEl.style.color = 'var(--yellow)';
+      detailEl.textContent = `running job ${currentJob}`;
+      queueEl.textContent = 'Your job will queue';
+      if (submitBtn) submitBtn.disabled = true;
+    } else if (currentJob && submittedJobId === currentJob) {
+      // Our job is running
+      instrumentBusy = true;
+      dot.style.background = 'var(--accent)';
+      stateEl.textContent = 'Running your job';
+      stateEl.style.color = 'var(--accent)';
+      detailEl.textContent = currentJob;
+      queueEl.textContent = '';
+      if (submitBtn) submitBtn.disabled = true;
+    } else {
+      // Instrument idle
+      instrumentBusy = false;
+      dot.style.background = 'var(--green)';
+      stateEl.textContent = 'Instrument ready';
+      stateEl.style.color = 'var(--green)';
+      detailEl.textContent = 'idle';
+      queueEl.textContent = '';
+      // Re-enable submit if we have a finalized job
+      if (submitBtn && savedJob) submitBtn.disabled = false;
+    }
+  } catch {}
 }
 
 // --- Booking status ---
@@ -1051,6 +1127,22 @@ async function pollJobStatus() {
     document.getElementById('statusRunId').textContent = job.run_id || '—';
     document.getElementById('statusError').textContent = job.error || '—';
 
+    // Update progress bar
+    const progressFill = document.getElementById('progressFill');
+    const progressMap = {
+      'accepted': { pct: 10, label: 'Queued', color: 'var(--muted)' },
+      'running': { pct: 50, label: 'Running', color: 'var(--accent)' },
+      'completed': { pct: 100, label: 'Completed', color: 'var(--green)' },
+      'failed': { pct: 100, label: 'Failed', color: 'var(--red)' },
+      'aborted': { pct: 100, label: 'Aborted', color: 'var(--yellow)' },
+      'unknown_requires_operator_review': { pct: 100, label: 'Needs Review', color: 'var(--red)' },
+    };
+    const prog = progressMap[job.status] || { pct: 0, label: job.status, color: 'var(--muted)' };
+    progressFill.style.width = prog.pct + '%';
+    progressFill.style.background = prog.color;
+    progressFill.textContent = prog.label;
+
+    // Update events log
     const eventsDiv = document.getElementById('statusEvents');
     eventsDiv.innerHTML = job.events.map(e => `<div>[${e.ts.slice(0,19)}] ${e.event}: ${e.detail}</div>`).join('');
     eventsDiv.scrollTop = eventsDiv.scrollHeight;
@@ -1060,6 +1152,8 @@ async function pollJobStatus() {
       clearInterval(statusPollTimer);
       statusPollTimer = null;
       document.getElementById('abortBtn').disabled = true;
+      // Re-check instrument status (will show idle if no other jobs)
+      pollInstrumentStatus();
     }
   } catch {}
 }
@@ -1101,6 +1195,7 @@ async function autoConfig() {
   } catch {}
   // Always check booking status after config is resolved
   checkBookingStatus();
+  startInstrumentPolling();
 }
 </script>
 </body>
