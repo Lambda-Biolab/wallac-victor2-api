@@ -1061,7 +1061,30 @@ async function abortJob() {
 renderPlate();
 onModeChange();
 loadMethods();
-checkBookingStatus();
+autoConfig();
+
+async function autoConfig() {
+  // Try to fetch config from the designer backend
+  try {
+    const resp = await fetch('/config');
+    if (resp.ok) {
+      const cfg = await resp.json();
+      // Auto-fill fields that aren't already set in localStorage
+      if (!elabftwUrl && cfg.elabftw_url) {
+        elabftwUrl = cfg.elabftw_url;
+        document.getElementById('elabftwUrl').value = elabftwUrl;
+        localStorage.setItem('wallacElabftwUrl', elabftwUrl);
+      }
+      if (!bridgeUrl && cfg.bridge_url) {
+        bridgeUrl = cfg.bridge_url;
+        document.getElementById('bridgeUrl').value = bridgeUrl;
+        localStorage.setItem('wallacBridgeUrl', bridgeUrl);
+      }
+    }
+  } catch {}
+  // Always check booking status after config is resolved
+  checkBookingStatus();
+}
 </script>
 </body>
 </html>
