@@ -91,6 +91,9 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
 /* Auth bar */
 .auth-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; }
 .auth-bar input { flex: 1; }
+.booking-free { background: #1a3a2a; color: var(--green); }
+.booking-busy { background: #3a2a1a; color: var(--yellow); }
+.booking-error { background: #3a1a1a; color: var(--red); }
 </style>
 </head>
 <body>
@@ -104,6 +107,12 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
     <input type="text" id="bridgeUrl" placeholder="Bridge URL (e.g. http://100.81.236.54:8423)" style="flex:2;" />
     <input type="password" id="authToken" placeholder="Designer token (leave empty if none)" style="flex:1;" />
     <button class="btn btn-secondary" onclick="saveSettings()">Save</button>
+  </div>
+
+  <!-- Booking status banner -->
+  <div id="bookingBanner" class="hidden" style="padding:8px 12px; border-radius:4px; margin-bottom:12px; font-size:0.85rem; display:flex; align-items:center; gap:8px;">
+    <span id="bookingIcon" style="font-size:1.2rem;"></span>
+    <span id="bookingText"></span>
   </div>
 
   <!-- Stepper -->
@@ -402,6 +411,73 @@ function saveSettings() {
   localStorage.setItem('wallacElabftwUrl', elabftwUrl);
   localStorage.setItem('wallacBridgeUrl', bridgeUrl);
   showStatus('Settings saved', 'success');
+  checkBookingStatus();
+}
+
+// --- Booking status ---
+const INSTRUMENT_ITEM_ID = 354; // Wallac Victor2 Plate Reader resource in eLabFTW
+
+async function checkBookingStatus() {
+  const banner = document.getElementById('bookingBanner');
+  if (!elabftwUrl) {
+    banner.classList.add('hidden');
+    return;
+  }
+
+  try {
+    const now = new Date();
+    const end = new Date(now.getTime() + 24 * 60 * 60 * 1000); // +24h
+    const startStr = now.toISOString().slice(0, 10);
+    const endStr = end.toISOString().slice(0, 10);
+
+    const resp = await fetch(
+      `${elabftwUrl}/api/v2/events?items_id=${INSTRUMENT_ITEM_ID}&start=${startStr}&end=${endStr}`,
+      { headers: authHeaders() }
+    );
+    if (!resp.ok) throw new Error(`${resp.status}`);
+    const events = await resp.json();
+
+    // Find any booking that overlaps with "now"
+    const active = events.find(e => {
+      const s = new Date(e.start);
+      const e2 = new Date(e.end);
+      return s <= now && e2 >= now;
+    });
+
+    if (active) {
+      const endTime = new Date(active.end).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+      const booker = active.fullname || active.title_only || 'unknown';
+      banner.className = 'booking-busy';
+      banner.classList.remove('hidden');
+      document.getElementById('bookingIcon').textContent = '⏳';
+      document.getElementById('bookingText').innerHTML =
+        `Instrument is booked by <strong>${booker}</strong> until ${endTime}. ` +
+        `<a href="${elabftwUrl}/database.php?mode=view&id=${INSTRUMENT_ITEM_ID}" target="_blank" style="color:var(--yellow);">View calendar →</a>`;
+    } else {
+      // Check for upcoming bookings today
+      const upcoming = events.find(e => new Date(e.start) > now);
+      banner.className = 'booking-free';
+      banner.classList.remove('hidden');
+      if (upcoming) {
+        const startTime = new Date(upcoming.start).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+        const booker = upcoming.fullname || upcoming.title_only || 'unknown';
+        document.getElementById('bookingIcon').textContent = '✓';
+        document.getElementById('bookingText').innerHTML =
+          `Instrument is available now. Next booking: <strong>${booker}</strong> at ${startTime}. ` +
+          `<a href="${elabftwUrl}/database.php?mode=view&id=${INSTRUMENT_ITEM_ID}" target="_blank" style="color:var(--green);">View calendar →</a>`;
+      } else {
+        document.getElementById('bookingIcon').textContent = '✓';
+        document.getElementById('bookingText').innerHTML =
+          `Instrument is available. ` +
+          `<a href="${elabftwUrl}/database.php?mode=view&id=${INSTRUMENT_ITEM_ID}" target="_blank" style="color:var(--green);">View calendar →</a>`;
+      }
+    }
+  } catch (e) {
+    banner.className = 'booking-error';
+    banner.classList.remove('hidden');
+    document.getElementById('bookingIcon').textContent = '⚠';
+    document.getElementById('bookingText').textContent = `Could not check booking status: ${e.message}`;
+  }
 }
 
 function authHeaders() {
@@ -985,6 +1061,7 @@ async function abortJob() {
 renderPlate();
 onModeChange();
 loadMethods();
+checkBookingStatus();
 </script>
 </body>
 </html>
