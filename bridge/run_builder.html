@@ -1154,6 +1154,19 @@ async function pollJobStatus() {
       document.getElementById('abortBtn').disabled = true;
       // Re-check instrument status (will show idle if no other jobs)
       pollInstrumentStatus();
+
+      // Show link to eLabFTW experiment if results were written back
+      if (job.elabftw_experiment_id && job.elabftw_experiment_id > 0 && elabftwUrl) {
+        const expUrl = `${elabftwUrl}/experiments.php?mode=view&id=${job.elabftw_experiment_id}`;
+        let linkDiv = document.getElementById('resultLink');
+        if (!linkDiv) {
+          linkDiv = document.createElement('div');
+          linkDiv.id = 'resultLink';
+          linkDiv.style.cssText = 'margin-top:12px; padding:12px; background:var(--bg); border:1px solid var(--green); border-radius:6px; text-align:center;';
+          document.getElementById('jobStatus').appendChild(linkDiv);
+        }
+        linkDiv.innerHTML = `<a href="${expUrl}" target="_blank" style="color:var(--green); font-size:1.1rem; font-weight:600; text-decoration:none;">Open results in eLabFTW →</a>`;
+      }
     }
   } catch {}
 }
