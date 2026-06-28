@@ -12,6 +12,8 @@ No eLabFTW polling. No metadata-encoded state machine. No claiming.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import threading
 import time
@@ -40,6 +42,44 @@ UNKNOWN = "unknown_requires_operator_review"
 TERMINAL_STATES = {COMPLETED, FAILED, ABORTED, UNKNOWN}
 
 
+# --- Duplicate detection ---
+
+
+class DuplicateJobError(Exception):
+    """Raised when a submitted job matches a non-terminal job already in the queue.
+
+    Carries the existing job_id so the caller can return it to the client.
+    """
+
+    def __init__(self, existing_job_id: str) -> None:
+        super().__init__(f"Duplicate of active job {existing_job_id}")
+        self.existing_job_id = existing_job_id
+
+
+def dedup_key(spec: dict[str, Any]) -> str:
+    """Stable key identifying "the same job" for duplicate detection.
+
+    Priority:
+      1. elabftw_experiment_id (>0) — one experiment = one instrument run.
+      2. Hash of execution_mode + protocol_name + method_ref + layout_ref
+         + analysis_ref — catches re-submits of the same finalized design.
+    """
+    exp_id = spec.get("elabftw_experiment_id", 0) or 0
+    if exp_id:
+        return f"exp:{exp_id}"
+    payload = json.dumps(
+        {
+            "execution_mode": spec.get("execution_mode", "existing_protocol"),
+            "protocol_name": spec.get("protocol_name", ""),
+            "method_ref": spec.get("method_ref", {}),
+            "layout_ref": spec.get("layout_ref", {}),
+            "analysis_ref": spec.get("analysis_ref", {}),
+        },
+        sort_keys=True,
+    )
+    return "hash:" + hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
 # --- Job data model ---
 
 
@@ -57,6 +97,7 @@ class Job:
     layout_ref: dict[str, Any] = field(default_factory=dict)
     analysis_ref: dict[str, Any] = field(default_factory=dict)
     expected_outputs: str = ""
+    dedup_key: str = ""
 
     # Runtime state
     status: str = ACCEPTED
@@ -125,6 +166,10 @@ class JobManager:
     def submit_job(self, job_spec: dict[str, Any]) -> Job:
         """Accept a new job for execution.
 
+        Rejects the submission if a non-terminal job with the same dedup key
+        (same eLabFTW experiment or same finalized design) is already in the
+        queue or running. Raises :class:`DuplicateJobError` in that case.
+
         Args:
             job_spec: Job specification dict with title, execution_mode,
                 protocol_name, etc.
@@ -132,6 +177,7 @@ class JobManager:
         Returns:
             The created Job with job_id and status=accepted.
         """
+        key = dedup_key(job_spec)
         job = Job(
             job_id=f"job-{uuid.uuid4().hex[:12]}",
             title=job_spec.get("title", "Untitled"),
@@ -144,10 +190,21 @@ class JobManager:
             analysis_ref=job_spec.get("analysis_ref", {}),
             expected_outputs=job_spec.get("expected_outputs", ""),
             created_at=now_iso(),
+            dedup_key=key,
         )
         job.add_event("job_submitted")
 
         with self._lock:
+            # Reject duplicates: a non-terminal job with the same key exists.
+            for existing in self._jobs.values():
+                if existing.dedup_key == key and existing.status not in TERMINAL_STATES:
+                    logger.warning(
+                        "Duplicate job rejected: new %s matches active %s (key=%s)",
+                        job.job_id,
+                        existing.job_id,
+                        key,
+                    )
+                    raise DuplicateJobError(existing.job_id)
             self._jobs[job.job_id] = job
             self._queue.append(job.job_id)
 

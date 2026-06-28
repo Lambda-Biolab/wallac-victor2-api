@@ -14,6 +14,7 @@ from bridge.jobs import (
     COMPLETED,
     FAILED,
     UNKNOWN,
+    DuplicateJobError,
     Job,
     JobManager,
 )
@@ -43,8 +44,8 @@ class TestJobManager:
 
     def test_list_jobs(self) -> None:
         mgr = JobManager()
-        mgr.submit_job({"title": "Job 1"})
-        mgr.submit_job({"title": "Job 2"})
+        mgr.submit_job({"title": "Job 1", "elabftw_experiment_id": 301})
+        mgr.submit_job({"title": "Job 2", "elabftw_experiment_id": 302})
         jobs = mgr.list_jobs()
         assert len(jobs) == 2
 
@@ -100,8 +101,8 @@ class TestJobManager:
         mgr.set_executor(executor)
         mgr.start_worker()
         try:
-            job1 = mgr.submit_job({"title": "Job 1"})
-            job2 = mgr.submit_job({"title": "Job 2"})
+            job1 = mgr.submit_job({"title": "Job 1", "elabftw_experiment_id": 101})
+            job2 = mgr.submit_job({"title": "Job 2", "elabftw_experiment_id": 102})
             # Release both
             barrier.set()
             # Wait
@@ -252,8 +253,8 @@ class TestBridgeApp:
         assert r.status_code == 404
 
     def test_list_jobs(self, client: TestClient) -> None:
-        client.post("/jobs", json={"title": "Job 1", "execution_mode": "existing_protocol"})
-        client.post("/jobs", json={"title": "Job 2", "execution_mode": "existing_protocol"})
+        client.post("/jobs", json={"title": "Job 1", "elabftw_experiment_id": 201})
+        client.post("/jobs", json={"title": "Job 2", "elabftw_experiment_id": 202})
         r = client.get("/jobs")
         assert r.status_code == 200
         assert len(r.json()) == 2
@@ -268,6 +269,96 @@ class TestBridgeApp:
     def test_abort_not_found(self, client: TestClient) -> None:
         r = client.post("/jobs/nonexistent/abort")
         assert r.status_code == 409
+
+    def test_duplicate_elabftw_experiment_rejected(self, client: TestClient) -> None:
+        """Two submissions with the same elabftw_experiment_id are treated as
+        duplicates while the first is still active."""
+        r1 = client.post(
+            "/jobs",
+            json={"title": "Run 1", "elabftw_experiment_id": 42},
+        )
+        assert r1.status_code == 201
+        r2 = client.post(
+            "/jobs",
+            json={"title": "Run 2", "elabftw_experiment_id": 42},
+        )
+        assert r2.status_code == 409
+        body = r2.json()
+        assert body["detail"]["existing_job_id"] == r1.json()["job_id"]
+
+    def test_duplicate_after_terminal_allowed(self, client: TestClient) -> None:
+        """Resubmitting the same experiment after the first job completed
+        is allowed (terminal jobs don't count as duplicates)."""
+        client.post(
+            "/jobs",
+            json={"title": "Run 1", "elabftw_experiment_id": 99},
+        )
+        # Without an executor wired, the first job stays "accepted".
+        # A second submit with the same experiment_id must be rejected.
+        r2 = client.post(
+            "/jobs",
+            json={"title": "Run 2", "elabftw_experiment_id": 99},
+        )
+        assert r2.status_code == 409
+
+    def test_duplicate_spec_hash_rejected(self, client: TestClient) -> None:
+        """Two submissions with the same method/layout refs but no
+        elabftw_experiment_id are detected via content hash."""
+        spec = {
+            "title": "Run",
+            "execution_mode": "generated_protocol",
+            "method_ref": {"object_id": 1},
+            "layout_ref": {"object_id": 2},
+        }
+        r1 = client.post("/jobs", json=spec)
+        assert r1.status_code == 201
+        # Same refs, different title — still a duplicate
+        spec2 = dict(spec, title="Different title")
+        r2 = client.post("/jobs", json=spec2)
+        assert r2.status_code == 409
+        assert r2.json()["detail"]["existing_job_id"] == r1.json()["job_id"]
+
+    def test_different_specs_both_accepted(self, client: TestClient) -> None:
+        """Two submissions with genuinely different specs are both accepted."""
+        r1 = client.post(
+            "/jobs",
+            json={"title": "A", "elabftw_experiment_id": 501},
+        )
+        r2 = client.post(
+            "/jobs",
+            json={"title": "B", "elabftw_experiment_id": 502},
+        )
+        assert r1.status_code == 201
+        assert r2.status_code == 201
+        assert r1.json()["job_id"] != r2.json()["job_id"]
+
+
+# --- JobManager-level duplicate detection tests ---
+
+
+class TestDuplicateDetection:
+    def test_same_experiment_id_raises(self) -> None:
+        mgr = JobManager()
+        mgr.submit_job({"title": "A", "elabftw_experiment_id": 7})
+        with pytest.raises(DuplicateJobError) as exc:
+            mgr.submit_job({"title": "B", "elabftw_experiment_id": 7})
+        assert exc.value.existing_job_id
+
+    def test_completed_job_allows_resubmit(self) -> None:
+        """A terminal job does not block resubmission with the same key."""
+        mgr = JobManager()
+        j1 = mgr.submit_job({"title": "A", "elabftw_experiment_id": 8})
+        j1.status = COMPLETED
+        # Should not raise
+        j2 = mgr.submit_job({"title": "B", "elabftw_experiment_id": 8})
+        assert j2.job_id != j1.job_id
+
+    def test_aborted_job_allows_resubmit(self) -> None:
+        mgr = JobManager()
+        j1 = mgr.submit_job({"title": "A", "elabftw_experiment_id": 9})
+        j1.status = FAILED
+        j2 = mgr.submit_job({"title": "B", "elabftw_experiment_id": 9})
+        assert j2.job_id != j1.job_id
 
 
 # --- Auth tests ---
