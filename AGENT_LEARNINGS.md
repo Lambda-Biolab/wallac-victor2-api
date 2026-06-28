@@ -223,3 +223,58 @@ dedicated service identity:
 **Gotcha:** Python's bcrypt generates `$2b$` hashes; PHP's `password_verify()`
 accepts both `$2b$` and `$2y$`, but use `$2y$` for consistency with
 eLabFTW's existing keys.
+
+## VM Agent Restart — always use start_agent.bat (NEVER taskkill solo)
+
+**Rule (MANDATORY, NON-NEGOTIABLE):** When restarting the vm-agent on the
+Windows VM, **always run `C:\install\start_agent.bat`** — never call
+`taskkill /F /IM python.exe` solo.
+
+**Why:** the Wallac Victor2 instrument has a faulty lid sensor that
+randomly pops a modal "Wallac 1420 Exception — LID OPEN ERROR" dialog
+which **deadlocks every measurement** until dismissed. The
+`lid_watcher.py` script polls for this dialog and auto-clicks Ignore.
+It is the **only remediation** for this hardware defect. `start_agent.bat`
+starts **both** `lid_watcher.py` (via `pythonw.exe`) AND `agent.py`. If
+you kill `python.exe` / `pythonw.exe` directly without then running
+`start_agent.bat`, the lid_watcher is left dead and the **next** lid
+error will wedge the instrument until a human intervenes at the console.
+
+**Operational checklist before any VM operation that touches instrument
+state:**
+
+1. VM SSH access is via **jump host**:
+   `ssh -J antonio@lambdabiolab-computer lambda@192.168.122.203`
+   (NOT `ssh lambdabiolab-computer` then `ssh lambda@…` — the host has
+   no key for the VM, only the workstation's jump config works.)
+2. To restart the agent, run `start_agent.bat` end-to-end via:
+   `powershell -NoProfile -Command "Start-Process -FilePath C:\install\start_agent.bat -WindowStyle Hidden"`
+3. After restart, **verify both** processes are alive:
+   `Get-Process python,pythonw -ErrorAction SilentlyContinue`
+   Expect **2 processes**: `python.exe` (agent) and `pythonw.exe` (lid_watcher).
+   If only `python.exe` is alive, the lid_watcher has died — see below.
+4. If `pythonw.exe` keeps dying after `start_agent.bat`: run `lid_watcher.py`
+   directly with debug logging (`Get-Content C:\Users\Public\lid_watcher.log -Tail 20`)
+   to diagnose. Known intermittent issue on Win7 + Python 3.8.
+
+**Related rule:** The `start_agent.bat` kills ALL python.exe/pythonw.exe
+processes on the VM before starting fresh. If you have other Python
+scripts running, they will be killed too.
+
+**Known cause of pythonw death:** Even when `lid_watcher.py` logs
+`lid_watcher started` successfully, the `pythonw.exe` process can die
+silently within a few seconds on Win7. The `python.exe` (console) variant
+appears to survive. If `pythonw.exe` repeatedly dies, fall back to
+running `lid_watcher.py` via `python.exe -WindowStyle Hidden` until
+the root cause is resolved.
+
+**File paths on the VM:**
+- Agent: `C:\install\agent.py`
+- Lid watcher: `C:\install\lid_watcher.py`
+- Restart script: `C:\install\start_agent.bat` — ALWAYS USE THIS
+- Full-stack cold start (incl. MlrMgr): `C:\install\start-stack.bat`
+- Lid watcher log: `C:\Users\Public\lid_watcher.log`
+- Abort flag (triggers ABORT click on next error): `C:\Users\Public\abort.flag`
+- Git repo on host: `~/repos/wallac-victor2-api/`
+- Git repo for ops: `~/repos/wallac-victor2-linux/` (see
+  `host-config/VM-OPERATIONS.md` for full VM access reference)
