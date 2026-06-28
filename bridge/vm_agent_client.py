@@ -118,6 +118,27 @@ class VmAgentClient:
 
     # --- Protocol PlateMap ---
 
+    def clone_protocol(self, template_id: int, new_id: int, name: str) -> dict[str, Any]:
+        """POST /mdb/protocols — clone a protocol with a new ID.
+
+        The OEM software caches protocols in memory and doesn't re-read the
+        PlateMap from the MDB. Cloning with a new ID forces a fresh read.
+        """
+        body = {
+            "_template_id": template_id,
+            "AssayProtID": new_id,
+            "ProtName": name,
+            "ProtNumber": new_id,
+            "ProtVersion": 1,
+            "FactoryPreset": False,
+            "ProtGroup": 103,  # Photometry group
+        }
+        return self._request("POST", "/mdb/protocols", body=body)
+
+    def delete_protocol(self, protocol_id: int) -> dict[str, Any]:
+        """DELETE /mdb/protocols/{id} — remove a cloned protocol."""
+        return self._request("DELETE", f"/mdb/protocols/{protocol_id}")
+
     def update_plate_map(self, protocol_id: int, wells: list[str]) -> dict[str, Any]:
         """PATCH /mdb/protocols/{id}/plate_map — set which wells to measure.
 

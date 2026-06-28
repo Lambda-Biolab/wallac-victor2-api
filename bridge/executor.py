@@ -230,9 +230,11 @@ class BridgeExecutor:
             return
         job.add_event("protocol_matched", protocol_name)
 
-        # Update the protocol's PlateMap to match the layout spec's wells.
-        # The protocol's default PlateMap may only enable a subset of wells;
-        # the layout spec defines which wells the user actually selected.
+        # Clone the matched protocol with a new ID and update its PlateMap.
+        # The OEM software (MlrMgr) caches protocols in memory and doesn't
+        # re-read the PlateMap from the MDB when a run starts. By cloning
+        # with a new ID, the OEM software is forced to read it fresh.
+        cloned_proto_id = 0
         if layout_spec:
             wells = [
                 w.get("well_name", w.get("name", ""))
@@ -242,23 +244,32 @@ class BridgeExecutor:
             if wells:
                 try:
                     proto = self.vm_agent.get_protocol(protocol_name)
-                    proto_id = proto.get("id", 0)
-                    if proto_id:
-                        self.vm_agent.update_plate_map(proto_id, wells)
-                        job.add_event("plate_map_updated", f"{len(wells)} wells")
-                except Exception as e:
-                    job.add_event("plate_map_update_failed", str(e))
-                    logger.warning("PlateMap update failed for %s: %s", protocol_name, e)
+                    template_id = proto.get("id", 0)
+                    if template_id:
+                        import time as _time
 
-        # Resolve and start the run
-        job.add_event("starting_run", protocol_name)
+                        cloned_proto_id = int(_time.time()) % 100000 + 2001000
+                        clone_name = f"ELAB-Run-{cloned_proto_id}"
+                        self.vm_agent.clone_protocol(template_id, cloned_proto_id, clone_name)
+                        self.vm_agent.update_plate_map(cloned_proto_id, wells)
+                        job.add_event("protocol_cloned", f"id={cloned_proto_id} wells={len(wells)}")
+                except Exception as e:
+                    job.add_event("protocol_clone_failed", str(e))
+                    logger.warning("Protocol clone failed for %s: %s", protocol_name, e)
+                    cloned_proto_id = 0
+
+        # Resolve and start the run — use cloned protocol ID if available,
+        # otherwise fall back to the original protocol name.
+        run_protocol = cloned_proto_id if cloned_proto_id else protocol_name
+        job.add_event("starting_run", str(run_protocol))
         try:
-            run_resp = self.vm_agent.start_run(protocol_name)
+            run_resp = self.vm_agent.start_run(run_protocol)
             run_id = run_resp.get("run_id", "")
             if not run_id:
                 job.status = "failed"
                 job.error = f"No run_id in response: {run_resp}"
                 job.add_event("execution_failed", job.error)
+                self._cleanup_cloned_protocol(cloned_proto_id)
                 return
             job.run_id = run_id
             job.add_event("run_started", run_id)
@@ -266,17 +277,29 @@ class BridgeExecutor:
             job.status = "failed"
             job.error = f"Failed to start run: {e}"
             job.add_event("execution_failed", job.error)
+            self._cleanup_cloned_protocol(cloned_proto_id)
             return
 
         # Poll for completion
         self._poll_run(job, run_id)
-        if job.status in ("failed", "aborted"):
-            return
 
         # Fetch results and run analysis
         self._fetch_and_writeback(job, run_id, layout_spec, analysis_spec)
 
+        # Clean up the cloned protocol
+        self._cleanup_cloned_protocol(cloned_proto_id)
+
     # --- Shared helpers ---
+
+    def _cleanup_cloned_protocol(self, proto_id: int) -> None:
+        """Delete a cloned protocol after the run. Best-effort."""
+        if not proto_id:
+            return
+        try:
+            self.vm_agent.delete_protocol(proto_id)
+            logger.info("Cleaned up cloned protocol %s", proto_id)
+        except Exception as e:
+            logger.warning("Failed to clean up cloned protocol %s: %s", proto_id, e)
 
     def _poll_run(self, job: Job, run_id: str) -> None:
         """Poll vm-agent for run completion. Updates job.status.
@@ -352,17 +375,26 @@ class BridgeExecutor:
         layout_spec: dict[str, Any] | None = None,
         analysis_spec_dict: dict[str, Any] | None = None,
     ) -> None:
-        """Fetch results from vm-agent, run analysis, write back to eLabFTW."""
-        job.add_event("fetching_results", run_id)
-        try:
-            results = self.vm_agent.get_run_results(run_id)
-        except VmAgentError as e:
-            job.status = "failed"
-            job.error = f"Failed to fetch results: {e}"
-            job.add_event("execution_failed", job.error)
-            return
+        """Fetch results from vm-agent, run analysis, write back to eLabFTW.
 
-        raw_wells = results.get("wells", results.get("data", []))
+        Retries fetching results because the OEM app doesn't flush them to
+        the MDB immediately after IsMeasured flips.
+        """
+        job.add_event("fetching_results", run_id)
+        raw_wells: list[dict[str, Any]] = []
+        for _ in range(8):
+            try:
+                results = self.vm_agent.get_run_results(run_id)
+            except VmAgentError as e:
+                job.status = "failed"
+                job.error = f"Failed to fetch results: {e}"
+                job.add_event("execution_failed", job.error)
+                return
+            raw_wells = results.get("wells", results.get("data", []))
+            if raw_wells:
+                break
+            time.sleep(2.0)  # OEM app hasn't flushed yet
+
         job.add_event("results_fetched", f"{len(raw_wells)} wells")
 
         # Run analysis if we have layout + analysis specs
