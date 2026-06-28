@@ -33,7 +33,7 @@ from .vm_agent_client import VmAgentClient, VmAgentError
 logger = logging.getLogger(__name__)
 
 # Poll interval for vm-agent run status (seconds)
-POLL_INTERVAL = 2.0
+POLL_INTERVAL = 1.0
 # Maximum time to wait for a run to complete (seconds)
 POLL_TIMEOUT = 600.0
 
@@ -367,12 +367,12 @@ class BridgeExecutor:
 
             state = run.get("state", "").lower()
 
-            # Fetch live results every ~3s for real-time heatmap.
+            # Fetch live results every ~1s for real-time heatmap.
             # The vm-agent's live buffer shows only the most recently measured
             # well, so we accumulate across polls. Filter to only accept wells
             # in the measured set to avoid stale data from the previous run.
             now = time.monotonic()
-            if now - last_live_fetch >= 3.0:
+            if now - last_live_fetch >= 1.0:
                 last_live_fetch = now
                 try:
                     live = self.vm_agent.get_run_results(run_id)
