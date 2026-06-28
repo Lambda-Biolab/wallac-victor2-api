@@ -552,7 +552,8 @@ class BridgeExecutor:
         """
         mode = method_spec.get("mode", "")
 
-        # Get the list of factory presets from the vm-agent
+        # Get the list of all protocols from the vm-agent
+        # (includes both factory presets and custom protocols like OD600)
         try:
             prots_resp = self.vm_agent.get_protocols()
             prots = (
@@ -560,7 +561,7 @@ class BridgeExecutor:
                 if isinstance(prots_resp, dict)
                 else prots_resp
             )
-            factory_presets = [p for p in prots if p.get("factory_preset")]
+            all_protocols = prots
         except Exception:
             return ""
 
@@ -592,12 +593,12 @@ class BridgeExecutor:
             target = f"Absorbance @ {wavelength} ({time_str}s)"
 
             # Try exact match first
-            for p in factory_presets:
+            for p in all_protocols:
                 if p["name"] == target:
                     return p["name"]
 
             # Fallback: match by wavelength only (ignore read time)
-            for p in factory_presets:
+            for p in all_protocols:
                 if "Absorbance" in p["name"] and f"@ {wavelength}" in p["name"]:
                     return p["name"]
 
@@ -637,12 +638,12 @@ class BridgeExecutor:
             target = f"{dye_name} ({ex_wl}nm/{em_wl}nm, {time_str}s)"
 
             # Try exact match first
-            for p in factory_presets:
+            for p in all_protocols:
                 if p["name"] == target:
                     return p["name"]
 
             # Fallback: match by dye name + wavelengths (ignore read time)
-            for p in factory_presets:
+            for p in all_protocols:
                 if (
                     dye_name in p["name"]
                     and ex_wl in p["name"]
@@ -653,7 +654,7 @@ class BridgeExecutor:
                     return p["name"]
 
             # Last resort: any match with dye name + wavelengths
-            for p in factory_presets:
+            for p in all_protocols:
                 if dye_name in p["name"] and ex_wl in p["name"] and em_wl in p["name"]:
                     return p["name"]
 
@@ -667,7 +668,7 @@ class BridgeExecutor:
 
         elif mode == "luminescence":
             # Single luminescence protocol
-            for p in factory_presets:
+            for p in all_protocols:
                 if p["name"] == "Luminescence":
                     return p["name"]
 
