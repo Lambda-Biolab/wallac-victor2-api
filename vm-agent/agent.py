@@ -264,7 +264,7 @@ _monitor_lock = threading.Lock()
 
 
 class Monitor(threading.Thread):
-    def __init__(self, interval=1.0):
+    def __init__(self, interval=0.1):
         super().__init__(daemon=True)
         self.interval = interval
         self._srv = None
@@ -280,8 +280,10 @@ class Monitor(threading.Thread):
         import comtypes
 
         comtypes.CoInitialize()
+        cycle = 0
         while True:
-            snap = {"ts": now_iso(), "error": None}
+            cycle += 1
+            snap = {"ts": now_iso(), "error": None, "live_wells": []}
             try:
                 srv = self._ensure()
                 st = srv.GetState
@@ -293,10 +295,62 @@ class Monitor(threading.Thread):
                     is_error=bool(st.IsError),
                     is_idle=bool(st.IsIdle),
                 )
+                # Temperature changes slowly; only poll every ~1s (every 10th
+                # cycle at 100ms) to keep the tight poll loop focused on
+                # GetLiveResult.
+                if cycle % 10 == 0:
+                    try:
+                        snap["target_temperature"] = float(srv.GetTargetTemperature)
+                    except Exception:  # noqa: BLE001
+                        snap["target_temperature"] = _monitor.get("target_temperature")
+                else:
+                    with _monitor_lock:
+                        snap["target_temperature"] = _monitor.get("target_temperature")
+                # Poll live results from the monitor thread (separate COM
+                # connection that is NOT blocked by the worker thread's
+                # running assay). The live buffer only holds the MOST RECENT
+                # well measured, so we accumulate across polls and reset when
+                # the assay_id changes (= new run started).
                 try:
-                    snap["target_temperature"] = float(srv.GetTargetTemperature)
+                    live = srv.GetLiveResult
+                    _ = live.Top
+                    current_wells = []
+                    while bool(live.IsValid):
+                        current_wells.append({
+                            "well": str(live.GetWellAddress),
+                            "counts": int(live.GetCounts),
+                            "result_type": int(live.GetResultType),
+                            "plate": int(live.GetPlateIndex),
+                            "plate_repeat": int(live.GetPlateRepeatIndex),
+                            "assay_id": int(live.GetAssayID),
+                        })
+                        if not bool(live.Next):
+                            break
+                    if current_wells:
+                        latest = current_wells[0]
+                        latest_assay = latest.get("assay_id", 0)
+                        with _monitor_lock:
+                            prev = list(_monitor.get("live_wells", []))
+                            prev_assay = prev[0].get("assay_id", 0) if prev else 0
+                        if latest_assay != prev_assay:
+                            # New run started; reset accumulation
+                            snap["live_wells"] = current_wells
+                        elif snap.get("is_running"):
+                            # Same run; merge new wells (dedup by well name)
+                            seen = {w["well"] for w in prev}
+                            merged = list(prev)
+                            for w in current_wells:
+                                if w["well"] not in seen:
+                                    merged.append(w)
+                                    seen.add(w["well"])
+                            snap["live_wells"] = merged
+                        else:
+                            snap["live_wells"] = current_wells
+                    else:
+                        with _monitor_lock:
+                            snap["live_wells"] = _monitor.get("live_wells", [])
                 except Exception:  # noqa: BLE001
-                    snap["target_temperature"] = None
+                    pass
             except Exception as exc:  # noqa: BLE001
                 self._srv = None
                 snap.update(connected=False, error=f"{type(exc).__name__}: {exc}")
@@ -588,6 +642,7 @@ def op_results(srv):
                     "result_type": int(live.GetResultType),
                     "plate": int(live.GetPlateIndex),
                     "plate_repeat": int(live.GetPlateRepeatIndex),
+                    "assay_id": int(live.GetAssayID),
                 }
             )
             if not bool(live.Next):
@@ -1670,20 +1725,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def _run_wells(self, run_id, meta):
         """Resolve (wells_raw, source) for a run: persisted DB rows once
-        measured/aborted, else the live buffer (re-resolving if it just
-        transitioned and the live buffer is already cleared)."""
-        w = self.server.worker
+        measured/aborted, else live wells from the monitor thread (which
+        has its own COM connection and is NOT blocked by the running assay)."""
         if meta.get("state") in ("measured", "aborted"):
             return self._persisted_wells(meta["protocol_id"], meta.get("assay_id") or 0)
-        wells = w.call(op_results, timeout=40).get("wells", [])
-        if wells:
-            return wells, "live"
-        with _runs_lock:  # may have flipped to measured since the snapshot
+        # Read live wells from the monitor snapshot (updated by the monitor
+        # thread's own COM connection, which works during runs).
+        with _monitor_lock:
+            snap = dict(_monitor)
+        live_wells = snap.get("live_wells", [])
+        if live_wells:
+            return live_wells, "live"
+        # Monitor snapshot empty; try the worker thread as a fallback (it
+        # can process COM calls during a run — NewAssay is non-blocking).
+        w = self.server.worker
+        worker_result = w.call(op_results, timeout=3).get("wells", [])
+        if worker_result:
+            return worker_result, "live"
+        # May have transitioned to measured since the snapshot
+        with _runs_lock:
             cur = _runs.get(run_id) or {}
             st2, aid2 = cur.get("state"), (cur.get("assay_id") or 0)
         if st2 in ("measured", "aborted"):
             return self._persisted_wells(meta["protocol_id"], aid2)
-        return wells, "live"
+        return [], "live"
 
     def _run_results(self, run_id, export=False):
         """Results for a run. Streams the live buffer while running; once the
