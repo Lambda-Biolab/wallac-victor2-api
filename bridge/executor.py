@@ -236,19 +236,18 @@ class BridgeExecutor:
         # with a new ID, the OEM software is forced to read it fresh.
         cloned_proto_id = 0
         if layout_spec:
+            # Only include wells with role "measured" — skip "excluded" and "skipped"
             wells = [
                 w.get("well_name", w.get("name", ""))
                 for w in layout_spec.get("wells", [])
-                if w.get("well_name", w.get("name", ""))
+                if w.get("well_name", w.get("name", "")) and w.get("role", "measured") == "measured"
             ]
             if wells:
                 try:
                     proto = self.vm_agent.get_protocol(protocol_name)
                     template_id = proto.get("id", 0)
                     if template_id:
-                        import time as _time
-
-                        cloned_proto_id = int(_time.time()) % 100000 + 2001000
+                        cloned_proto_id = int(time.time()) % 100000 + 2001000
                         clone_name = f"ELAB-Run-{cloned_proto_id}"
                         self.vm_agent.clone_protocol(template_id, cloned_proto_id, clone_name)
                         self.vm_agent.update_plate_map(cloned_proto_id, wells)
@@ -256,41 +255,35 @@ class BridgeExecutor:
                 except Exception as e:
                     job.add_event("protocol_clone_failed", str(e))
                     logger.warning("Protocol clone failed for %s: %s", protocol_name, e)
-                    cloned_proto_id = 0
+                    # Don't reset cloned_proto_id to 0 — if the clone was
+                    # created but PlateMap update failed, we still want to
+                    # clean it up later.
 
         # Resolve and start the run — use cloned protocol ID if available,
         # otherwise fall back to the original protocol name.
         run_protocol = cloned_proto_id if cloned_proto_id else protocol_name
-        job.add_event("starting_run", str(run_protocol))
         try:
+            job.add_event("starting_run", str(run_protocol))
             run_resp = self.vm_agent.start_run(run_protocol)
             run_id = run_resp.get("run_id", "")
             if not run_id:
                 job.status = "failed"
                 job.error = f"No run_id in response: {run_resp}"
                 job.add_event("execution_failed", job.error)
-                self._cleanup_cloned_protocol(cloned_proto_id)
                 return
             job.run_id = run_id
             job.add_event("run_started", run_id)
-        except VmAgentError as e:
-            job.status = "failed"
-            job.error = f"Failed to start run: {e}"
-            job.add_event("execution_failed", job.error)
+
+            # Poll for completion
+            self._poll_run(job, run_id)
+            if job.status in ("failed", "aborted"):
+                return
+
+            # Fetch results and run analysis
+            self._fetch_and_writeback(job, run_id, layout_spec, analysis_spec)
+        finally:
+            # Always clean up the cloned protocol, even on exception.
             self._cleanup_cloned_protocol(cloned_proto_id)
-            return
-
-        # Poll for completion
-        self._poll_run(job, run_id)
-        if job.status in ("failed", "aborted"):
-            self._cleanup_cloned_protocol(cloned_proto_id)
-            return
-
-        # Fetch results and run analysis
-        self._fetch_and_writeback(job, run_id, layout_spec, analysis_spec)
-
-        # Clean up the cloned protocol
-        self._cleanup_cloned_protocol(cloned_proto_id)
 
     # --- Shared helpers ---
 
@@ -422,6 +415,13 @@ class BridgeExecutor:
 
         job.add_event("results_fetched", f"{len(raw_wells)} wells")
 
+        # Normalize well names (A01 → A1) so they're consistent across
+        # the heatmap, analysis pipeline, and raw JSON attachment.
+        for w in raw_wells:
+            wn = w.get("well", "")
+            if wn:
+                w["well"] = _normalize_well_name(wn)
+
         # Run analysis if we have layout + analysis specs
         analyzed_csv = ""
         if layout_spec and analysis_spec_dict:
@@ -431,12 +431,6 @@ class BridgeExecutor:
                     name = well.get("well_name", well.get("name", ""))
                     if name:
                         layout_wells[_normalize_well_name(name)] = well
-
-                # Normalize raw well names too so they match layout keys
-                for w in raw_wells:
-                    wn = w.get("well", "")
-                    if wn:
-                        w["well"] = _normalize_well_name(wn)
 
                 spec = AnalysisSpec.from_dict(analysis_spec_dict)
                 analysis_result = self.analysis.run(raw_wells, layout_wells, spec)
