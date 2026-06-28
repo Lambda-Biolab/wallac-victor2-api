@@ -282,6 +282,9 @@ class BridgeExecutor:
 
         # Poll for completion
         self._poll_run(job, run_id)
+        if job.status in ("failed", "aborted"):
+            self._cleanup_cloned_protocol(cloned_proto_id)
+            return
 
         # Fetch results and run analysis
         self._fetch_and_writeback(job, run_id, layout_spec, analysis_spec)
@@ -306,19 +309,33 @@ class BridgeExecutor:
 
         Also fetches live results every few seconds so the Run Builder
         can display a real-time heatmap of wells as they are measured.
+
+        Abort handling: the vm-agent rejects aborts for runs younger than
+        60s (aborting earlier wedges the instrument). If abort is requested
+        while the run is too young, we keep polling and retry once the
+        60s threshold is reached. If the run completes before then, we
+        accept the result.
         """
         deadline = time.monotonic() + POLL_TIMEOUT
         last_live_fetch = 0.0
+        abort_tried = False
         while time.monotonic() < deadline:
-            if job.abort_requested:
+            if job.abort_requested and not abort_tried:
                 try:
                     self.vm_agent.abort_run(run_id)
                     job.add_event("abort_sent", run_id)
+                    abort_tried = True
+                except VmAgentError as e:
+                    if e.status_code == 425:
+                        # Too early to abort — keep polling, retry next iteration.
+                        # The 425 response includes how many seconds to wait.
+                        pass
+                    else:
+                        job.add_event("abort_failed", str(e))
+                        abort_tried = True
                 except Exception as e:
                     job.add_event("abort_failed", str(e))
-                job.status = "aborted"
-                job.add_event("execution_aborted")
-                return
+                    abort_tried = True
 
             try:
                 run = self.vm_agent.get_run(run_id)
@@ -352,14 +369,22 @@ class BridgeExecutor:
             # vm-agent terminal states: "measured" (completed successfully),
             # "completed", "done", "finished"
             if state in ("measured", "completed", "done", "finished"):
-                job.add_event("run_completed", state)
+                if job.abort_requested and abort_tried:
+                    job.status = "aborted"
+                    job.add_event("execution_aborted", "run stopped")
+                else:
+                    job.add_event("run_completed", state)
                 return
 
             # Error states: "error", "failed", "aborted"
             if state in ("error", "failed", "aborted"):
-                job.status = "failed"
-                job.error = f"Instrument run failed: state={state}"
-                job.add_event("execution_failed", job.error)
+                if job.abort_requested and abort_tried and state == "aborted":
+                    job.status = "aborted"
+                    job.add_event("execution_aborted")
+                else:
+                    job.status = "failed"
+                    job.error = f"Instrument run failed: state={state}"
+                    job.add_event("execution_failed", job.error)
                 return
 
             time.sleep(POLL_INTERVAL)
