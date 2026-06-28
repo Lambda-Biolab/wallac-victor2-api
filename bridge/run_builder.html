@@ -982,9 +982,25 @@ async function finalizeAll() {
 async function submitToBridge() {
   if (!bridgeUrl) { showStatus('Set the Bridge URL in settings first', 'error'); return; }
 
+  const mode = document.getElementById('jobMode') ? document.getElementById('jobMode').value : 'existing_protocol';
+
+  // Validate required fields before submitting
+  if (mode === 'existing_protocol') {
+    const protoName = document.getElementById('jobProtocolName') ? document.getElementById('jobProtocolName').value : '';
+    if (!protoName) {
+      showStatus('Select a protocol name for existing_protocol mode', 'error');
+      return;
+    }
+  } else if (mode === 'generated_protocol') {
+    if (!savedMethod) {
+      showStatus('Save a Method before submitting (Step 1)', 'error');
+      return;
+    }
+  }
+
   const jobSpec = {
     title: savedJob ? savedJob.title : (savedMethod ? savedMethod.title : 'Untitled Run'),
-    execution_mode: document.getElementById('jobMode') ? document.getElementById('jobMode').value : 'existing_protocol',
+    execution_mode: mode,
     protocol_name: document.getElementById('jobProtocolName') ? document.getElementById('jobProtocolName').value : '',
     expected_outputs: document.getElementById('jobExpectedOutputs') ? document.getElementById('jobExpectedOutputs').value : '',
   };
