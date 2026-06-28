@@ -191,6 +191,7 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
 
     <div class="btn-row">
       <button class="btn btn-primary" onclick="saveMethod()">Save Method</button>
+      <button class="btn btn-primary" onclick="goToStep(2)">Next →</button>
     </div>
 
     <div id="methodList"></div>
@@ -390,6 +391,7 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
 
     <div class="btn-row">
       <button class="btn btn-secondary" onclick="goToStep(4)">Back</button>
+      <button class="btn btn-primary" onclick="goToStep(5)">Review →</button>
     </div>
   </div>
 </div>
@@ -583,6 +585,19 @@ function showStatus(msg, type) {
 
 // --- Stepper ---
 function goToStep(n) {
+  // Prevent skipping ahead without saving required steps
+  if (n > 1 && !savedMethod) {
+    showStatus('Save a Method (Step 1) before proceeding', 'error');
+    return;
+  }
+  if (n > 2 && !savedLayout) {
+    showStatus('Save a Plate Layout (Step 2) before proceeding', 'error');
+    return;
+  }
+  if (n > 3 && !savedAnalysis) {
+    showStatus('Save an Analysis Plan (Step 3) before proceeding', 'error');
+    return;
+  }
   for (let i = 1; i <= 5; i++) {
     document.getElementById('step' + i).classList.toggle('hidden', i !== n);
   }
