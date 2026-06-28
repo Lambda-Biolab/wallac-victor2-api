@@ -238,11 +238,20 @@ class BridgeExecutor:
         run_proto_id = 0  # for start_run (only set if clone + PlateMap both succeed)
         if layout_spec:
             # Only include wells with role "measured" — skip "excluded" and "skipped"
+            all_layout_wells = layout_spec.get("wells", [])
             wells = [
                 w.get("well_name", w.get("name", ""))
-                for w in layout_spec.get("wells", [])
+                for w in all_layout_wells
                 if w.get("well_name", w.get("name", "")) and w.get("role", "measured") == "measured"
             ]
+            role_counts: dict[str, int] = {}
+            for w in all_layout_wells:
+                r = w.get("role", "measured")
+                role_counts[r] = role_counts.get(r, 0) + 1
+            job.add_event(
+                "layout_wells_analyzed",
+                f"total={len(all_layout_wells)} measured={len(wells)} roles={role_counts}",
+            )
             if wells:
                 try:
                     proto = self.vm_agent.get_protocol(protocol_name)
@@ -344,7 +353,9 @@ class BridgeExecutor:
 
             state = run.get("state", "").lower()
 
-            # Fetch live results every ~3s for real-time heatmap
+            # Fetch live results every ~3s for real-time heatmap.
+            # The vm-agent's live buffer may only contain recently measured
+            # wells, so we accumulate across polls to build the full picture.
             now = time.monotonic()
             if now - last_live_fetch >= 3.0:
                 last_live_fetch = now
@@ -352,14 +363,17 @@ class BridgeExecutor:
                     live = self.vm_agent.get_run_results(run_id)
                     wells = live.get("wells", live.get("data", []))
                     if wells:
-                        job.live_wells = [
-                            {
-                                "well": _normalize_well_name(w.get("well", w.get("well_name", ""))),
-                                "od": w.get("od"),
-                                "counts": w.get("counts"),
-                            }
-                            for w in wells
-                        ]
+                        # Merge new wells into existing live_wells (new overwrites old)
+                        existing = {w["well"]: w for w in job.live_wells}
+                        for w in wells:
+                            name = _normalize_well_name(w.get("well", w.get("well_name", "")))
+                            if name:
+                                existing[name] = {
+                                    "well": name,
+                                    "od": w.get("od"),
+                                    "counts": w.get("counts"),
+                                }
+                        job.live_wells = list(existing.values())
                 except Exception:
                     pass  # live fetch is best-effort
 
