@@ -155,13 +155,13 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
     <div id="photometrySettings" class="form-group">
       <label>Filter</label>
       <select id="photoFilter">
-        <option value="P610">P610 — 610nm (OD600)</option>
         <option value="P405">P405 — 405nm</option>
         <option value="P450">P450 — 450nm</option>
         <option value="P490">P490 — 490nm</option>
         <option value="P260">P260 — 260nm</option>
         <option value="P280">P280 — 280nm</option>
       </select>
+      <p class="hint">Note: P610 (OD600) filter is installed but no matching instrument protocol exists. Use an existing_protocol run for OD600.</p>
       <label style="margin-top:8px">Read time (seconds)</label>
       <input type="number" id="photoReadTime" value="1.0" step="0.1" min="0.1" />
     </div>
