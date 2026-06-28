@@ -224,6 +224,28 @@ dedicated service identity:
 accepts both `$2b$` and `$2y$`, but use `$2y$` for consistency with
 eLabFTW's existing keys.
 
+### Deployed service identity (2026-06-28)
+
+The bridge now uses a dedicated service identity instead of the sysadmin's
+API key:
+
+- **User:** userid=2, "Wallac Bridge" `<wallac-bridge@lambdabiolab.local>`,
+  non-sysadmin, team=1 (Lambda Biolab)
+- **API key:** id=7, name=`wallac-bridge-service`, `can_write=1`
+- **Config:** `/etc/wallac-bridge/bridge.env` on lambdabiolab-computer
+  contains `WALLAC_ELABFTW_API_KEY=7-<secret>`
+- **Old keys deleted:** id=5 (old service key with unrecoverable secret)
+
+The service user can: list/read items (`?type=` not `?cat=` — see gotcha
+#6 above), create experiments, upload files, read events. Verified
+end-to-end: job submitted → run completed → writeback to eLabFTW.
+
+**Systemd service fix:** `wallac-bridge.service` was running `main.py`
+(the old poll-based daemon). Updated `ExecStart` to run the direct-submit
+FastAPI app via uvicorn on port 8423, matching the designer service pattern.
+The old `main.py` daemon is retained for the dashboard (port 8421) but
+is not the primary bridge entry point in the direct-submit architecture.
+
 ## VM Agent Restart — always use start_agent.bat (NEVER taskkill solo)
 
 **Rule (MANDATORY, NON-NEGOTIABLE):** When restarting the vm-agent on the
