@@ -430,8 +430,9 @@ async function checkBookingStatus() {
     const startStr = now.toISOString().slice(0, 10);
     const endStr = end.toISOString().slice(0, 10);
 
+    // Use the designer backend as a proxy to avoid browser cert/mixed-content issues
     const resp = await fetch(
-      `${elabftwUrl}/api/v2/events?items_id=${INSTRUMENT_ITEM_ID}&start=${startStr}&end=${endStr}`,
+      `/elabftw/events?items_id=${INSTRUMENT_ITEM_ID}&start=${startStr}&end=${endStr}`,
       { headers: authHeaders() }
     );
     if (!resp.ok) throw new Error(`${resp.status}`);

@@ -231,6 +231,46 @@ def _register_crud_endpoints(
     )
 
 
+def _register_elabftw_proxy(app: FastAPI, config: Any) -> None:
+    """Register a proxy endpoint for eLabFTW API calls.
+
+    The Run Builder is served over HTTP but eLabFTW uses HTTPS with a
+    self-signed cert. Browsers block cross-origin fetches to HTTPS with
+    untrusted certs. This proxy lets the browser call same-origin HTTP.
+    """
+    import json as _json
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    @app.get("/elabftw/events")
+    def get_elabftw_events(items_id: int, start: str = "", end: str = "") -> list:
+        if not config:
+            raise HTTPException(status_code=503, detail="No eLabFTW config")
+
+        params = f"?items_id={items_id}"
+        if start:
+            params += f"&start={start}"
+        if end:
+            params += f"&end={end}"
+
+        url = f"{config.elabftw_url}/api/v2/events{params}"
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", config.elabftw_api_key)
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        try:
+            with urllib.request.urlopen(req, context=ctx) as resp:
+                return _json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            raise HTTPException(status_code=e.code, detail=str(e.read().decode()[:200])) from e
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"eLabFTW unreachable: {e}") from e
+
+
 # --- App factory ---
 
 
@@ -281,6 +321,8 @@ def create_designer_app(
             "bridge_url": os.environ.get("WALLAC_BRIDGE_URL", ""),
             "vm_agent_url": config.vm_agent_url if config else "",
         }
+
+    _register_elabftw_proxy(app, config)
 
     @app.get("/run-builder")
     def run_builder() -> Any:
