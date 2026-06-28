@@ -27,8 +27,8 @@ jobs:
       - name: Install tools and test dependencies
         run: |
           uv pip install --system \
-            ruff \
-            complexipy \
+            ruff==0.15.15 \
+            complexipy==5.5.0 \
             pytest \
             fastapi \
             httpx \
