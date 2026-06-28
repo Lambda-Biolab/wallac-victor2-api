@@ -214,6 +214,7 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
           <div class="legend-item"><div class="legend-swatch" style="background:var(--yellow)"></div>Blank</div>
           <div class="legend-item"><div class="legend-swatch" style="background:var(--green)"></div>Pos. control</div>
           <div class="legend-item"><div class="legend-swatch" style="background:var(--blue)"></div>Neg. control</div>
+          <div class="legend-item"><div class="legend-swatch" style="background:#e6194b"></div>Sample/group colors</div>
         </div>
       </div>
 
@@ -245,8 +246,7 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
 
     <div class="btn-row">
       <button class="btn btn-secondary" onclick="goToStep(1)">Back</button>
-      <button class="btn btn-primary" onclick="saveLayout()">Save Layout</button>
-      <button class="btn btn-primary" onclick="goToStep(3)">Next →</button>
+      <button class="btn btn-primary" onclick="saveLayoutAndNext()">Next →</button>
     </div>
   </div>
 
@@ -708,6 +708,25 @@ let dragStart = null;  // {row, col}
 let dragEnd = null;
 let selectedWells = new Set();
 
+// Color palette for sample names and replicate groups
+const SAMPLE_COLORS = [
+  '#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4',
+  '#46f0f0', '#f032e6', '#bcf60c', '#fabebe', '#008080', '#e6beff',
+  '#9a6324', '#fffac8', '#800000', '#aaffc3', '#808000', '#ffd8b1',
+  '#000075', '#808080',
+];
+const sampleColorMap = {};
+let sampleColorIdx = 0;
+
+function colorForSample(sampleName) {
+  if (!sampleName) return null;
+  if (!(sampleName in sampleColorMap)) {
+    sampleColorMap[sampleName] = SAMPLE_COLORS[sampleColorIdx % SAMPLE_COLORS.length];
+    sampleColorIdx++;
+  }
+  return sampleColorMap[sampleName];
+}
+
 function renderPlate() {
   const grid = document.getElementById('plateGrid');
   let html = '<div></div>';
@@ -718,7 +737,22 @@ function renderPlate() {
       const name = `${r}${c}`;
       const w = plateWells[name];
       let cls = 'well ' + (w.control_type || w.role);
-      html += `<div class="${cls}" data-well="${name}" data-row="${r}" data-col="${c}">${c}</div>`;
+      let style = '';
+
+      // If well has a sample name, color by sample
+      if (w.sample_name && w.role !== 'skipped') {
+        const color = colorForSample(w.sample_name);
+        style = ` style="background:${color}; color:#fff;"`;
+        cls = 'well';
+      }
+      // If well has a replicate group (but no sample name), color by group
+      else if (w.replicate_group && w.role !== 'skipped') {
+        const color = colorForSample('group:' + w.replicate_group);
+        style = ` style="background:${color}; color:#fff;"`;
+        cls = 'well';
+      }
+
+      html += `<div class="${cls}" data-well="${name}" data-row="${r}" data-col="${c}"${style}>${c}</div>`;
     }
   }
   grid.innerHTML = html;
@@ -841,12 +875,24 @@ function applyToSelected(field, value) {
 function applyReplicateToSelected() {
   const val = document.getElementById('multiReplicateGroup').value;
   for (const name of selectedWells) plateWells[name].replicate_group = val;
+  renderPlate();
+  // Re-highlight selected wells
+  document.querySelectorAll('.well').forEach(el => {
+    el.classList.toggle('dragging', selectedWells.has(el.dataset.well));
+  });
+  showMultiSelectDetail();
   showStatus(`Set replicate group "${val}" on ${selectedWells.size} wells`, 'success');
 }
 
 function applySampleToSelected() {
   const val = document.getElementById('multiSampleName').value;
   for (const name of selectedWells) plateWells[name].sample_name = val;
+  renderPlate();
+  // Re-highlight selected wells
+  document.querySelectorAll('.well').forEach(el => {
+    el.classList.toggle('dragging', selectedWells.has(el.dataset.well));
+  });
+  showMultiSelectDetail();
   showStatus(`Set sample name "${val}" on ${selectedWells.size} wells`, 'success');
 }
 
@@ -883,7 +929,11 @@ function selectWell(name) {
 
 function updateWell(name, field, value) {
   plateWells[name][field] = value;
-  if (field === 'role' || field === 'control_type') renderPlate();
+  renderPlate();
+  // Re-highlight selected well
+  document.querySelectorAll('.well').forEach(el => {
+    el.classList.toggle('selected', el.dataset.well === name);
+  });
   if (selectedWell === name) selectWell(name);
 }
 
@@ -936,13 +986,19 @@ function buildLayoutSpec() {
 
 async function saveLayout() {
   const title = document.getElementById('layoutTitle').value;
-  if (!title) { showStatus('Enter a layout title', 'error'); return; }
+  if (!title) { showStatus('Enter a layout title', 'error'); return false; }
   const spec = buildLayoutSpec();
   try {
     const result = await api('POST', '/api/layouts', { title, spec });
     savedLayout = result;
     showStatus(`Layout saved: id=${result.item_id}`, 'success');
-  } catch (e) { showStatus('Failed: ' + e.message, 'error'); }
+    return true;
+  } catch (e) { showStatus('Failed: ' + e.message, 'error'); return false; }
+}
+
+async function saveLayoutAndNext() {
+  const ok = await saveLayout();
+  if (ok) goToStep(3);
 }
 
 // --- Step 3: Analysis ---
