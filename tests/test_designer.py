@@ -36,8 +36,31 @@ class MockDesignerClient:
         self._upload_data: dict[tuple[int, int], bytes] = {}
         self._next_upload_id = 5000
 
-    def list_items(self, category_id: int) -> list[dict[str, Any]]:
-        return [v for v in self._items.values() if v.get("category") == category_id]
+    def list_items(self, category_id: int, expected_schema: str = "") -> list[dict[str, Any]]:
+        items = [v for v in self._items.values() if v.get("category") == category_id]
+        if expected_schema:
+            filtered = []
+            for item in items:
+                meta = item.get("metadata")
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:
+                        meta = {}
+                if not isinstance(meta, dict):
+                    continue
+                ef = meta.get("extra_fields", {})
+                ds = ef.get("Designer spec", {})
+                spec_json = ds.get("value", "") if isinstance(ds, dict) else ""
+                if spec_json:
+                    try:
+                        spec = json.loads(spec_json)
+                        if spec.get("schema_name") == expected_schema:
+                            filtered.append(item)
+                    except Exception:
+                        pass
+            return filtered
+        return items
 
     def get_item(self, item_id: int) -> dict[str, Any]:
         if item_id not in self._items:

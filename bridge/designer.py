@@ -139,6 +139,14 @@ ATTACHMENT_NAMES: dict[str, str] = {
     "job": "job.json",
 }
 
+#: Maps category kind to the expected schema_name in the Designer spec.
+SCHEMA_NAMES: dict[str, str] = {
+    "method": "wallac.method",
+    "layout": "wallac.layout",
+    "analysis": "wallac.analysis",
+    "job": "wallac.job",
+}
+
 
 # --- Designer service -------------------------------------------------------
 
@@ -254,7 +262,8 @@ class DesignerService:
         """List all draft objects of a given kind."""
         self._validate_kind(kind)
         cat_id = self.categories[kind]
-        items = self.client.list_items(cat_id)
+        expected_schema = SCHEMA_NAMES.get(kind, "")
+        items = self.client.list_items(cat_id, expected_schema=expected_schema)
         drafts = []
         for item in items:
             try:

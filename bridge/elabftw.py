@@ -273,13 +273,15 @@ class ElabftwClient:
 
     # --- Designer methods (Stage 3: protocol authoring) ---
 
-    def list_items(self, category_id: int) -> list[dict[str, Any]]:
+    def list_items(self, category_id: int, expected_schema: str = "") -> list[dict[str, Any]]:
         """List all items created from a resource template.
 
         eLabFTW's ``?type=`` filter returns all items, not just those from
         the specified template. We filter client-side by checking for the
         ``Designer spec`` metadata field that the designer writes when
-        creating drafts.
+        creating drafts. If ``expected_schema`` is provided, also filter
+        by the ``schema_name`` field in the spec to prevent cross-contamination
+        (e.g. job items appearing in the methods list).
         """
         all_items = self._request("GET", f"/items?type={category_id}") or []
         result = []
@@ -288,8 +290,21 @@ class ElabftwClient:
             if meta is None:
                 continue
             ef = meta.get("extra_fields") or {}
-            if "Designer spec" in ef:
-                result.append(item)
+            if "Designer spec" not in ef:
+                continue
+            if expected_schema:
+                spec_json = ""
+                ds = ef.get("Designer spec")
+                if isinstance(ds, dict):
+                    spec_json = ds.get("value", "")
+                if spec_json:
+                    try:
+                        spec = json.loads(spec_json)
+                        if spec.get("schema_name") != expected_schema:
+                            continue
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+            result.append(item)
         return result
 
     def get_item(self, item_id: int) -> dict[str, Any]:
