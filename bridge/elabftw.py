@@ -276,10 +276,21 @@ class ElabftwClient:
     def list_items(self, category_id: int) -> list[dict[str, Any]]:
         """List all items created from a resource template.
 
-        Uses ``?type=`` because items created via the API with ``type`` may
-        not have ``category`` set in the ``items_categories`` table.
+        eLabFTW's ``?type=`` filter returns all items, not just those from
+        the specified template. We filter client-side by checking for the
+        ``Designer spec`` metadata field that the designer writes when
+        creating drafts.
         """
-        return self._request("GET", f"/items?type={category_id}") or []
+        all_items = self._request("GET", f"/items?type={category_id}") or []
+        result = []
+        for item in all_items:
+            meta = normalize_metadata(item.get("metadata"))
+            if meta is None:
+                continue
+            ef = meta.get("extra_fields") or {}
+            if "Designer spec" in ef:
+                result.append(item)
+        return result
 
     def get_item(self, item_id: int) -> dict[str, Any]:
         """Get a single item by ID."""
