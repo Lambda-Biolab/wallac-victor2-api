@@ -316,14 +316,16 @@ class Monitor(threading.Thread):
                     _ = live.Top
                     current_wells = []
                     while bool(live.IsValid):
-                        current_wells.append({
-                            "well": str(live.GetWellAddress),
-                            "counts": int(live.GetCounts),
-                            "result_type": int(live.GetResultType),
-                            "plate": int(live.GetPlateIndex),
-                            "plate_repeat": int(live.GetPlateRepeatIndex),
-                            "assay_id": int(live.GetAssayID),
-                        })
+                        current_wells.append(
+                            {
+                                "well": str(live.GetWellAddress),
+                                "counts": int(live.GetCounts),
+                                "result_type": int(live.GetResultType),
+                                "plate": int(live.GetPlateIndex),
+                                "plate_repeat": int(live.GetPlateRepeatIndex),
+                                "assay_id": int(live.GetAssayID),
+                            }
+                        )
                         if not bool(live.Next):
                             break
                     if current_wells:
@@ -1231,6 +1233,56 @@ def op_mdb_delete_protocol(assay_prot_id):
     return _op
 
 
+def op_mdb_update_plate_map(assay_prot_id, plate_map):
+    """Overwrite the PlateMap OLE Object field on a protocol row.
+
+    plate_map: list of 108 ints (12-byte header + 96-byte 8x12 grid).
+    Writes the entire blob via DAO AppendChunk. The field is cleared first
+    so AppendChunk replaces rather than concatenates.
+
+    args:
+        assay_prot_id: int protocol ID
+        plate_map: list[int] of 108 bytes
+    returns:
+        dict {"protocol_id": int, "bytes_written": int}
+    """
+    import array
+
+    def _op(_srv):
+        if len(plate_map) != 108:
+            raise ApiError(
+                400,
+                "invalid_plate_map",
+                f"plate_map must be 108 bytes (12 header + 96 grid); got {len(plate_map)}",
+            )
+        blob = array.array("B", [int(b) & 0xFF for b in plate_map])
+        db = _open_mdb_w()
+        try:
+            rs = db.OpenRecordset(
+                "SELECT PlateMap FROM AssayProtocol WHERE AssayProtID = " + str(int(assay_prot_id))
+            )
+            if rs.EOF:
+                raise ApiError(404, "protocol_not_found", f"AssayProtID {assay_prot_id} not found")
+            rs.Edit()
+            # Overwrite (not append): set the OLE Object field to empty first
+            # so AppendChunk starts from a clean state.
+            fld = rs.Fields("PlateMap")
+            with contextlib.suppress(Exception):
+                # may not support empty-byte assignment; AppendChunk still replaces
+                fld.Value = b""
+            fld.AppendChunk(blob)
+            rs.Update()
+            rs.Close()
+            return {
+                "protocol_id": int(assay_prot_id),
+                "bytes_written": len(blob),
+            }
+        finally:
+            db.Close()
+
+    return _op
+
+
 def op_mdb_backup(name):
     def _op(_srv):
         if not os.path.exists(MDB_BACKUP_DIR):
@@ -2031,6 +2083,43 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, {"error": "not_found", "hint": "see GET /docs", "path": path})
         except Exception as exc:  # noqa: BLE001
             self._com_error(exc)
+
+    def do_PATCH(self):
+        if not self._authorized():
+            self._send(
+                401, {"error": "unauthorized", "hint": "send 'Authorization: Bearer <token>'"}
+            )
+            return
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        parts = path.strip("/").split("/")
+        try:
+            if (
+                len(parts) == 4
+                and parts[0] == "mdb"
+                and parts[1] == "protocols"
+                and parts[3] == "plate_map"
+            ):
+                self._mdb_update_plate_map(parts[2])
+            else:
+                self._send(404, {"error": "not_found", "hint": "see GET /docs", "path": path})
+        except Exception as exc:  # noqa: BLE001
+            self._com_error(exc)
+
+    def _mdb_update_plate_map(self, assay_prot_id):
+        """PATCH /mdb/protocols/{id}/plate_map — overwrite the PlateMap blob.
+
+        Body: {"plate_map": [108 ints]} (12-byte header + 96-byte 8x12 grid).
+        """
+        try:
+            pid = int(assay_prot_id)
+        except ValueError:
+            raise ApiError(400, "invalid_id", "protocol id must be an integer") from None
+        body = self._read_json()
+        plate_map = body.get("plate_map")
+        if not isinstance(plate_map, list):
+            raise ApiError(400, "invalid_body", "plate_map must be a list of 108 ints")
+        result = self.server.worker.call(op_mdb_update_plate_map(pid, plate_map), timeout=30)
+        self._send(200, result)
 
     def _delete_run(self, run_id):
         """Forget a finished/failed/stuck run record (frees the 'busy' guard).
