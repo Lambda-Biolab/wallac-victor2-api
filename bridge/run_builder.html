@@ -130,8 +130,7 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
     <div class="step active" data-step="1" onclick="goToStep(1)">1. Method</div>
     <div class="step" data-step="2" onclick="goToStep(2)">2. Plate Layout</div>
     <div class="step" data-step="3" onclick="goToStep(3)">3. Analysis Plan</div>
-    <div class="step" data-step="4" onclick="goToStep(4)">4. Automation Job</div>
-    <div class="step" data-step="5" onclick="goToStep(5)">5. Review & Finalize</div>
+    <div class="step" data-step="4" onclick="goToStep(4)">4. Job & Submit</div>
   </div>
 
   <div id="statusArea"></div>
@@ -333,27 +332,8 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
     <div class="btn-row">
       <button class="btn btn-secondary" onclick="goToStep(3)">Back</button>
       <button class="btn btn-primary" onclick="saveJob()">Save Job</button>
-      <button class="btn btn-primary" onclick="goToStep(5)">Review →</button>
+      <button class="btn btn-primary" id="submitBtn" onclick="finalizeAndSubmit()" disabled>Submit to Bridge →</button>
     </div>
-  </div>
-
-  <!-- Step 5: Review & Finalize -->
-  <div class="panel hidden" id="step5">
-    <h2>Review & Finalize</h2>
-    <p class="subtitle">Finalize canonical JSON, then submit directly to the bridge for execution.</p>
-
-    <div class="summary-grid" id="reviewSummary"></div>
-
-    <div style="margin-top:16px;">
-      <h2>Actions</h2>
-      <p class="hint">Finalize computes the canonical JSON and attaches it with a SHA-256 hash. Then submit directly to the bridge — no eLabFTW signing required for quick runs.</p>
-      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
-        <button class="btn btn-primary" onclick="finalizeAll()">Finalize All</button>
-        <button class="btn btn-primary" id="submitBtn" onclick="submitToBridge()" disabled>Submit to Bridge →</button>
-      </div>
-    </div>
-
-    <div id="finalizeResults" style="margin-top:16px;"></div>
 
     <div id="jobStatus" class="hidden" style="margin-top:16px;">
       <h2>Job Status</h2>
@@ -387,11 +367,6 @@ textarea { min-height: 60px; resize: vertical; font-family: monospace; }
       <div style="margin-top:8px;">
         <button class="btn btn-danger" id="abortBtn" onclick="abortJob()" disabled>Request Abort</button>
       </div>
-    </div>
-
-    <div class="btn-row">
-      <button class="btn btn-secondary" onclick="goToStep(4)">Back</button>
-      <button class="btn btn-primary" onclick="goToStep(5)">Review →</button>
     </div>
   </div>
 </div>
@@ -598,7 +573,7 @@ function goToStep(n) {
     showStatus('Save an Analysis Plan (Step 3) before proceeding', 'error');
     return;
   }
-  for (let i = 1; i <= 5; i++) {
+  for (let i = 1; i <= 4; i++) {
     document.getElementById('step' + i).classList.toggle('hidden', i !== n);
   }
   document.querySelectorAll('.step').forEach(s => {
@@ -606,7 +581,6 @@ function goToStep(n) {
     s.classList.toggle('active', step === n);
     s.classList.toggle('done', step < n);
   });
-  if (n === 5) renderReview();
 }
 
 // --- Step 1: Method ---
@@ -1050,123 +1024,17 @@ async function saveJob() {
     const result = await api('POST', '/api/jobs', { title, spec });
     savedJob = result;
     showStatus(`Job saved: id=${result.item_id}`, 'success');
+    document.getElementById('submitBtn').disabled = false;
   } catch (e) { showStatus('Failed: ' + e.message, 'error'); }
 }
 
-// --- Step 5: Review ---
-function elabftwItemUrl(itemId) {
-  if (!elabftwUrl) return null;
-  return `${elabftwUrl}/database.php?mode=view&id=${itemId}`;
-}
-
-function renderReview() {
-  const summary = document.getElementById('reviewSummary');
-  const items = [];
-  if (savedMethod) items.push(['Method', savedMethod]);
-  if (savedLayout) items.push(['Plate Layout', savedLayout]);
-  if (savedAnalysis) items.push(['Analysis Plan', savedAnalysis]);
-  if (savedJob) items.push(['Automation Job', savedJob]);
-
-  summary.innerHTML = items.map(([label, obj]) => {
-    const url = elabftwItemUrl(obj.item_id);
-    const link = url
-      ? `<a href="${url}" target="_blank" style="color:var(--accent); font-size:0.8rem; text-decoration:none;">Open in eLabFTW →</a>`
-      : '<span class="hint">Set eLabFTW URL above to enable links</span>';
-    return `
-    <div class="summary-item">
-      <div class="summary-label">${label}</div>
-      <div class="summary-value">${obj.title}</div>
-      <div class="resource-meta">id=${obj.item_id}, lifecycle=${obj.lifecycle}</div>
-      <div class="resource-meta">hash=${obj.hash ? obj.hash.slice(0,16)+'...' : '(not finalized)'}</div>
-      <div class="resource-meta">attachment=${obj.json_attachment_id || '(none)'}</div>
-      <div style="margin-top:4px;">${link}</div>
-    </div>`;
-  }).join('');
-}
-
-async function finalizeAll() {
-  const results = document.getElementById('finalizeResults');
-  results.innerHTML = '';
-
-  // Validate specs before finalizing
-  const validations = [
-    ['Method', savedMethod, 'methods', 'wallac.method', validateMethodSpec],
-    ['Plate Layout', savedLayout, 'layouts', 'wallac.layout', validateLayoutSpec],
-    ['Analysis Plan', savedAnalysis, 'analyses', 'wallac.analysis', validateAnalysisSpec],
-    ['Automation Job', savedJob, 'jobs', 'wallac.job', () => []],
-  ];
-
-  // Check each spec exists and has correct schema
-  for (const [label, obj, prefix, expectedSchema, validator] of validations) {
-    if (!obj) {
-      results.innerHTML += `<div class="status-msg error">${label}: not saved yet. Complete Step ${validations.indexOf([label, obj, prefix, expectedSchema, validator]) + 1} first.</div>`;
-      return;
-    }
-    // Verify the spec has the correct schema_name
-    const spec = obj.spec || obj.spec_dict || {};
-    if (spec.schema_name && spec.schema_name !== expectedSchema) {
-      results.innerHTML += `<div class="status-msg error">${label}: spec has wrong schema_name '${spec.schema_name}' (expected '${expectedSchema}'). Re-save the ${label.toLowerCase()}.</div>`;
-      return;
-    }
-    // Run spec-specific validation
-    if (validator) {
-      const errors = validator(spec);
-      if (errors.length > 0) {
-        results.innerHTML += `<div class="status-msg error">${label}: ${errors.join('; ')}</div>`;
-        return;
-      }
-    }
-  }
-
-  const items = [
-    ['Method', savedMethod, 'methods'],
-    ['Plate Layout', savedLayout, 'layouts'],
-    ['Analysis Plan', savedAnalysis, 'analyses'],
-    ['Automation Job', savedJob, 'jobs'],
-  ];
-  let allOk = true;
-  for (const [label, obj, prefix] of items) {
-    if (!obj) continue;
-    try {
-      const result = await api('POST', `/api/${prefix}/${obj.item_id}/finalize`);
-      obj.hash = result.hash;
-      obj.json_attachment_id = result.json_attachment_id;
-      results.innerHTML += `<div class="status-msg success">${label} finalized: hash=${result.hash.slice(0,16)}..., attachment=${result.json_attachment_id}</div>`;
-    } catch (e) {
-      allOk = false;
-      results.innerHTML += `<div class="status-msg error">${label} finalize failed: ${e.message}</div>`;
-    }
-  }
-  if (allOk) {
-    document.getElementById('submitBtn').disabled = false;
-  }
-  renderReview();
-}
-
-function validateLayoutSpec(spec) {
-  const errors = [];
-  if (!spec.wells || spec.wells.length === 0) {
-    errors.push('No wells defined in layout');
-  }
-  return errors;
-}
-
-function validateAnalysisSpec(spec) {
-  const errors = [];
-  // Analysis spec can be minimal — just check it exists
-  if (!spec.schema_name) {
-    errors.push('No schema_name in analysis spec');
-  }
-  return errors;
-}
-
-// --- Submit to bridge ---
-async function submitToBridge() {
+async function finalizeAndSubmit() {
   if (!bridgeUrl) { showStatus('Set the Bridge URL in settings first', 'error'); return; }
+  if (!savedJob) { showStatus('Save the Job first', 'error'); return; }
 
   const mode = document.getElementById('jobMode') ? document.getElementById('jobMode').value : 'existing_protocol';
 
-  // Validate required fields before submitting
+  // Validate required fields
   if (mode === 'existing_protocol') {
     const protoName = document.getElementById('jobProtocolName') ? document.getElementById('jobProtocolName').value : '';
     if (!protoName) {
@@ -1180,6 +1048,29 @@ async function submitToBridge() {
     }
   }
 
+  // Step 1: Finalize all specs (canonicalize + attach JSON)
+  showStatus('Finalizing specs...', 'info');
+  const items = [
+    ['Method', savedMethod, 'methods'],
+    ['Plate Layout', savedLayout, 'layouts'],
+    ['Analysis Plan', savedAnalysis, 'analyses'],
+    ['Automation Job', savedJob, 'jobs'],
+  ];
+
+  for (const [label, obj, prefix] of items) {
+    if (!obj) continue;
+    try {
+      const result = await api('POST', `/api/${prefix}/${obj.item_id}/finalize`);
+      obj.hash = result.hash;
+      obj.json_attachment_id = result.json_attachment_id;
+    } catch (e) {
+      showStatus(`${label} finalize failed: ${e.message}`, 'error');
+      return;
+    }
+  }
+  showStatus('Specs finalized. Submitting to bridge...', 'info');
+
+  // Step 2: Build job spec and submit to bridge
   const jobSpec = {
     title: savedJob ? savedJob.title : (savedMethod ? savedMethod.title : 'Untitled Run'),
     execution_mode: mode,
@@ -1195,7 +1086,6 @@ async function submitToBridge() {
   }
 
   try {
-    showStatus('Submitting to bridge...', 'info');
     const resp = await fetch(`${bridgeUrl}/jobs`, {
       method: 'POST',
       headers: { ...authHeaders(), 'Content-Type': 'application/json' },
@@ -1214,6 +1104,9 @@ async function submitToBridge() {
     showStatus('Submit failed: ' + e.message, 'error');
   }
 }
+
+// --- Submit to bridge (merged with finalize) ---
+// See finalizeAndSubmit() above
 
 function startStatusPolling() {
   if (statusPollTimer) clearInterval(statusPollTimer);
