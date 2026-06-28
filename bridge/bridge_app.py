@@ -25,7 +25,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from .config import BridgeConfig
+from .elabftw import ElabftwClient
+from .executor import BridgeExecutor
 from .jobs import Job, JobManager
+from .vm_agent_client import VmAgentClient
 
 # --- Pydantic models ---
 
@@ -126,6 +129,25 @@ def create_bridge_app(
         job_manager = JobManager()
 
     bridge_token = os.environ.get("WALLAC_BRIDGE_TOKEN", "")
+
+    # Wire the executor: connect JobManager to vm-agent + eLabFTW
+    if config is not None:
+        vm_agent = VmAgentClient(
+            base_url=config.vm_agent_url,
+            token=config.vm_agent_token,
+        )
+        elabftw = ElabftwClient(
+            base_url=config.elabftw_url,
+            api_key=config.elabftw_api_key,
+            verify_tls=False,
+        )
+        executor = BridgeExecutor(
+            vm_agent=vm_agent,
+            elabftw=elabftw,
+            dry_run=config.dry_run,
+        )
+        job_manager.set_executor(executor)
+        job_manager.start_worker()
 
     app = FastAPI(
         title="Wallac Victor2 Bridge",
