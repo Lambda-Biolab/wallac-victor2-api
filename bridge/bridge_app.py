@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 from .config import BridgeConfig
 from .elabftw import ElabftwClient
 from .executor import BridgeExecutor
-from .jobs import Job, JobManager
+from .jobs import DuplicateJobError, Job, JobManager
 from .vm_agent_client import VmAgentClient
 
 # --- Pydantic models ---
@@ -183,7 +183,26 @@ def create_bridge_app(
         req: JobSubmitRequest, authorization: str | None = Header(default=None)
     ) -> JobResponse:
         _check_auth(token, authorization)
-        job = mgr.submit_job(req.model_dump())
+        try:
+            job = mgr.submit_job(req.model_dump())
+        except DuplicateJobError as e:
+            # Idempotent: return the existing active job instead of queuing
+            # a duplicate. 409 Conflict signals the client that the job was
+            # already submitted; the body contains the original job_id.
+            existing = mgr.get_job(e.existing_job_id)
+            if existing is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "message": "A job with the same spec is already active",
+                        "existing_job_id": e.existing_job_id,
+                        "existing_status": existing.status,
+                    },
+                ) from e
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"message": "Duplicate job", "existing_job_id": e.existing_job_id},
+            ) from e
         return _job_to_response(job)
 
     @app.get("/jobs", response_model=list[JobResponse])
