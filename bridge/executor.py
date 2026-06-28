@@ -570,9 +570,11 @@ class BridgeExecutor:
             read_time = photo.get("read_time_seconds", 1.0)
 
             # Map filter_id to the wavelength used in the protocol name.
-            # Only include filters that have matching factory preset protocols
-            # on the instrument. P610 (OD600) has no matching protocol.
+            # P610 is the physical 610nm bandpass filter, used for OD600.
+            # The instrument has a custom protocol "Absorbance @ 600 (1.0s)"
+            # that uses this filter (MeasSequence L:2200000).
             filter_to_wavelength = {
+                "P610": "600",  # OD600 — 610nm filter, protocol named @ 600
                 "P405": "405",
                 "P450": "450",
                 "P490": "490",
