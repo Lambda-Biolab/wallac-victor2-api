@@ -8,7 +8,7 @@ Type=simple
 User=antonio
 WorkingDirectory=/home/antonio/repos/wallac-victor2-api
 EnvironmentFile=/etc/wallac-bridge/bridge.env
-ExecStart=/home/antonio/repos/wallac-victor2-api/.venv/bin/python3 main.py
+ExecStart=/home/antonio/repos/wallac-victor2-api/.venv/bin/python3 -m uvicorn bridge.bridge_app:create_bridge_app --factory --host 0.0.0.0 --port 8423
 
 Restart=on-failure
 RestartSec=10
