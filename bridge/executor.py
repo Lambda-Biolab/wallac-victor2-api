@@ -18,6 +18,7 @@ no eLabFTW polling or claiming needed.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import time
@@ -315,7 +316,14 @@ class BridgeExecutor:
         self._writeback(job, raw_wells, analyzed_csv)
 
     def _writeback(self, job: Job, raw_wells: list[dict[str, Any]], analyzed_csv: str) -> None:
-        """Write results back to eLabFTW as an experiment."""
+        """Write results back to eLabFTW as an experiment.
+
+        The experiment body contains:
+        - Job metadata (ID, protocol, run ID)
+        - A 96-well plate heatmap with color-coded values
+        - A results table with per-well readings
+        - Raw JSON and analyzed CSV as downloadable attachments
+        """
         job.add_event("writeback_started", "")
 
         # Create or use existing experiment
@@ -350,15 +358,8 @@ class BridgeExecutor:
                 job.artifacts.append({"name": "analyzed.csv", "type": "analyzed", "uploaded": True})
                 job.add_event("analyzed_results_uploaded", "")
 
-            # Patch experiment body with summary
-            body = (
-                f"<h2>Wallac Victor2 Results</h2>"
-                f"<p><strong>Job ID:</strong> {job.job_id}</p>"
-                f"<p><strong>Protocol:</strong> {job.protocol_name or 'N/A'}</p>"
-                f"<p><strong>Run ID:</strong> {job.run_id}</p>"
-                f"<p><strong>Wells measured:</strong> {len(raw_wells)}</p>"
-                f"<p>Raw results and analyzed data are attached as files.</p>"
-            )
+            # Build rich HTML body with plate heatmap + results table
+            body = self._build_results_html(job, raw_wells)
             self.elabftw.patch_experiment(exp_id, {"body": body})
 
             job.status = "completed"
@@ -370,6 +371,136 @@ class BridgeExecutor:
             job.error = f"Write-back failed: {e}"
             job.add_event("writeback_failed", str(e))
             logger.exception("Write-back failed for job %s", job.job_id)
+
+    def _build_results_html(self, job: Job, raw_wells: list[dict[str, Any]]) -> str:
+        """Build a rich HTML body with plate heatmap and results table."""
+        import html as html_mod
+
+        # Extract well values into a dict keyed by well name
+        well_values: dict[str, float] = {}
+        for w in raw_wells:
+            name = w.get("well_name", w.get("name", w.get("well", "")))
+            if not name:
+                continue
+            # Try common value field names
+            val = (
+                w.get("primary_value")
+                or w.get("od")
+                or w.get("value")
+                or w.get("raw_value")
+                or w.get("counts")
+                or w.get("intensity")
+            )
+            if val is not None:
+                with contextlib.suppress(ValueError, TypeError):
+                    well_values[name] = float(val)
+
+        # Compute min/max for color scaling
+        vals = list(well_values.values())
+        vmin = min(vals) if vals else 0.0
+        vmax = max(vals) if vals else 1.0
+        vrange = vmax - vmin if vmax > vmin else 1.0
+
+        def color_for(val: float) -> str:
+            """Map a value to a blue-white-red color scale."""
+            if vrange == 0:
+                return "#ffffff"
+            t = (val - vmin) / vrange  # 0..1
+            # Blue (low) → white (mid) → red (high)
+            if t < 0.5:
+                # Blue to white
+                r = int(255 * (t * 2))
+                g = int(255 * (t * 2))
+                b = 255
+            else:
+                # White to red
+                r = 255
+                g = int(255 * (1 - (t - 0.5) * 2))
+                b = int(255 * (1 - (t - 0.5) * 2))
+            return f"#{r:02x}{g:02x}{b:02x}"
+
+        # Build plate heatmap (8 rows x 12 cols)
+        rows = "ABCDEFGH"
+        cols = list(range(1, 13))
+
+        plate_html = [
+            '<table style="border-collapse:collapse; font-size:0.75rem;">',
+            "<tr><td></td>",
+        ]
+        for c in cols:
+            plate_html.append(
+                f'<td style="text-align:center; padding:2px 6px; font-weight:bold;">{c}</td>'
+            )
+        plate_html.append("</tr>")
+
+        for r in rows:
+            plate_html.append(f'<tr><td style="font-weight:bold; padding:2px 6px;">{r}</td>')
+            for c in cols:
+                well = f"{r}{c}"
+                val = well_values.get(well)
+                if val is not None:
+                    color = color_for(val)
+                    plate_html.append(
+                        f'<td style="background:{color}; text-align:center; padding:2px 6px;'
+                        f' border:1px solid #ccc;">{val:.3f}</td>'
+                    )
+                else:
+                    plate_html.append(
+                        '<td style="background:#f0f0f0; text-align:center; padding:2px 6px;'
+                        ' border:1px solid #ccc; color:#999;">—</td>'
+                    )
+            plate_html.append("</tr>")
+        plate_html.append("</table>")
+
+        # Build results table (top 20 wells by value, or all if fewer)
+        sorted_wells = sorted(well_values.items(), key=lambda x: x[1], reverse=True)
+        table_rows = sorted_wells[:20]
+
+        table_html = [
+            '<table style="border-collapse:collapse; font-size:0.85rem; margin-top:12px;">',
+            '<tr style="background:#e0e0e0;">',
+            "<th style='padding:4px 12px; text-align:left; border:1px solid #ccc;'>Well</th>",
+            "<th style='padding:4px 12px; text-align:right; border:1px solid #ccc;'>Value</th>",
+            "</tr>",
+        ]
+        for well, val in table_rows:
+            table_html.append(
+                f"<tr>"
+                f"<td style='padding:4px 12px; border:1px solid #ddd;'>{html_mod.escape(well)}</td>"
+                f"<td style='padding:4px 12px; border:1px solid #ddd; text-align:right;'>{val:.4f}</td>"
+                f"</tr>"
+            )
+        table_html.append("</table>")
+        if len(sorted_wells) > 20:
+            table_html.append(
+                f"<p style='font-size:0.8rem; color:#666;'>Showing top 20 of {len(sorted_wells)} wells. "
+                "See attached CSV for full results.</p>"
+            )
+
+        # Summary stats
+        n_measured = len(well_values)
+        mean_val = sum(vals) / len(vals) if vals else 0
+        min_val = vmin if vals else 0
+        max_val = vmax if vals else 0
+
+        body = (
+            f"<h2>Wallac Victor2 Results</h2>"
+            f"<table style='border-collapse:collapse; margin-bottom:16px;'>"
+            f"<tr><td style='padding:4px 16px 4px 0; font-weight:bold;'>Job ID:</td><td>{html_mod.escape(job.job_id)}</td></tr>"
+            f"<tr><td style='padding:4px 16px 4px 0; font-weight:bold;'>Protocol:</td><td>{html_mod.escape(job.protocol_name or 'N/A')}</td></tr>"
+            f"<tr><td style='padding:4px 16px 4px 0; font-weight:bold;'>Run ID:</td><td>{html_mod.escape(job.run_id)}</td></tr>"
+            f"<tr><td style='padding:4px 16px 4px 0; font-weight:bold;'>Wells measured:</td><td>{n_measured}</td></tr>"
+            f"<tr><td style='padding:4px 16px 4px 0; font-weight:bold;'>Min / Mean / Max:</td><td>{min_val:.4f} / {mean_val:.4f} / {max_val:.4f}</td></tr>"
+            f"</table>"
+            f"<h3>Plate Heatmap</h3>"
+            f"{''.join(plate_html)}"
+            f"<h3>Results (Top Wells)</h3>"
+            f"{''.join(table_html)}"
+            f"<p style='margin-top:16px; font-size:0.85rem; color:#666;'>"
+            f"Raw results (JSON) and analyzed data (CSV) are attached as files below."
+            f"</p>"
+        )
+        return body
 
     def _download_ref(self, ref: dict[str, Any]) -> dict[str, Any]:
         """Download a canonical JSON attachment from eLabFTW using a ref dict.
