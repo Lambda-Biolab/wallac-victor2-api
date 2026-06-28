@@ -251,13 +251,15 @@ class BridgeExecutor:
                 return
 
             state = run.get("state", "").lower()
-            is_error = run.get("is_error", False)
 
-            if state in ("completed", "done", "finished"):
+            # vm-agent terminal states: "measured" (completed successfully),
+            # "completed", "done", "finished"
+            if state in ("measured", "completed", "done", "finished"):
                 job.add_event("run_completed", state)
                 return
 
-            if is_error or state in ("error", "failed"):
+            # Error states: "error", "failed", "aborted"
+            if state in ("error", "failed", "aborted"):
                 job.status = "failed"
                 job.error = f"Instrument run failed: state={state}"
                 job.add_event("execution_failed", job.error)
