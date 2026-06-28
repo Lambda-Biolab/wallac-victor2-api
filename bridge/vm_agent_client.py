@@ -48,7 +48,23 @@ class VmAgentClient:
         path: str,
         body: dict[str, Any] | None = None,
     ) -> Any:
-        url = f"{self.base}{path}"
+        # URL-encode the path to handle protocol names with spaces/special chars
+        import urllib.parse
+
+        # Split path into segments and encode the last segment (e.g. protocol name)
+        # while preserving leading slashes and query strings
+        if "?" in path:
+            base_path, query = path.split("?", 1)
+        else:
+            base_path, query = path, ""
+        segments = base_path.split("/")
+        # Encode each segment individually to preserve / separators
+        encoded_segments = [urllib.parse.quote(seg, safe="") for seg in segments]
+        encoded_path = "/".join(encoded_segments)
+        if query:
+            encoded_path += "?" + query
+
+        url = f"{self.base}{encoded_path}"
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method)
         if self.token:
