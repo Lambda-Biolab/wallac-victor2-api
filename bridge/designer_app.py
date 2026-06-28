@@ -269,6 +269,19 @@ def create_designer_app(
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/config")
+    def get_config() -> dict[str, str]:
+        """Return client-side config (URLs) so the Run Builder can auto-fill."""
+        import os
+
+        return {
+            "elabftw_url": config.elabftw_url
+            if config
+            else os.environ.get("WALLAC_ELABFTW_URL", ""),
+            "bridge_url": os.environ.get("WALLAC_BRIDGE_URL", ""),
+            "vm_agent_url": config.vm_agent_url if config else "",
+        }
+
     @app.get("/run-builder")
     def run_builder() -> Any:
         """Serve the Run Builder single-page app."""
