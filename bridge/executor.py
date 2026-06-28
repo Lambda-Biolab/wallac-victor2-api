@@ -440,6 +440,18 @@ class BridgeExecutor:
             if wn:
                 w["well"] = _normalize_well_name(wn)
 
+        # Filter to only the measured wells from the layout spec.
+        # The vm-agent returns all 96 persisted rows even when only a
+        # subset was measured (the rest have near-zero placeholder values).
+        if layout_spec:
+            measured_names = {
+                _normalize_well_name(w.get("well_name", w.get("name", "")))
+                for w in layout_spec.get("wells", [])
+                if w.get("role", "measured") == "measured"
+            }
+            raw_wells = [w for w in raw_wells if w.get("well", "") in measured_names]
+            job.add_event("results_filtered", f"{len(raw_wells)} measured wells")
+
         # Run analysis if we have layout + analysis specs
         analyzed_csv = ""
         if layout_spec and analysis_spec_dict:
