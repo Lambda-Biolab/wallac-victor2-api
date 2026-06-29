@@ -36,77 +36,23 @@ assembling a protocol and streaming live results back over SSE.
 
 ## Architecture
 
+Two stacks glue together over the libvirt NAT: the **vm-agent** (Python 3.8 +
+`comtypes`) runs inside the Windows 7 VM and drives the OEM COM automation
+server (`Wallac1420.Server`) behind a REST/JSON + SSE interface; the **bridge**
+(FastAPI, on the Linux host) sits between the Run Builder UI and the vm-agent,
+integrating with **eLabFTW** as the durable archive while submitting and
+executing jobs directly over HTTP.
+
 ```
-                         Linux host
-  ┌─────────────────────────────────────────────────────────────┐
-  │                                                             │
-  │  Run Builder (browser)                                      │
-  │    │  HTTP                                                  │
-  │    ▼                                                        │
-  │  designer_app  :8422   ──►  eLabFTW  (drafts, signed specs)  │
-  │    │  POST /jobs                                           │
-  │    ▼                                                        │
-  │  bridge_app    :8423   ──►  eLabFTW  (experiment + results) │
-  │    │  HTTP/JSON + SSE                                       │
-  │    ▼                                                        │
-  └────┬─────────────────────────────────────────────────────────┘
-       │  libvirt NAT (optional bearer token)
-       ▼
-  Windows 7 VM ── vm-agent/agent.py   (Python 3.8 + comtypes, console user)
-       │  COM automation   (ProgID Wallac1420.Server)
-       ▼
-  OEM MlrServ / MlrMgr ──► Victor2 / 1420 reader
+  Run Builder ──► designer :8422 ──► eLabFTW (drafts, signed specs)
+                                   bridge   :8423 ──► eLabFTW (experiment + results)
+                                   vm-agent :8420 ──► OEM COM ──► Victor2 / 1420
 ```
 
-### vm-agent — instrument microservice (Windows VM)
-
-**`vm-agent/agent.py`** runs *inside* the VM as the interactive desktop user
-(COM/OLE automation only works there). It drives `MlrServ`'s COM server and
-serves REST/JSON + Server-Sent Events on the VM's libvirt NAT interface.
-
-COM is apartment-threaded, so a single dedicated STA worker owns the COM
-object; HTTP handler threads marshal calls to it. A separate thread holds its
-own COM connection for ~1 Hz real-time monitoring, so a long operation never
-freezes the status stream.
-
-Supporting pieces:
-
-- **`launch_as_user.py`** — start the OEM GUI / agent as the interactive
-  console user from a SYSTEM context (`CreateProcessAsUser`, no password).
-- **`lid_watcher.py`** — auto-dismiss a faulty lid-interlock dialog so it
-  doesn't stall measurements (every action is logged for auditability).
-- **`start-stack.bat`** — Startup-folder autostart that brings the whole
-  stack up on logon.
-- **`probe.py`, `dump_methods.py`, `dump_protocols.py`, `dump_tlb.py`** —
-  COM-introspection diagnostics used when extending the API.
-
-### bridge — eLabFTW integration (Linux host)
-
-The bridge sits between the user and the vm-agent. It accepts job submissions
-(via HTTP from the Run Builder), executes them against the vm-agent, and
-writes results back to eLabFTW as experiment records. Three FastAPI apps:
-
-- **`bridge/bridge_app.py`** (`:8423`) — direct-submit job API. Accepts
-  `POST /jobs`, executes on a background worker thread, writes results to
-  eLabFTW. Replaces the old eLabFTW-polling daemon (`main.py`).
-- **`bridge/designer_app.py`** (`:8422`) — Run Builder backend. CRUD for
-  Method, Plate Layout, Analysis Plan, and Automation Job draft objects;
-  finalize (canonicalize + SHA-256 hash); clone signed objects. Serves the
-  Run Builder single-page app at `GET /run-builder`.
-- **`bridge/dashboard.py`** (`:8421`) — live status dashboard, served by
-  `main.py`.
-
-Key design decisions (see [`docs/architecture-direct-submit.md`](docs/architecture-direct-submit.md)):
-
-- eLabFTW is the **archive**, not the job queue. The Run Builder submits jobs
-  directly to the bridge via HTTP POST — no polling.
-- Draft objects (Method/Layout/Analysis/Job) are mutable; signed objects
-  reject mutation (routed to clone/version). Canonical JSON is
-  deterministically serialized and SHA-256 hashed.
-- The browser never receives the eLabFTW API key or vm-agent token — all
-  eLabFTW interaction happens server-side.
-- Result write-back is resilient: if eLabFTW is unreachable, results are
-  spooled to disk (`bridge/spool.py`) and retried.
+For the full architecture (component breakdown, threading model, key design
+decisions) see [`docs/architecture.md`](docs/architecture.md); for the
+direct-submit design rationale see
+[`docs/architecture-direct-submit.md`](docs/architecture-direct-submit.md).
 
 ## API
 
@@ -139,36 +85,21 @@ deduped per-well OD table (optionally an 8×12 grid). Errors are actionable —
 e.g. `409 instrument_not_ready` with a `hint` telling you to close the lid —
 rather than raw COM tracebacks.
 
-### bridge API — `:8423`
+### bridge / designer API — `:8423` / `:8422`
 
-| Method & path | Purpose |
-|---|---|
-| `GET /health` | bridge liveness + worker status + current job |
-| `POST /jobs` | submit a job for execution (idempotent: duplicate spec → `409`) |
-| `GET /jobs` | list all jobs |
-| `GET /jobs/{job_id}` | job status, events, artifacts, live wells |
-| `POST /jobs/{job_id}/abort` | abort a running job |
+The bridge (job submit / execute / abort) and designer (Run Builder, draft
+finalize / clone) expose their own REST endpoints. Tables and the shared
+auth model live in [`docs/bridge-api.md`](docs/bridge-api.md).
 
-### designer API — `:8422`
+**Auth (summary):** all three services use optional
+`Authorization: Bearer <token>`. The vm-agent reads its token from a file on
+the VM (`TOKEN_FILE` in `agent.py`); the bridge and designer read from env
+vars (`WALLAC_BRIDGE_TOKEN`, `WALLAC_DESIGNER_TOKEN`). If unset, auth is
+disabled and the service logs a warning. **No token is ever stored in this
+repository.** See [`docs/auth-secrets-policy.md`](docs/auth-secrets-policy.md).
 
-| Method & path | Purpose |
-|---|---|
-| `GET /health` | liveness |
-| `GET /config` | client-side URLs (bridge, eLabFTW, vm-agent) for auto-fill |
-| `GET /run-builder` | Run Builder single-page app |
-| `GET /elabftw/events` | proxy for eLabFTW calendar (self-signed cert workaround) |
-| `POST/GET /api/{methods\|layouts\|analyses\|jobs}` | create / list drafts |
-| `GET/PATCH /api/{...}/{item_id}` | read / update a draft |
-| `POST /api/{...}/{item_id}/finalize` | canonicalize + hash + attach JSON |
-| `POST /api/{...}/{item_id}/clone` | clone a signed object to a new draft |
-
-**Auth:** all three services use optional `Authorization: Bearer <token>`.
-The vm-agent reads its token from a file on the VM (`TOKEN_FILE` in
-`agent.py`); the bridge and designer read from env vars (`WALLAC_BRIDGE_TOKEN`,
-`WALLAC_DESIGNER_TOKEN`). If unset, auth is disabled and the service logs a
-warning. **No token is ever stored in this repository.**
-
-Full request/response details: [`docs/api-reference.md`](docs/api-reference.md).
+Full request/response details: [`docs/api-reference.md`](docs/api-reference.md)
+and [`docs/bridge-api.md`](docs/bridge-api.md).
 
 ## Install & use
 
@@ -239,17 +170,11 @@ curl -H "$H" "http://$VM/jobs/<id>/export?format=grid&value=od"
 ## Operations & internals
 
 The operational runbook (start / verify / restart the `win7-wallac` VM, the
-ARCnet / VFIO passthrough setup) and the bench gotchas live in the internal
-sister repo **`wallac-victor2-linux`** at `host-config/VM-OPERATIONS.md` — they
-are environment-specific, so they are not duplicated in this public package.
-
-> **Deployment gotcha that does belong here:** the Wallac OEM installer nests its
-> files under `C:\Program Files\Wallac\Wallac1420\` (note the extra `Wallac\`);
-> the flat `C:\Program Files\Wallac1420\` directory exists but is **empty**. The
-> path constants in `vm-agent/` use the nested form — if your OEM install
-> differs, verify inside the VM with `where /R "C:\Program Files" MlrMgr.exe` and
-> adjust. (The flat form was a real bug here — it made `start-stack.bat` fail with
-> *"Windows cannot find 'MlrMgr.exe'"*.)
+ARCnet / VFIO passthrough setup) and environment-specific deployment gotchas —
+including the nested-`Wallac\` OEM install path — live in
+[`docs/deployment-notes.md`](docs/deployment-notes.md). The bench-level
+runbook is in the internal sister repo `wallac-victor2-linux`
+(`host-config/VM-OPERATIONS.md`).
 
 ## Development
 
@@ -272,13 +197,20 @@ paths require Windows, `comtypes`, and a live instrument.
 
 ## Documentation
 
-- [API reference](docs/api-reference.md) — full vm-agent request/response details
-- [Direct-submit architecture](docs/architecture-direct-submit.md) — bridge design
-  decision (eLabFTW as archive, not job queue)
+- [Architecture](docs/architecture.md) — system overview, vm-agent/bridge
+  components, threading model, key design decisions
+- [vm-agent API reference](docs/api-reference.md) — full `:8420`
+  request/response details
+- [Bridge & designer API](docs/bridge-api.md) — `:8423` / `:8422` endpoints
+  and auth model
+- [Direct-submit architecture](docs/architecture-direct-submit.md) — bridge
+  design decision (eLabFTW as archive, not job queue)
 - [eLabFTW object model](docs/elabftw-object-model.md) — resource categories,
   draft/signed lifecycle, canonical JSON schemas
-- [Auth & secrets policy](docs/auth-secrets-policy.md) — token handling, what is
-  and isn't stored
+- [Auth & secrets policy](docs/auth-secrets-policy.md) — token handling, what
+  is and isn't stored
+- [Deployment notes](docs/deployment-notes.md) — OEM install path gotchas,
+  VM-operations pointer
 - [Abort recovery](docs/abort-recovery.md) — job abort flow and spool recovery
 - [Stage 7 hardware E2E test plan](docs/stage7-hardware-e2e-test-plan.md) —
   hardware validation protocol
