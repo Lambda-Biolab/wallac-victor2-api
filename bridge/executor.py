@@ -25,7 +25,9 @@ import time
 from typing import Any
 
 from .analysis import AnalysisPipeline
+from .canonical import compute_hash
 from .elabftw import ElabftwClient
+from .errors import CANONICAL_HASH_MISMATCH, SIGNATURE_MISSING, BridgeError, Severity
 from .jobs import Job
 from .schemas import AnalysisSpec
 from .vm_agent_client import VmAgentClient, VmAgentError
@@ -683,24 +685,82 @@ class BridgeExecutor:
         return body
 
     def _download_ref(self, ref: dict[str, Any]) -> dict[str, Any]:
-        """Download a canonical JSON attachment from eLabFTW using a ref dict.
+        """Download a canonical JSON attachment from eLabFTW using a ref dict, verifying hash.
 
-        Ref format: {"object_id": int, "hash": str, "attachment_id": int}
+        Ref format: {"object_id": int, "hash": str, "json_attachment_id" or "attachment_id": int}
+
+        Raises:
+            BridgeError: with code SIGNATURE_MISSING if ref fields are incomplete.
+            BridgeError: with code CANONICAL_HASH_MISMATCH if the downloaded bytes
+                do not hash to the expected value.  This is a fail-closed check.
         """
         object_id = ref.get("object_id", 0)
-        attachment_id = ref.get("attachment_id", 0)
+        # Support both json_attachment_id (canonical schema name) and
+        # attachment_id (legacy HTTP API name) for backward compatibility.
+        attachment_id = ref.get("json_attachment_id", 0) or ref.get("attachment_id", 0)
+        expected_hash = ref.get("hash", "")
+
         if not object_id or not attachment_id:
-            logger.warning("download_ref: missing object_id or attachment_id in ref: %s", ref)
-            return {}
+            raise BridgeError(
+                code=SIGNATURE_MISSING,
+                severity=Severity.ERROR,
+                human_message=(f"Missing object_id or attachment_id in {list(ref.keys())}: {ref}"),
+                operator_hint=(
+                    "The method/layout/analysis reference must include object_id and "
+                    "attachment_id (or json_attachment_id) for hash-verified download."
+                ),
+                retryable=False,
+                details={"ref": ref},
+            )
+
+        if not expected_hash:
+            raise BridgeError(
+                code=SIGNATURE_MISSING,
+                severity=Severity.ERROR,
+                human_message="Missing hash in reference: cannot verify attachment integrity.",
+                operator_hint=(
+                    "The method/layout/analysis reference must include a SHA-256 hash "
+                    "of the canonical JSON attachment for integrity verification."
+                ),
+                retryable=False,
+                details={"ref_keys": list(ref.keys())},
+            )
 
         try:
             data = self.elabftw.download_upload(object_id, attachment_id)
-            return json.loads(data)
         except Exception as e:
-            logger.warning(
-                "download_ref failed for object=%s attachment=%s: %s", object_id, attachment_id, e
+            raise BridgeError(
+                code=SIGNATURE_MISSING,
+                severity=Severity.ERROR,
+                human_message=f"Failed to download attachment {attachment_id} from object {object_id}: {e}",
+                operator_hint="Check that the attachment exists and the eLabFTW API is reachable.",
+                retryable=True,
+                details={"object_id": object_id, "attachment_id": attachment_id},
+            ) from e
+
+        actual_hash = compute_hash(data)
+        if actual_hash != expected_hash.lower():
+            raise BridgeError(
+                code=CANONICAL_HASH_MISMATCH,
+                severity=Severity.ERROR,
+                human_message=(
+                    f"Hash mismatch for downloaded attachment: expected {expected_hash}, got {actual_hash}. "
+                    "The attachment may have been replaced or corrupted after signing."
+                ),
+                operator_hint=(
+                    "Re-generate and re-sign the spec attachment, or restore the "
+                    "original signed version in eLabFTW."
+                ),
+                retryable=False,
+                details={
+                    "expected_hash": expected_hash,
+                    "actual_hash": actual_hash,
+                    "object_id": object_id,
+                    "attachment_id": attachment_id,
+                },
             )
-            return {}
+
+        return json.loads(data)
 
     def _match_protocol_from_method(self, method_spec: dict[str, Any]) -> tuple[str, int]:
         """Match a method spec to a protocol on the instrument.
