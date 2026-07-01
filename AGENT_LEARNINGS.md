@@ -419,3 +419,31 @@ works for both, so default to it.
 Verify `SessionId = 1` after EVERY launch. Do not skip this step.
 The lid_watcher "looks alive but does nothing" failure mode is silent
 and the run will wedge for hours with no obvious cause.
+
+## Wallac repo layout — wallac-victor2-api vs wallac-victor2-linux
+
+### CRITICAL: vm-agent/agent.py lives in wallac-victor2-api, NOT wallac-victor2-linux
+
+Two repos exist locally:
+- `~/repos/wallac-victor2-api` — the **canonical** repo for vm-agent code.
+  Remote: `https://github.com/Lambda-Biolab/wallac-victor2-api.git`.
+  This is where `vm-agent/agent.py` (2189 lines, Phase A+B+C) lives and
+  where all vm-agent changes must be committed and pushed.
+- `~/repos/wallac-victor2-linux` — the host/ARCnet/driver repo. It has a
+  **stale copy** of `vm-agent/agent.py` (936 lines, Phase A only) that
+  should NOT be edited. It exists for historical reasons (the vm-agent
+  was originally developed there before being split into the API repo).
+
+**Before editing vm-agent/agent.py, always verify you are in
+`~/repos/wallac-victor2-api`, not `~/repos/wallac-victor2-linux`.**
+
+The VM at 192.168.122.203 runs whichever agent.py was last SCP'd to
+`C:\install\agent.py`. Always SCP from the API repo and commit to the
+API repo.
+
+### How to check which repo you're in
+
+```bash
+git remote -v
+# Should show: Lambda-Biolab/wallac-victor2-api.git
+```
