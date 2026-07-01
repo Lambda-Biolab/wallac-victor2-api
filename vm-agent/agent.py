@@ -1281,6 +1281,58 @@ def op_mdb_delete_protocol(assay_prot_id):
     return _op
 
 
+def _wells_to_plate_map(body):
+    """Convert a well selection dict to a 108-byte plate_map array.
+
+    Accepts:
+        {"wells": ["A1","A2",...,"B12"]}  — explicit well list
+        {"rows": ["A","B"]}               — entire rows
+        {"all": true}                     — full 96-well plate
+
+    Returns: list of 108 ints (12-byte header + 96 well flags).
+    """
+    header = [1, 0, 0, 0, 12, 0, 0, 0, 8, 0, 0, 0]
+    grid = [0] * 96  # 8 rows x 12 cols, all off
+
+    if body.get("all"):
+        grid = [1] * 96
+    elif body.get("rows"):
+        for row in body["rows"]:
+            r = row.upper().strip()
+            if len(r) == 1 and "A" <= r <= "H":
+                row_idx = ord(r) - ord("A")
+                for col in range(12):
+                    grid[row_idx * 12 + col] = 1
+    elif body.get("wells"):
+        import re
+
+        for well in body["wells"]:
+            m = re.match(r"^([A-H])(\d{1,2})$", well.upper().strip())
+            if not m:
+                raise ApiError(
+                    400,
+                    "invalid_well",
+                    f"well '{well}' must be like A1, B12, etc.",
+                )
+            row_idx = ord(m.group(1)) - ord("A")
+            col_idx = int(m.group(2)) - 1
+            if not (0 <= row_idx < 8 and 0 <= col_idx < 12):
+                raise ApiError(
+                    400,
+                    "invalid_well",
+                    f"well '{well}' is out of range (A1-H12)",
+                )
+            grid[row_idx * 12 + col_idx] = 1
+    else:
+        raise ApiError(
+            400,
+            "invalid_body",
+            "provide 'wells' (list like ['A1','B12']), 'rows' (list like ['A','B']), or 'all' (true)",
+        )
+
+    return header + grid
+
+
 def op_mdb_update_plate_map(assay_prot_id, plate_map):
     """Overwrite the PlateMap OLE Object field on a protocol row.
 
@@ -2148,6 +2200,13 @@ class Handler(BaseHTTPRequestHandler):
                 and parts[3] == "plate_map"
             ):
                 self._mdb_update_plate_map(parts[2])
+            elif (
+                len(parts) == 4
+                and parts[0] == "mdb"
+                and parts[1] == "protocols"
+                and parts[3] == "wells"
+            ):
+                self._mdb_set_wells(parts[2])
             else:
                 self._send(404, {"error": "not_found", "hint": "see GET /docs", "path": path})
         except Exception as exc:  # noqa: BLE001
@@ -2166,6 +2225,22 @@ class Handler(BaseHTTPRequestHandler):
         plate_map = body.get("plate_map")
         if not isinstance(plate_map, list):
             raise ApiError(400, "invalid_body", "plate_map must be a list of 108 ints")
+        result = self.server.worker.call(op_mdb_update_plate_map(pid, plate_map), timeout=30)
+        self._send(200, result)
+
+    def _mdb_set_wells(self, assay_prot_id):
+        """PATCH /mdb/protocols/{id}/wells — set which wells to measure.
+
+        Body: {"wells": ["A1","A2",...,"B12"]} or {"rows": ["A","B"]} or
+              {"all": true} to restore full plate.
+        Builds the 108-byte plate_map internally.
+        """
+        try:
+            pid = int(assay_prot_id)
+        except ValueError:
+            raise ApiError(400, "invalid_id", "protocol id must be an integer") from None
+        body = self._read_json()
+        plate_map = _wells_to_plate_map(body)
         result = self.server.worker.call(op_mdb_update_plate_map(pid, plate_map), timeout=30)
         self._send(200, result)
 
