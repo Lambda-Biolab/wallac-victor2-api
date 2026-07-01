@@ -336,7 +336,10 @@ class Monitor(threading.Thread):
                                 r["state"] = "completed"
                                 r["ended_at"] = now_iso()
                         except Exception:  # noqa: BLE001
-                            pass
+                            # COM assay object is stale/invalid — the
+                            # instrument is idle, so the run is done.
+                            r["state"] = "completed"
+                            r["ended_at"] = now_iso()
                     else:
                         # No COM assay object — instrument is idle,
                         # so the run must have finished or been lost.
