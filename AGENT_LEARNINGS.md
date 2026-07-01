@@ -447,3 +447,35 @@ API repo.
 git remote -v
 # Should show: Lambda-Biolab/wallac-victor2-api.git
 ```
+
+## `PATCH /mdb/protocols/{id}/wells` — simpler than raw plate_map
+
+Added as a higher-level alternative to the raw `plate_map` endpoint. Accepts:
+- `{"wells": ["A1","A2","B1","B2"]}` — specific wells
+- `{"rows": ["A","B"]}` — entire rows
+- `{"all": true}` — full 96-well plate
+
+Internally calls `_wells_to_plate_map()` which builds the 108-byte blob and
+delegates to `op_mdb_update_plate_map()`. Response is the same as
+`plate_map`: `{"protocol_id": <int>, "bytes_written": 108}`.
+
+Keeps the raw `plate_map` endpoint for callers that already have the binary
+format (e.g. the bridge client, which constructs the byte array from a spec).
+
+See `agent.py`: `_mdb_set_wells()` (line 2234), `_wells_to_plate_map()` (line 1287).
+
+## Monitor fix — auto-transition stuck runs to "completed"
+
+When the instrument is idle (`is_running=false`) but a run is still marked
+"running" in the monitor state, the background monitor thread now
+automatically transitions it to "completed".
+
+This covers the case where:
+- The COM assay object throws an exception after the run finishes (edge case)
+- The run completes between two monitor cycles and the state change is missed
+- The instrument finishes but the monitor thread's COM poll doesn't catch the
+exact state transition
+
+Previously, the agent would remain stuck in the "running" state indefinitely
+until the operator noticed and manually aborted/cleared. The fix checks the
+instrument's live state on each monitor tick and closes stale runs.

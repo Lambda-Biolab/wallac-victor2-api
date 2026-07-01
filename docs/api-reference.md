@@ -347,6 +347,8 @@ without it they return `403 authoring_disabled`.
 | `POST` | `/mdb/protocols` | token + authoring | Insert a new AssayProtocol row |
 | `DELETE` | `/mdb/protocols/<id>` | token + authoring | Delete an AssayProtocol row by ID |
 | `POST` | `/mdb/backup` | token + authoring | Create a timestamped backup of the MDB |
+| `PATCH` | `/mdb/protocols/{id}/plate_map` | token + authoring | Overwrite the 108-byte PlateMap binary blob |
+| `PATCH` | `/mdb/protocols/{id}/wells` | token + authoring | Set wells by name/row/all (builds plate_map internally) |
 | `POST` | `/mdb/query` | token | Execute a read-only SELECT query |
 
 #### `GET /mdb/groups?name=<name>`
@@ -463,6 +465,54 @@ Body:
 ```
 
 `400` if sql is missing or not a SELECT statement.
+
+#### `PATCH /mdb/protocols/{id}/plate_map`
+
+Requires `WALLAC_ENABLE_PROTOCOL_AUTHORING=true`. Acquires the write lock.
+
+Overwrite the `PlateMap` binary blob — a 108-byte array (12-byte header + 96-byte
+8×12 grid, row-major, `01` = measure, `00` = skip). See AGENT_LEARNINGS.md for
+the binary format details.
+
+Body:
+
+| Field | Type | Required |
+|-------|------|----------|
+| `plate_map` | `[int]` | yes — exactly 108 integers |
+
+Response (`200`):
+
+```json
+{"protocol_id": 2000001, "bytes_written": 108}
+```
+
+`400` if `plate_map` is not a list of 108 ints; `403 authoring_disabled` if the
+feature flag is not set; `404 protocol_not_found` if the id does not exist.
+
+#### `PATCH /mdb/protocols/{id}/wells`
+
+Requires `WALLAC_ENABLE_PROTOCOL_AUTHORING=true`. Acquires the write lock.
+
+A higher-level alternative to `PATCH /mdb/protocols/{id}/plate_map` that accepts
+well names or rows instead of raw bytes. Builds the 108-byte plate_map internally.
+
+Body — exactly one of these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `rows` | `[string]` | Entire rows, e.g. `["A","B"]` measures all wells in rows A and B |
+| `wells` | `[string]` | Specific wells, e.g. `["A1","A2","B1","B2"]` |
+| `all` | `bool` | When `true`, restores the full 96-well plate |
+
+Response (`200`):
+
+```json
+{"protocol_id": 2000001, "bytes_written": 108}
+```
+
+`400` if none of `rows`, `wells`, or `all` is provided, or if a well name is
+invalid; `403 authoring_disabled` if the feature flag is not set;
+`404 protocol_not_found` if the id does not exist.
 
 ---
 
