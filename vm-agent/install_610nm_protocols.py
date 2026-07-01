@@ -1,9 +1,28 @@
-"""Add 610nm protocols — skip PlateMap (let instrument use default)."""
+"""Add 610nm absorbance protocols as factory presets in Mlr3.mdb.
+
+The 610nm filter is physically in slot 7 of the CW-lamp filter wheel A.
+This script adds the filter, photometry labels, and assay protocols
+directly into the Jet database so they survive VM restarts.
+
+IMPORTANT: On Windows 7 with UAC, writes to C:\\Program Files\\... get
+redirected to the VirtualStore path. The agent reads from the
+VirtualStore path, so we must write there too.
+"""
 import comtypes.client
 import datetime
+import os
+
+# Try VirtualStore path first (where the agent reads from), then fall
+# back to the real Program Files path.
+MDB_PATHS = [
+    r"C:\Users\lambda\AppData\Local\VirtualStore\Program Files\Wallac\Wallac1420\Data\Mlr3.mdb",
+    r"C:\Program Files\Wallac\Wallac1420\Data\Mlr3.mdb",
+]
+MDB_SRC = next((p for p in MDB_PATHS if os.path.exists(p)), MDB_PATHS[0])
+print(f"Using MDB: {MDB_SRC}")
 
 eng = comtypes.client.CreateObject("DAO.DBEngine.36")
-db = eng.OpenDatabase(r"C:\Program Files\Wallac\Wallac1420\Data\Mlr3.mdb", False, False)
+db = eng.OpenDatabase(MDB_SRC, False, False)
 
 now = datetime.datetime.now()
 now_str = now.strftime("#%m/%d/%Y %H:%M:%S#")
@@ -84,7 +103,7 @@ print(f"Protocol 0.1s: id={prot_id_01s}")
 db.Close()
 
 # --- 4. Verify ---
-db2 = eng.OpenDatabase(r"C:\Program Files\Wallac\Wallac1420\Data\Mlr3.mdb", False, True)
+db2 = eng.OpenDatabase(MDB_SRC, False, True)
 rs = db2.OpenRecordset("SELECT AssayProtID, ProtName, MeasSequence, FactoryPreset FROM AssayProtocol WHERE ProtName LIKE '%610%'")
 print("\n=== Verification ===")
 while not rs.EOF:
