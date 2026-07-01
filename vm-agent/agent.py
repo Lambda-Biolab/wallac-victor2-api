@@ -321,6 +321,28 @@ class Monitor(threading.Thread):
             with _monitor_lock:
                 snap["target_temperature"] = _monitor.get("target_temperature")
 
+        # Reconcile run state: if the instrument is idle but a run is
+        # still marked "running", the run has completed. Transition it
+        # so stale runs don't block new ones with 409 Conflict.
+        if snap.get("is_idle") and not snap.get("is_running"):
+            with _runs_lock:
+                for rid, r in _runs.items():
+                    if r.get("state") not in ("starting", "running"):
+                        continue
+                    assay = _assays.get(rid)
+                    if assay is not None:
+                        try:
+                            if bool(assay.IsMeasured) or not bool(assay.IsRunning):
+                                r["state"] = "completed"
+                                r["ended_at"] = now_iso()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    else:
+                        # No COM assay object — instrument is idle,
+                        # so the run must have finished or been lost.
+                        r["state"] = "completed"
+                        r["ended_at"] = now_iso()
+
     def _snapshot_live_wells(self, srv, snap: dict) -> None:
         """Poll live results and merge with previous run's accumulation.
 
