@@ -94,18 +94,18 @@ class MockVmAgentClient:
 
     def get_jobs(self) -> list[dict[str, Any]]:
         """Return jobs list — needed by _fetch_and_writeback for assay_id resolution."""
-        return [
-            {"assay_id": 200, "protocol_name": "Absorbance @ 600 (1.0s)", "protocol_id": 1001}
-        ]
+        return [{"assay_id": 200, "protocol_name": "Absorbance @ 600 (1.0s)", "protocol_id": 1001}]
 
     def get_job_results(
         self, job_id: int, shape: str = "list", value: str = "od", dedup: bool = True
     ) -> dict[str, Any]:
         """Return mock wells with OD values — simulates MDB flush complete."""
-        return {"wells": [
-            {"well": "A01", "od": 0.078, "counts": 684016},
-            {"well": "A02", "od": 0.089, "counts": 666875},
-        ]}
+        return {
+            "wells": [
+                {"well": "A01", "od": 0.078, "counts": 684016},
+                {"well": "A02", "od": 0.089, "counts": 666875},
+            ]
+        }
 
     def clone_protocol(self, template_id: int, new_id: int, name: str) -> None:
         pass
