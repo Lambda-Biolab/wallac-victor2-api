@@ -91,6 +91,7 @@ class Job:
     title: str
     execution_mode: str  # "existing_protocol" or "generated_protocol"
     protocol_name: str = ""
+    protocol_id: int = 0
     elabftw_experiment_id: int = 0
     spec_dict: dict[str, Any] = field(default_factory=dict)
     method_ref: dict[str, Any] = field(default_factory=dict)
@@ -124,6 +125,7 @@ class Job:
             "title": self.title,
             "execution_mode": self.execution_mode,
             "protocol_name": self.protocol_name,
+            "protocol_id": self.protocol_id,
             "elabftw_experiment_id": self.elabftw_experiment_id,
             "status": self.status,
             "created_at": self.created_at,
@@ -183,6 +185,7 @@ class JobManager:
             title=job_spec.get("title", "Untitled"),
             execution_mode=job_spec.get("execution_mode", "existing_protocol"),
             protocol_name=job_spec.get("protocol_name", ""),
+            protocol_id=job_spec.get("protocol_id", 0),
             elabftw_experiment_id=job_spec.get("elabftw_experiment_id", 0),
             spec_dict=job_spec.get("spec_dict", {}),
             method_ref=job_spec.get("method_ref", {}),

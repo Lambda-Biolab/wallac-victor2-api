@@ -85,51 +85,58 @@ class BridgeExecutor:
     # --- existing_protocol mode ---
 
     def _execute_existing_protocol(self, job: Job) -> None:
-        """Run a factory preset protocol by name."""
+        """Run a factory preset protocol by name or ID."""
         protocol_name = job.protocol_name
-        if not protocol_name:
+        protocol_id = job.protocol_id
+
+        if not protocol_name and not protocol_id:
             job.status = "failed"
-            job.error = "No protocol_name specified for existing_protocol mode"
+            job.error = "No protocol_name or protocol_id specified for existing_protocol mode"
             job.add_event("execution_failed", job.error)
             return
 
-        job.add_event("resolving_protocol", protocol_name)
-        try:
-            # Try resolving by name first; if the name contains special chars
-            # that break URL paths (e.g. '/'), fall back to searching the
-            # protocol list for a name match and resolve by ID.
-            proto = self.vm_agent.get_protocol(protocol_name)
-            job.add_event("protocol_resolved", f"id={proto.get('id')}")
-        except VmAgentError as e:
-            if e.status_code == 404:
-                # Fallback: search protocol list for a name match
-                try:
-                    prots_resp = self.vm_agent.get_protocols()
-                    prots = (
-                        prots_resp.get("protocols", prots_resp)
-                        if isinstance(prots_resp, dict)
-                        else prots_resp
-                    )
-                    proto = next(
-                        (p for p in prots if p.get("name") == protocol_name),
-                        None,
-                    )
-                    if proto is None:
+        # If protocol_id is provided, use it directly (skip name resolution).
+        if protocol_id:
+            job.add_event("protocol_resolved", f"id={protocol_id} (direct)")
+            proto = {"id": protocol_id, "name": protocol_name or f"protocol_{protocol_id}"}
+        else:
+            job.add_event("resolving_protocol", protocol_name)
+            try:
+                # Try resolving by name first; if the name contains special chars
+                # that break URL paths (e.g. '/'), fall back to searching the
+                # protocol list for a name match and resolve by ID.
+                proto = self.vm_agent.get_protocol(protocol_name)
+                job.add_event("protocol_resolved", f"id={proto.get('id')}")
+            except VmAgentError as e:
+                if e.status_code == 404:
+                    # Fallback: search protocol list for a name match
+                    try:
+                        prots_resp = self.vm_agent.get_protocols()
+                        prots = (
+                            prots_resp.get("protocols", prots_resp)
+                            if isinstance(prots_resp, dict)
+                            else prots_resp
+                        )
+                        proto = next(
+                            (p for p in prots if p.get("name") == protocol_name),
+                            None,
+                        )
+                        if proto is None:
+                            job.status = "failed"
+                            job.error = f"Protocol '{protocol_name}' not found by name or ID"
+                            job.add_event("execution_failed", job.error)
+                            return
+                        job.add_event("protocol_resolved", f"id={proto.get('id')} (via list search)")
+                    except VmAgentError as e2:
                         job.status = "failed"
-                        job.error = f"Protocol '{protocol_name}' not found by name or ID"
+                        job.error = f"Protocol '{protocol_name}' not found: {e2}"
                         job.add_event("execution_failed", job.error)
                         return
-                    job.add_event("protocol_resolved", f"id={proto.get('id')} (via list search)")
-                except VmAgentError as e2:
+                else:
                     job.status = "failed"
-                    job.error = f"Protocol '{protocol_name}' not found: {e2}"
+                    job.error = f"Protocol '{protocol_name}' not found: {e}"
                     job.add_event("execution_failed", job.error)
                     return
-            else:
-                job.status = "failed"
-                job.error = f"Protocol '{protocol_name}' not found: {e}"
-                job.add_event("execution_failed", job.error)
-                return
 
         if self.dry_run:
             job.status = "completed"
