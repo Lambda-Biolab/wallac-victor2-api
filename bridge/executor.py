@@ -484,8 +484,8 @@ class BridgeExecutor:
         raw_wells: list[dict[str, Any]] = []
 
         # Find the new assay: any assay_id > max_assay_before with
-        # matching protocol name. Retry for MDB flush (can take 1-3min).
-        for attempt in range(60):
+        # matching protocol name. Retry for MDB flush.
+        for attempt in range(20):
             assay_id = _find_assay_after(
                 self.vm_agent, job.max_assay_before, proto_name
             )
@@ -504,12 +504,22 @@ class BridgeExecutor:
         if not raw_wells:
             job.add_event("assay_id_resolution_failed",
                           f"No new assay found after max_assay_before={job.max_assay_before}")
-            # Last resort: try run-level endpoint
-            try:
-                results = self.vm_agent.get_run_results(run_id)
-                raw_wells = results.get("wells", results.get("data", []))
-            except VmAgentError:
-                pass
+            # Last resort: use live_wells accumulated during polling.
+            # The MDB flush can take 4+ minutes; live_wells is the only
+            # source of complete data when MDB is not yet flushed.
+            if job.live_wells:
+                raw_wells = [
+                    {"well": w.get("well", ""), "od": w.get("od"), "counts": w.get("counts")}
+                    for w in job.live_wells
+                ]
+                job.add_event("results_from_live_wells", f"{len(raw_wells)} wells (MDB not flushed)")
+            else:
+                # Fallback to run-level endpoint (only returns live well)
+                try:
+                    results = self.vm_agent.get_run_results(run_id)
+                    raw_wells = results.get("wells", results.get("data", []))
+                except VmAgentError:
+                    pass
 
         job.add_event("results_fetched", f"{len(raw_wells)} wells")
 
