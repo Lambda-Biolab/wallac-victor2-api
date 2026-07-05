@@ -41,6 +41,10 @@ class JobSubmitRequest(BaseModel):
     protocol_name: str = Field("", description="Wallac protocol name (existing_protocol mode)")
     protocol_id: int = Field(0, description="Wallac protocol ID (existing_protocol mode, takes precedence over protocol_name)")
     elabftw_experiment_id: int = Field(0, description="eLabFTW experiment ID for result write-back")
+    wells_spec: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Well specification for plate map override: {all: true}, {rows: [A,B]}, or {wells: [A1,A2]}",
+    )
     expected_outputs: str = Field("", description="Expected measurement outputs")
     spec_dict: dict[str, Any] = Field(
         default_factory=dict, description="Parsed job spec (generated_protocol mode)"
@@ -59,6 +63,7 @@ class JobResponse(BaseModel):
     protocol_name: str
     protocol_id: int
     elabftw_experiment_id: int
+    wells_spec: dict[str, Any] = {}
     status: str
     created_at: str
     started_at: str
@@ -86,6 +91,7 @@ def _job_to_response(job: Job) -> JobResponse:
         protocol_name=job.protocol_name,
         protocol_id=job.protocol_id,
         elabftw_experiment_id=job.elabftw_experiment_id,
+        wells_spec=job.wells_spec,
         status=job.status,
         created_at=job.created_at,
         started_at=job.started_at,
