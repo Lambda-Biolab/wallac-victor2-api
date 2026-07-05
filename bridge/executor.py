@@ -484,8 +484,8 @@ class BridgeExecutor:
         raw_wells: list[dict[str, Any]] = []
 
         # Find the new assay: any assay_id > max_assay_before with
-        # matching protocol name. Retry for MDB flush (can take 30-120s).
-        for attempt in range(15):
+        # matching protocol name. Retry for MDB flush (can take 1-3min).
+        for attempt in range(60):
             assay_id = _find_assay_after(
                 self.vm_agent, job.max_assay_before, proto_name
             )
