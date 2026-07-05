@@ -168,17 +168,15 @@ class BridgeExecutor:
         if job.status in ("failed", "aborted"):
             return
 
-        # Fetch the run record to get the vm-agent's job_id (assay_id),
-        # which is needed to fetch the full 96-well results from the MDB.
-        # GET /runs/{id}/results only returns the "live" well; GET /jobs/{id}/results
-        # returns all wells from the historical MDB.
-        try:
-            run_record = self.vm_agent.get_run(run_id)
-            job.assay_prot_id = run_record.get("job_id", 0) or run_record.get("assay_id", 0)
-            if job.assay_prot_id:
-                job.add_event("assay_id_resolved", str(job.assay_prot_id))
-        except Exception as e:
-            job.add_event("assay_id_resolution_failed", str(e))
+        # assay_prot_id was captured during _poll_run from live well data.
+        # The vm-agent's run record has job_id (internal counter) and
+        # assay_id (usually 0) — neither is the MDB assay_id needed for
+        # GET /jobs/{id}/results. The live well data includes the correct
+        # assay_id.
+        if job.assay_prot_id:
+            job.add_event("assay_id_resolved", str(job.assay_prot_id))
+        else:
+            job.add_event("assay_id_resolution_failed", "no assay_id in live well data")
 
         # Fetch results
         self._fetch_and_writeback(job, run_id)
@@ -412,6 +410,12 @@ class BridgeExecutor:
                                 "od": w.get("od"),
                                 "counts": w.get("counts"),
                             }
+                            # Capture the MDB assay_id — needed to fetch
+                            # full 96-well results after completion. The
+                            # run record's job_id is NOT the MDB assay_id.
+                            aid = w.get("assay_id", 0)
+                            if aid and not job.assay_prot_id:
+                                job.assay_prot_id = aid
                         job.live_wells = list(existing.values())
                 except Exception:
                     pass  # live fetch is best-effort
