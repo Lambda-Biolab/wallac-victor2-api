@@ -28,7 +28,6 @@ jobs:
         run: |
           uv pip install --system \
             ruff==0.15.15 \
-            complexipy==5.5.0 \
             pyright \
             pytest \
             fastapi \
