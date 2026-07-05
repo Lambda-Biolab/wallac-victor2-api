@@ -168,6 +168,18 @@ class BridgeExecutor:
         if job.status in ("failed", "aborted"):
             return
 
+        # Fetch the run record to get the vm-agent's job_id (assay_id),
+        # which is needed to fetch the full 96-well results from the MDB.
+        # GET /runs/{id}/results only returns the "live" well; GET /jobs/{id}/results
+        # returns all wells from the historical MDB.
+        try:
+            run_record = self.vm_agent.get_run(run_id)
+            job.assay_prot_id = run_record.get("job_id", 0) or run_record.get("assay_id", 0)
+            if job.assay_prot_id:
+                job.add_event("assay_id_resolved", str(job.assay_prot_id))
+        except Exception as e:
+            job.add_event("assay_id_resolution_failed", str(e))
+
         # Fetch results
         self._fetch_and_writeback(job, run_id)
 
@@ -447,7 +459,14 @@ class BridgeExecutor:
         raw_wells: list[dict[str, Any]] = []
         for _ in range(8):
             try:
-                results = self.vm_agent.get_run_results(run_id)
+                # Try job-level results first (GET /jobs/{id}/results) —
+                # this reads from the historical MDB and returns ALL wells.
+                # The run-level endpoint (GET /runs/{id}/results) only
+                # returns the "live" well from the status monitor.
+                if job.assay_prot_id:
+                    results = self.vm_agent.get_job_results(job.assay_prot_id)
+                else:
+                    results = self.vm_agent.get_run_results(run_id)
             except VmAgentError as e:
                 job.status = "failed"
                 job.error = f"Failed to fetch results: {e}"
