@@ -443,6 +443,16 @@ class BridgeExecutor:
                 except Exception:
                     pass  # live fetch is best-effort
 
+                # Emit a progress event every ~3s (every 3rd live fetch)
+                # so the orchestrator can show well count progress to the user.
+                well_count = len(job.live_wells)
+                if well_count > 0 and int(now * 3) % 3 == 0:
+                    total = len(measured_wells) if measured_wells else 96
+                    job.add_event(
+                        "run_progress",
+                        f"{well_count}/{total} wells measured",
+                    )
+
             # vm-agent terminal states: "measured" (completed successfully),
             # "completed", "done", "finished"
             if state in ("measured", "completed", "done", "finished"):
@@ -490,7 +500,9 @@ class BridgeExecutor:
 
         # Find the new assay: any assay_id > max_assay_before with
         # matching protocol name. Retry for MDB flush.
-        for attempt in range(20):
+        # The Wallac OEM software can take 2-5 minutes to flush the MDB
+        # to disk after a run completes. 100 × 3s = 300s = 5 minutes.
+        for attempt in range(100):
             assay_id = _find_assay_after(self.vm_agent, job.max_assay_before, proto_name)
             if assay_id:
                 try:
@@ -504,6 +516,13 @@ class BridgeExecutor:
                         break
                 except VmAgentError:
                     pass
+            # Emit progress every 10 attempts (30s) so the orchestrator
+            # can show "Waiting for instrument database to flush…" to the user.
+            if attempt > 0 and attempt % 10 == 0:
+                job.add_event(
+                    "fetching_results",
+                    f"Waiting for MDB flush ({attempt * 3}s elapsed)",
+                )
             time.sleep(3.0)
 
         if not raw_wells:
