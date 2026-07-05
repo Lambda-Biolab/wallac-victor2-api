@@ -29,11 +29,12 @@ jobs:
           uv pip install --system \
             ruff==0.15.15 \
             complexipy==5.5.0 \
+            pyright \
             pytest \
             fastapi \
             httpx \
             pydantic \
             pynacl
 
-      - name: Validate (lint + format-check + complexity + tests)
+      - name: Validate (lint + typecheck + format-check + complexity + tests)
         run: make validate

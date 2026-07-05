@@ -15,9 +15,9 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import urllib.error
-import urllib.request
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
@@ -66,18 +66,18 @@ class VmAgentClient:
 
         url = f"{self.base}{encoded_path}"
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method)
+        req = Request(url, data=data, method=method)
         if self.token:
             req.add_header("Authorization", f"Bearer {self.token}")
         if body is not None:
             req.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urlopen(req, timeout=self.timeout) as resp:
                 content = resp.read()
                 if not content:
                     return None
                 return json.loads(content)
-        except urllib.error.HTTPError as e:
+        except HTTPError as e:
             detail = ""
             with contextlib.suppress(Exception):
                 detail = e.read().decode()[:500]
@@ -86,7 +86,7 @@ class VmAgentClient:
                 status_code=e.code,
                 detail=detail,
             ) from e
-        except urllib.error.URLError as e:
+        except URLError as e:
             raise VmAgentError(
                 f"vm-agent {method} {path} unreachable: {e}",
             ) from e
@@ -264,10 +264,10 @@ class VmAgentClient:
         """GET /jobs/{id}/export — CSV export of job results."""
         params = f"format={format}&value={value}"
         url = f"{self.base}/jobs/{job_id}/export?{params}"
-        req = urllib.request.Request(url)
+        req = Request(url)
         if self.token:
             req.add_header("Authorization", f"Bearer {self.token}")
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+        with urlopen(req, timeout=self.timeout) as resp:
             return resp.read().decode()
 
     # --- Admin ---

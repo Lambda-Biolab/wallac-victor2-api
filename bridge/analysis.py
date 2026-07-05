@@ -28,7 +28,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 from .schemas import AnalysisSpec, WellRole
 
@@ -362,7 +362,7 @@ class AnalysisPipeline:
             result.normalization_factor = None
             return
 
-        mean_control = sum(control_values) / len(control_values)
+        mean_control = sum(cast("list[float]", control_values)) / len(control_values)
         if mean_control == 0:
             result.normalization_factor = None
             return
@@ -412,6 +412,9 @@ class AnalysisPipeline:
                     or w.primary_value is not None
                 )
             ]
+            # The filter guard ensures no None values, but pyright can't track
+            # this through the nested ternary — safe to cast.
+            values = cast("list[float]", values)
 
             if not values:
                 continue

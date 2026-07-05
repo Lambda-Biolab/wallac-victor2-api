@@ -78,7 +78,7 @@ class DesignerElabftwClient(Protocol):
     Job categories.
     """
 
-    def list_items(self, category_id: int) -> list[dict[str, Any]]:
+    def list_items(self, category_id: int, expected_schema: str = "") -> list[dict[str, Any]]:
         """List all items in a resource category."""
         ...
 

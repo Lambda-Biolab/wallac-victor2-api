@@ -493,5 +493,12 @@ class RecoveryManager:
                 operator_hint="Create a new signed Automation Job to retry.",
                 details={"persisted_state": persisted_state.value},
             )
+        else:
+            error = BridgeError(
+                code="unknown_final_state",
+                severity=Severity.ERROR,
+                human_message=f"Unknown final state: {final.value}",
+                details={"persisted_state": persisted_state.value},
+            )
 
         return final, error

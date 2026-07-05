@@ -9,10 +9,11 @@ GATED := vm-agent/agent.py vm-agent/lid_watcher.py vm-agent/launch_as_user.py \
          bridge/vm_agent_client.py bridge/spool.py bridge/execution.py \
          bridge/jobs.py bridge/bridge_app.py
 
-.PHONY: validate format test complexity setup_dev
+.PHONY: validate format test typecheck complexity setup_dev
 
-validate:  ## lint + format-check + complexity + tests
+validate:  ## lint + typecheck + format-check + complexity + tests
 	ruff check .
+	pyright bridge/
 	ruff format --check .
 	complexipy $(GATED) -mx 15
 	pytest -q
@@ -23,6 +24,9 @@ format:  ## auto-fix lint + format
 
 test:  ## run the unit tests
 	pytest -q
+
+typecheck:  ## static type check (pyright, bridge/ only — vm-agent is Windows/comtypes)
+	pyright bridge/
 
 complexity:  ## cognitive complexity gate on the agent stack
 	complexipy $(GATED) -mx 15
