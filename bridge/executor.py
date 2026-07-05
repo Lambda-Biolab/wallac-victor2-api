@@ -143,6 +143,37 @@ class BridgeExecutor:
             job.add_event("dry_run_complete", f"Would run protocol {protocol_name}")
             return
 
+        # If wells_spec is provided, clone the protocol and update its plate map.
+        # The OEM software caches protocol plate maps in memory — cloning with
+        # a new ID forces a fresh read from the MDB. The clone is deleted after.
+        cloned_proto_id = 0
+        if job.wells_spec:
+            import time as _time
+            import random
+            # Generate a unique ID in the reserved high range (2,000,000+)
+            cloned_proto_id = 2000000 + int(_time.time()) % 100000 + random.randint(0, 999)
+            clone_name = f"ELAB-Temp-{cloned_proto_id}"
+            try:
+                job.add_event("cloning_protocol", f"template={proto.get('id')} new_id={cloned_proto_id}")
+                self.vm_agent.clone_protocol(proto.get("id"), cloned_proto_id, clone_name)
+                job.add_event("clone_created", str(cloned_proto_id))
+
+                # Update the plate map on the clone
+                self._update_wells(cloned_proto_id, job.wells_spec)
+                job.add_event("plate_map_updated", str(job.wells_spec))
+
+                # Use the clone for the run
+                proto = {"id": cloned_proto_id, "name": clone_name}
+            except Exception as e:
+                job.status = "failed"
+                job.error = f"Protocol clone/plate map update failed: {e}"
+                job.add_event("execution_failed", job.error)
+                # Clean up partial clone
+                if cloned_proto_id:
+                    with contextlib.suppress(Exception):
+                        self.vm_agent.delete_protocol(cloned_proto_id)
+                return
+
         # Start the run — use the protocol ID (resolved above) to avoid
         # URL path issues with names containing special characters
         proto_id = proto.get("id", protocol_name)
@@ -181,7 +212,9 @@ class BridgeExecutor:
         # Fetch results
         self._fetch_and_writeback(job, run_id)
 
-    # --- generated_protocol mode ---
+        # Clean up the cloned protocol (always, even on failure).
+        if cloned_proto_id:
+            self._cleanup_cloned_protocol(cloned_proto_id)
 
     def _execute_generated_protocol(self, job: Job) -> None:
         """Run a generated protocol from signed method/layout/analysis refs.
@@ -341,6 +374,30 @@ class BridgeExecutor:
             logger.info("Cleaned up cloned protocol %s", proto_id)
         except Exception as e:
             logger.warning("Failed to clean up cloned protocol %s: %s", proto_id, e)
+
+    def _update_wells(self, proto_id: int, wells_spec: dict[str, Any]) -> None:
+        """Update a protocol's plate map via the vm-agent /wells endpoint.
+
+        Accepts three formats:
+          {"all": true} — all 96 wells
+          {"rows": ["A", "B", ...]} — entire rows
+          {"wells": ["A1", "A2", ...]} — specific wells
+        """
+        if wells_spec.get("all"):
+            body = {"all": True}
+        elif wells_spec.get("rows"):
+            body = {"rows": wells_spec["rows"]}
+        elif wells_spec.get("wells"):
+            body = {"wells": wells_spec["wells"]}
+        else:
+            return  # no valid spec
+
+        # Use the vm-agent's high-level /wells endpoint
+        self.vm_agent._request(
+            "PATCH",
+            f"/mdb/protocols/{proto_id}/wells",
+            body=body,
+        )
 
     def _poll_run(self, job: Job, run_id: str, measured_wells: set[str] | None = None) -> None:
         """Poll vm-agent for run completion. Updates job.status.

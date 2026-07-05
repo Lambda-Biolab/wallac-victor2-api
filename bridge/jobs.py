@@ -93,6 +93,12 @@ class Job:
     protocol_name: str = ""
     protocol_id: int = 0
     elabftw_experiment_id: int = 0
+    # Well specification for plate map override. Format:
+    #   {"all": true} — all 96 wells
+    #   {"rows": ["A", "B", ...]} — entire rows
+    #   {"wells": ["A1", "A2", ...]} — specific wells
+    # When empty, uses the protocol's factory plate map.
+    wells_spec: dict[str, Any] = field(default_factory=dict)
     spec_dict: dict[str, Any] = field(default_factory=dict)
     method_ref: dict[str, Any] = field(default_factory=dict)
     layout_ref: dict[str, Any] = field(default_factory=dict)
@@ -127,6 +133,7 @@ class Job:
             "protocol_name": self.protocol_name,
             "protocol_id": self.protocol_id,
             "elabftw_experiment_id": self.elabftw_experiment_id,
+            "wells_spec": self.wells_spec,
             "status": self.status,
             "created_at": self.created_at,
             "started_at": self.started_at,
@@ -187,6 +194,7 @@ class JobManager:
             protocol_name=job_spec.get("protocol_name", ""),
             protocol_id=job_spec.get("protocol_id", 0),
             elabftw_experiment_id=job_spec.get("elabftw_experiment_id", 0),
+            wells_spec=job_spec.get("wells_spec", {}),
             spec_dict=job_spec.get("spec_dict", {}),
             method_ref=job_spec.get("method_ref", {}),
             layout_ref=job_spec.get("layout_ref", {}),
