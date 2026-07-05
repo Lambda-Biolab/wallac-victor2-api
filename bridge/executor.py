@@ -485,32 +485,67 @@ class BridgeExecutor:
     ) -> None:
         """Fetch results from vm-agent, run analysis, write back to eLabFTW.
 
-        Retries fetching results because the OEM app doesn't flush them to
-        the MDB immediately after IsMeasured flips.
+        The OEM app (MlrMgr.exe) writes results to the MDB asynchronously
+        after the run completes. We wait for the flush, then look up the
+        correct assay_id from the MDB job list.
         """
         job.add_event("fetching_results", run_id)
+
+        # Resolve the MDB assay_id from the job list.
+        # The assay_id from live_wells (captured during polling) can be
+        # stale if the OEM software creates multiple assay entries.
+        # Instead, query GET /jobs and find the latest assay matching our
+        # protocol. Retry until results appear (MDB flush can take 15-30s).
+        assay_id = job.assay_prot_id or 0
+        proto_name = job.protocol_name or ""
         raw_wells: list[dict[str, Any]] = []
-        # The OEM app doesn't flush results to the MDB immediately.
-        # Retry up to 12 times at 2s intervals (~24s total).
+
         for attempt in range(12):
+            # Try the assay_id we already have (from live_wells capture).
+            if assay_id:
+                try:
+                    results = self.vm_agent.get_job_results(assay_id)
+                    raw_wells = results.get("wells", results.get("data", []))
+                    if raw_wells:
+                        break
+                except VmAgentError:
+                    pass
+
+            # Fallback: find latest assay in the MDB matching our protocol.
             try:
-                # Try job-level results first (GET /jobs/{id}/results) —
-                # this reads from the historical MDB and returns ALL wells.
-                # The run-level endpoint (GET /runs/{id}/results) only
-                # returns the "live" well from the status monitor.
-                if job.assay_prot_id:
-                    results = self.vm_agent.get_job_results(job.assay_prot_id)
-                else:
-                    results = self.vm_agent.get_run_results(run_id)
-            except VmAgentError as e:
-                job.status = "failed"
-                job.error = f"Failed to fetch results: {e}"
-                job.add_event("execution_failed", job.error)
-                return
-            raw_wells = results.get("wells", results.get("data", []))
-            if raw_wells:
-                break
-            time.sleep(2.0)  # OEM app hasn't flushed yet
+                jobs_list = self.vm_agent.get_jobs()
+                jobs = jobs_list.get("jobs", jobs_list) if isinstance(jobs_list, dict) else jobs_list
+                best_id = 0
+                for j in jobs:
+                    jid = j.get("assay_id", 0)
+                    jname = j.get("protocol_name", "")
+                    if jid > best_id and jname == proto_name:
+                        best_id = jid
+                if best_id and best_id != assay_id:
+                    try:
+                        results = self.vm_agent.get_job_results(best_id)
+                        candidate_wells = results.get("wells", results.get("data", []))
+                        if candidate_wells:
+                            assay_id = best_id
+                            job.assay_prot_id = best_id
+                            raw_wells = candidate_wells
+                            job.add_event("assay_id_from_job_list", str(best_id))
+                            break
+                    except VmAgentError:
+                        pass
+            except Exception:
+                pass
+
+            if not raw_wells:
+                time.sleep(4.0)
+
+        if not assay_id and not raw_wells:
+            # Last resort: try run-level endpoint (only returns live well).
+            try:
+                results = self.vm_agent.get_run_results(run_id)
+                raw_wells = results.get("wells", results.get("data", []))
+            except VmAgentError:
+                pass
 
         job.add_event("results_fetched", f"{len(raw_wells)} wells")
 
