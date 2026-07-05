@@ -392,6 +392,7 @@ class ValidationService:
 
     def _check_vm_agent_capabilities(self, job: JobSpec, report: ValidationReport) -> None:
         """Check that vm-agent is healthy and supports the required mode."""
+        assert self.vm_agent is not None  # caller checks before calling
         try:
             health = self.vm_agent.get_health()
         except Exception as e:

@@ -8,9 +8,11 @@ IMPORTANT: On Windows 7 with UAC, writes to C:\\Program Files\\... get
 redirected to the VirtualStore path. The agent reads from the
 VirtualStore path, so we must write there too.
 """
-import comtypes.client
+
 import datetime
 import os
+
+import comtypes.client
 
 # Try VirtualStore path first (where the agent reads from), then fall
 # back to the real Program Files path.
@@ -104,11 +106,15 @@ db.Close()
 
 # --- 4. Verify ---
 db2 = eng.OpenDatabase(MDB_SRC, False, True)
-rs = db2.OpenRecordset("SELECT AssayProtID, ProtName, MeasSequence, FactoryPreset FROM AssayProtocol WHERE ProtName LIKE '%610%'")
+rs = db2.OpenRecordset(
+    "SELECT AssayProtID, ProtName, MeasSequence, FactoryPreset FROM AssayProtocol WHERE ProtName LIKE '%610%'"
+)
 print("\n=== Verification ===")
 while not rs.EOF:
-    print(f"  id={rs.Fields.Item('AssayProtID').Value} name={rs.Fields.Item('ProtName').Value!r} "
-          f"seq={rs.Fields.Item('MeasSequence').Value!r} factory={rs.Fields.Item('FactoryPreset').Value}")
+    print(
+        f"  id={rs.Fields.Item('AssayProtID').Value} name={rs.Fields.Item('ProtName').Value!r} "
+        f"seq={rs.Fields.Item('MeasSequence').Value!r} factory={rs.Fields.Item('FactoryPreset').Value}"
+    )
     rs.MoveNext()
 rs.Close()
 db2.Close()

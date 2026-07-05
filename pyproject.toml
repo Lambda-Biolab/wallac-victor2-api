@@ -5,8 +5,8 @@
 #   vm-agent/{agent,lid_watcher,launch_as_user}.py
 #   bridge/{elabftw,signature,intake,models,errors}.py
 # The COM-introspection diagnostics (vm-agent/probe.py, dump_*.py) are research
-# tools and are excluded. pyright is intentionally not run: the agent is
-# Windows/comtypes-only, so it false-positives on a Linux host/CI.
+# tools and are excluded. Pyright checks bridge/ only — the vm-agent uses
+# Windows/comtypes which false-positives on a Linux host/CI.
 
 [tool.ruff]
 line-length = 100
@@ -32,3 +32,12 @@ max_complexity_allowed = 15
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = ["-ra", "--strict-markers"]
+
+[tool.pyright]
+include = ["bridge"]
+exclude = ["vm-agent"]
+# Bridge runs on Python 3.13 (lambdabiolab-computer); CI uses 3.11.
+# vm-agent (Python 3.8 on Windows 7) is excluded above.
+pythonVersion = "3.11"
+venvPath = "."
+venv = ".venv"

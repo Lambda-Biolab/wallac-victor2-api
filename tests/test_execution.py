@@ -34,7 +34,7 @@ class TestVmAgentClient:
         assert c.base == "http://localhost:8420"
         assert c.token == "abc"
 
-    @patch("bridge.vm_agent_client.urllib.request.urlopen")
+    @patch("bridge.vm_agent_client.urlopen")
     def test_get_health(self, mock_urlopen: MagicMock) -> None:
         mock_resp = MagicMock()
         mock_resp.read.return_value = json.dumps({"ok": True}).encode()
@@ -44,7 +44,7 @@ class TestVmAgentClient:
         result = c.get_health()
         assert result == {"ok": True}
 
-    @patch("bridge.vm_agent_client.urllib.request.urlopen")
+    @patch("bridge.vm_agent_client.urlopen")
     def test_start_run(self, mock_urlopen: MagicMock) -> None:
         mock_resp = MagicMock()
         mock_resp.read.return_value = json.dumps(
@@ -59,7 +59,7 @@ class TestVmAgentClient:
         result = c.start_run("Absorbance 600")
         assert result["run_id"] == "r-abc123"
 
-    @patch("bridge.vm_agent_client.urllib.request.urlopen")
+    @patch("bridge.vm_agent_client.urlopen")
     def test_measure(self, mock_urlopen: MagicMock) -> None:
         mock_resp = MagicMock()
         mock_resp.read.return_value = json.dumps(

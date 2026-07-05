@@ -99,6 +99,7 @@ class ExecutionResult:
     analysis_result: AnalysisResult | None = None
     spooled: bool = False
     error: str = ""
+    result_summary: str = ""
     events: list[dict[str, str]] = field(default_factory=list)
 
     def add_event(self, event: str, detail: str = "") -> None:

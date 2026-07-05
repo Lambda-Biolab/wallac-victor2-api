@@ -178,7 +178,7 @@ class DashboardStateStore:
         Returns True if notified (state may have changed), False on timeout.
         """
         with self._cond:
-            return self._cond.wait_for(timeout)
+            return self._cond.wait(timeout=timeout)
 
 
 # --- HTTP server ------------------------------------------------------------
@@ -190,7 +190,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "WallacBridgeDashboard/0.1"
 
     # Suppress default logging (the bridge logs its own messages)
-    def log_message(self, fmt: str, *args: Any) -> None:
+    def log_message(self, format: str, *args: Any) -> None:
         pass
 
     def _send_json(self, code: int, payload: Any) -> None:
