@@ -479,3 +479,86 @@ exact state transition
 Previously, the agent would remain stuck in the "running" state indefinitely
 until the operator noticed and manually aborted/cleared. The fix checks the
 instrument's live state on each monitor tick and closes stale runs.
+
+## Wallac Victor2 MDB schema — what data is actually stored
+
+The Wallac Victor2 stores results in a Microsoft Access (Jet) database
+(`Mlr3.mdb`). The schema was discovered by querying the MDB directly via
+DAO (`DAO.DBEngine.36`).
+
+### Result table (per-well measurements)
+
+Fields: `PlateID`, `WellID`, `LabelIndex`, `ResultType`, `RepeatNumber`,
+`MeasA`, `MeasB`, `MeasTime`
+
+- **`MeasA`** — raw signal intensity (A/D converter counts). This is the
+  photomultiplier tube (PMT) reading for each well.
+- **`MeasB`** — number of flashes (measurements) averaged for this result.
+- **There is NO pre-computed OD/absorbance field.** The OEM software does
+  not store absorbance — it only stores raw signal counts. Absorbance is
+  computed on-the-fly when results are displayed.
+
+### PlateResult table (per-plate metadata)
+
+Fields: `PlateID`, `AssayID`, `PlateNumber`, `RepeatNumber`,
+`AllPosMeasured`, `BarCode`, `TempAtStart`, `TempAtEnd`, `MeasDate`,
+`Errors`, `Notes`, `LabelPlateBackgrounds`
+
+- **`LabelPlateBackgrounds`** — packed string containing the instrument's
+  internal reference reading. Format: `label,result_type#count,flashes;`
+  e.g. `1,0#313706,2;` means label=1, result_type=0, count=313706,
+  flashes=2. This is the I₀ (reference intensity) for the Beer-Lambert
+  calculation. The Victor2 takes this reading automatically at the start
+  of each run from an internal reference position — the user does not set
+  it manually.
+
+### WellResult table (well addresses)
+
+Fields: `PlateID`, `WellID`, `Well`, `SampleTypeID`
+
+- Maps numeric `WellID` to alphanumeric well addresses (A01, A02, ...).
+
+### How absorbance is computed
+
+The vm-agent's `_od()` function (`agent.py:804`) computes absorbance
+using the Beer-Lambert formula:
+
+```
+A = log10((I0 / flashes_ref) / (signal / flashes))
+```
+
+Where:
+- `I0` = `background_count` from `LabelPlateBackgrounds`
+- `flashes_ref` = `background_flashes` from `LabelPlateBackgrounds`
+- `signal` = `MeasA` from the `Result` table
+- `flashes` = `MeasB` from the `Result` table
+
+This is the standard absorbance formula: A = log10(I0/I). The vm-agent
+is doing the same calculation the OEM software would do.
+
+### What this means for users
+
+- **You do NOT need to do your own calculations.** The vm-agent computes
+  absorbance correctly from the raw signal.
+- **The reference is automatic.** The Victor2 reads an internal reference
+  position at the start of each run. You don't set a blank manually.
+- **Well-level blanking is NOT included.** If you want to subtract a
+  blank column's average from all wells (e.g. for background correction
+  against a specific sample layout), that must be done as a
+  post-processing step in eLabFTW or downstream analysis.
+- **The `counts` field in API responses is `MeasA`** (raw signal
+  intensity). The `od` field is the computed absorbance.
+
+### MDB flush timing
+
+The OEM software does not flush the MDB to disk immediately after a
+run completes. The flush can take 2-5 minutes. The bridge's
+`_fetch_and_writeback()` method retries for up to 5 minutes
+(100 x 3s) waiting for the MDB to flush. If the flush doesn't complete
+in time, the bridge falls back to `live_wells` (accumulated during
+polling) which only have raw counts -- no OD values.
+
+- **References:** `vm-agent/agent.py` (`_od()` at line 804,
+  `op_job_results()` at line 820, `_parse_backgrounds()` at line 784,
+  `_JOB_RESULTS_SQL` at line 727, `_open_results_db()` at line 741),
+  `bridge/executor.py` (`_fetch_and_writeback()` at line 473).
