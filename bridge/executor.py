@@ -53,6 +53,24 @@ def _normalize_well_name(name: str) -> str:
     return name
 
 
+def _find_assay_after(vm_agent, max_before: int, proto_name: str) -> int:
+    """Find the newest MDB assay_id greater than max_before matching proto_name."""
+    try:
+        jobs_list = vm_agent.get_jobs()
+        jobs = jobs_list.get("jobs", jobs_list) if isinstance(jobs_list, dict) else jobs_list
+        best_id = 0
+        for j in jobs:
+            jid = j.get("assay_id", 0)
+            if jid > max_before:
+                jname = j.get("protocol_name", "")
+                if max_before == 0 or jname == proto_name:
+                    if jid > best_id:
+                        best_id = jid
+        return best_id
+    except Exception:
+        return 0
+
+
 class BridgeExecutor:
     """Executes direct-submit jobs through the vm-agent and writes results to eLabFTW.
 
@@ -142,6 +160,22 @@ class BridgeExecutor:
             job.status = "completed"
             job.add_event("dry_run_complete", f"Would run protocol {protocol_name}")
             return
+
+        # Snapshot the max MDB assay_id before starting the run.
+        # After the run completes, we find the NEW assay(s) with
+        # assay_id > this max to fetch the correct results.
+        max_assay_before = 0
+        try:
+            jobs_before = self.vm_agent.get_jobs()
+            jlist = jobs_before.get("jobs", jobs_before) if isinstance(jobs_before, dict) else jobs_before
+            for j in jlist:
+                aid = j.get("assay_id", 0)
+                if aid > max_assay_before:
+                    max_assay_before = aid
+        except Exception:
+            pass
+        job.max_assay_before = max_assay_before
+        job.add_event("assay_snapshot_before", str(max_assay_before))
 
         # Start the run — use the protocol ID (resolved above) to avoid
         # URL path issues with names containing special characters
@@ -340,30 +374,6 @@ class BridgeExecutor:
         except Exception as e:
             logger.warning("Failed to clean up cloned protocol %s: %s", proto_id, e)
 
-    def _update_wells(self, proto_id: int, wells_spec: dict[str, Any]) -> None:
-        """Update a protocol's plate map via the vm-agent /wells endpoint.
-
-        Accepts three formats:
-          {"all": true} — all 96 wells
-          {"rows": ["A", "B", ...]} — entire rows
-          {"wells": ["A1", "A2", ...]} — specific wells
-        """
-        if wells_spec.get("all"):
-            body = {"all": True}
-        elif wells_spec.get("rows"):
-            body = {"rows": wells_spec["rows"]}
-        elif wells_spec.get("wells"):
-            body = {"wells": wells_spec["wells"]}
-        else:
-            return  # no valid spec
-
-        # Use the vm-agent's high-level /wells endpoint
-        self.vm_agent._request(
-            "PATCH",
-            f"/mdb/protocols/{proto_id}/wells",
-            body=body,
-        )
-
     def _poll_run(self, job: Job, run_id: str, measured_wells: set[str] | None = None) -> None:
         """Poll vm-agent for run completion. Updates job.status.
 
@@ -415,18 +425,6 @@ class BridgeExecutor:
             now = time.monotonic()
             if now - last_live_fetch >= 1.0:
                 last_live_fetch = now
-
-                # Fetch status to capture MDB assay_id (only available here).
-                if not job.assay_prot_id:
-                    try:
-                        status = self.vm_agent.get_status()
-                        for sw in status.get("live_wells", []):
-                            aid = sw.get("assay_id", 0)
-                            if aid:
-                                job.assay_prot_id = aid
-                                break
-                    except Exception:
-                        pass
 
                 try:
                     live = self.vm_agent.get_run_results(run_id)
@@ -485,62 +483,37 @@ class BridgeExecutor:
     ) -> None:
         """Fetch results from vm-agent, run analysis, write back to eLabFTW.
 
-        The OEM app (MlrMgr.exe) writes results to the MDB asynchronously
-        after the run completes. We wait for the flush, then look up the
-        correct assay_id from the MDB job list.
+        Finds the correct MDB assay_id by comparing the pre-run snapshot
+        (max_assay_before) with the current job list. The OEM software
+        creates a new assay entry for each run with a sequential ID.
         """
         job.add_event("fetching_results", run_id)
 
-        # Resolve the MDB assay_id from the job list.
-        # The assay_id from live_wells (captured during polling) can be
-        # stale if the OEM software creates multiple assay entries.
-        # Instead, query GET /jobs and find the latest assay matching our
-        # protocol. Retry until results appear (MDB flush can take 15-30s).
-        assay_id = job.assay_prot_id or 0
         proto_name = job.protocol_name or ""
         raw_wells: list[dict[str, Any]] = []
 
+        # Find the new assay: any assay_id > max_assay_before with
+        # matching protocol name. Retry for MDB flush (can take 15-30s).
         for attempt in range(12):
-            # Try the assay_id we already have (from live_wells capture).
+            assay_id = _find_assay_after(
+                self.vm_agent, job.max_assay_before, proto_name
+            )
             if assay_id:
                 try:
                     results = self.vm_agent.get_job_results(assay_id)
                     raw_wells = results.get("wells", results.get("data", []))
                     if raw_wells:
+                        job.assay_prot_id = assay_id
+                        job.add_event("assay_id_resolved", f"{assay_id} (post-run, attempt {attempt+1})")
                         break
                 except VmAgentError:
                     pass
+            time.sleep(3.0)
 
-            # Fallback: find latest assay in the MDB matching our protocol.
-            try:
-                jobs_list = self.vm_agent.get_jobs()
-                jobs = jobs_list.get("jobs", jobs_list) if isinstance(jobs_list, dict) else jobs_list
-                best_id = 0
-                for j in jobs:
-                    jid = j.get("assay_id", 0)
-                    jname = j.get("protocol_name", "")
-                    if jid > best_id and jname == proto_name:
-                        best_id = jid
-                if best_id and best_id != assay_id:
-                    try:
-                        results = self.vm_agent.get_job_results(best_id)
-                        candidate_wells = results.get("wells", results.get("data", []))
-                        if candidate_wells:
-                            assay_id = best_id
-                            job.assay_prot_id = best_id
-                            raw_wells = candidate_wells
-                            job.add_event("assay_id_from_job_list", str(best_id))
-                            break
-                    except VmAgentError:
-                        pass
-            except Exception:
-                pass
-
-            if not raw_wells:
-                time.sleep(4.0)
-
-        if not assay_id and not raw_wells:
-            # Last resort: try run-level endpoint (only returns live well).
+        if not raw_wells:
+            job.add_event("assay_id_resolution_failed",
+                          f"No new assay found after max_assay_before={job.max_assay_before}")
+            # Last resort: try run-level endpoint
             try:
                 results = self.vm_agent.get_run_results(run_id)
                 raw_wells = results.get("wells", results.get("data", []))
