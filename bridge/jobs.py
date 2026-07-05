@@ -99,6 +99,9 @@ class Job:
     #   {"wells": ["A1", "A2", ...]} — specific wells
     # When empty, uses the protocol's factory plate map.
     wells_spec: dict[str, Any] = field(default_factory=dict)
+    # Snapshot of max MDB assay_id before the run — used to identify
+    # the new assay created by this run.
+    max_assay_before: int = 0
     spec_dict: dict[str, Any] = field(default_factory=dict)
     method_ref: dict[str, Any] = field(default_factory=dict)
     layout_ref: dict[str, Any] = field(default_factory=dict)
