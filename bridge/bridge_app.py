@@ -39,6 +39,7 @@ class JobSubmitRequest(BaseModel):
         "existing_protocol", description="existing_protocol or generated_protocol"
     )
     protocol_name: str = Field("", description="Wallac protocol name (existing_protocol mode)")
+    protocol_id: int = Field(0, description="Wallac protocol ID (existing_protocol mode, takes precedence over protocol_name)")
     elabftw_experiment_id: int = Field(0, description="eLabFTW experiment ID for result write-back")
     expected_outputs: str = Field("", description="Expected measurement outputs")
     spec_dict: dict[str, Any] = Field(
@@ -56,6 +57,7 @@ class JobResponse(BaseModel):
     title: str
     execution_mode: str
     protocol_name: str
+    protocol_id: int
     elabftw_experiment_id: int
     status: str
     created_at: str
@@ -82,6 +84,7 @@ def _job_to_response(job: Job) -> JobResponse:
         title=job.title,
         execution_mode=job.execution_mode,
         protocol_name=job.protocol_name,
+        protocol_id=job.protocol_id,
         elabftw_experiment_id=job.elabftw_experiment_id,
         status=job.status,
         created_at=job.created_at,
