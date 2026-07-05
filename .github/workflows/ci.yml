@@ -30,10 +30,11 @@ jobs:
             ruff==0.15.15 \
             pyright \
             pytest \
+            pytest-timeout \
             fastapi \
             httpx \
             pydantic \
             pynacl
 
-      - name: Validate (lint + typecheck + format-check + complexity + tests)
+      - name: Validate (lint + typecheck + format-check + tests)
         run: make validate
