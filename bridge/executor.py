@@ -202,17 +202,8 @@ class BridgeExecutor:
         if job.status in ("failed", "aborted"):
             return
 
-        # assay_prot_id was captured during _poll_run from live well data.
-        # The vm-agent's run record has job_id (internal counter) and
-        # assay_id (usually 0) — neither is the MDB assay_id needed for
-        # GET /jobs/{id}/results. The live well data includes the correct
-        # assay_id.
-        if job.assay_prot_id:
-            job.add_event("assay_id_resolved", str(job.assay_prot_id))
-        else:
-            job.add_event("assay_id_resolution_failed", "no assay_id in live well data")
-
-        # Fetch results
+        # Fetch results (assay_id is resolved in _fetch_and_writeback
+        # using the pre-run MDB snapshot).
         self._fetch_and_writeback(job, run_id)
 
     def _execute_generated_protocol(self, job: Job) -> None:
@@ -493,8 +484,8 @@ class BridgeExecutor:
         raw_wells: list[dict[str, Any]] = []
 
         # Find the new assay: any assay_id > max_assay_before with
-        # matching protocol name. Retry for MDB flush (can take 15-30s).
-        for attempt in range(12):
+        # matching protocol name. Retry for MDB flush (can take 30-120s).
+        for attempt in range(15):
             assay_id = _find_assay_after(
                 self.vm_agent, job.max_assay_before, proto_name
             )
