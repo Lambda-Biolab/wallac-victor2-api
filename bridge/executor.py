@@ -525,7 +525,9 @@ class BridgeExecutor:
         """
         job.add_event("fetching_results", run_id)
         raw_wells: list[dict[str, Any]] = []
-        for _ in range(8):
+        # The OEM app doesn't flush results to the MDB immediately.
+        # Retry up to 12 times at 2s intervals (~24s total).
+        for attempt in range(12):
             try:
                 # Try job-level results first (GET /jobs/{id}/results) —
                 # this reads from the historical MDB and returns ALL wells.
