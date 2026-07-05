@@ -393,6 +393,19 @@ class BridgeExecutor:
             now = time.monotonic()
             if now - last_live_fetch >= 1.0:
                 last_live_fetch = now
+
+                # Fetch status to capture MDB assay_id (only available here).
+                if not job.assay_prot_id:
+                    try:
+                        status = self.vm_agent.get_status()
+                        for sw in status.get("live_wells", []):
+                            aid = sw.get("assay_id", 0)
+                            if aid:
+                                job.assay_prot_id = aid
+                                break
+                    except Exception:
+                        pass
+
                 try:
                     live = self.vm_agent.get_run_results(run_id)
                     wells = live.get("wells", live.get("data", []))
@@ -410,12 +423,6 @@ class BridgeExecutor:
                                 "od": w.get("od"),
                                 "counts": w.get("counts"),
                             }
-                            # Capture the MDB assay_id — needed to fetch
-                            # full 96-well results after completion. The
-                            # run record's job_id is NOT the MDB assay_id.
-                            aid = w.get("assay_id", 0)
-                            if aid and not job.assay_prot_id:
-                                job.assay_prot_id = aid
                         job.live_wells = list(existing.values())
                 except Exception:
                     pass  # live fetch is best-effort
