@@ -203,9 +203,6 @@ def test_job_not_found(server):
     assert data["error"] == "job_not_found"
 
 
-import pytest
-
-
 # --- AC 4: SSE stream --------------------------------------------------------
 
 
