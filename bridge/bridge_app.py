@@ -39,7 +39,10 @@ class JobSubmitRequest(BaseModel):
         "existing_protocol", description="existing_protocol or generated_protocol"
     )
     protocol_name: str = Field("", description="Wallac protocol name (existing_protocol mode)")
-    protocol_id: int = Field(0, description="Wallac protocol ID (existing_protocol mode, takes precedence over protocol_name)")
+    protocol_id: int = Field(
+        0,
+        description="Wallac protocol ID (existing_protocol mode, takes precedence over protocol_name)",
+    )
     elabftw_experiment_id: int = Field(0, description="eLabFTW experiment ID for result write-back")
     wells_spec: dict[str, Any] = Field(
         default_factory=dict,

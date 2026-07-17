@@ -54,7 +54,13 @@ def _normalize_well_name(name: str) -> str:
 
 
 def _find_assay_after(vm_agent, max_before: int, proto_name: str) -> int:
-    """Find the newest MDB assay_id greater than max_before matching proto_name."""
+    """Find the newest MDB assay_id greater than max_before.
+
+    If proto_name is provided, filter by protocol name. If proto_name is
+    empty (existing_protocol mode with only protocol_id), match any new
+    assay — the pre-run snapshot (max_assay_before) already scopes the
+    search to only new assays from this run.
+    """
     try:
         jobs_list = vm_agent.get_jobs()
         jobs = jobs_list.get("jobs", jobs_list) if isinstance(jobs_list, dict) else jobs_list
@@ -63,7 +69,7 @@ def _find_assay_after(vm_agent, max_before: int, proto_name: str) -> int:
             jid = j.get("assay_id", 0)
             if jid > max_before:
                 jname = j.get("protocol_name", "")
-                if (max_before == 0 or jname == proto_name) and jid > best_id:
+                if (not proto_name or jname == proto_name) and jid > best_id:
                     best_id = jid
         return best_id
     except Exception:
@@ -443,6 +449,16 @@ class BridgeExecutor:
                 except Exception:
                     pass  # live fetch is best-effort
 
+                # Emit a progress event every ~3s (every 3rd live fetch)
+                # so the orchestrator can show well count progress to the user.
+                well_count = len(job.live_wells)
+                if well_count > 0 and int(now * 3) % 3 == 0:
+                    total = len(measured_wells) if measured_wells else 96
+                    job.add_event(
+                        "run_progress",
+                        f"{well_count}/{total} wells measured",
+                    )
+
             # vm-agent terminal states: "measured" (completed successfully),
             # "completed", "done", "finished"
             if state in ("measured", "completed", "done", "finished"):
@@ -488,9 +504,9 @@ class BridgeExecutor:
         proto_name = job.protocol_name or ""
         raw_wells: list[dict[str, Any]] = []
 
-        # Find the new assay: any assay_id > max_assay_before with
-        # matching protocol name. Retry for MDB flush.
-        for attempt in range(20):
+        # Find the new assay: any assay_id > max_assay_before.
+        # Retry briefly in case the MDB write is still in-flight.
+        for attempt in range(10):
             assay_id = _find_assay_after(self.vm_agent, job.max_assay_before, proto_name)
             if assay_id:
                 try:
@@ -504,6 +520,12 @@ class BridgeExecutor:
                         break
                 except VmAgentError:
                     pass
+            # Emit progress every few attempts so the user knows we're fetching.
+            if attempt > 0 and attempt % 5 == 0:
+                job.add_event(
+                    "fetching_results",
+                    f"Fetching results (attempt {attempt + 1})",
+                )
             time.sleep(3.0)
 
         if not raw_wells:

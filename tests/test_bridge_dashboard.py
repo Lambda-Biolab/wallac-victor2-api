@@ -211,23 +211,28 @@ def test_sse_stream_produces_events(server):
     srv, store, _ = server
     store.update(1, make_state(item_id=1, state="running"))
 
-    # Read the first few bytes of the SSE stream
+    # Read the first event from the SSE stream line by line.
+    # Using readline() instead of read(N) avoids blocking — read(N) waits
+    # until N bytes are received or the connection closes, but the SSE
+    # stream sends small events and stays open indefinitely.
     url = f"{_base_url(srv)}/api/jobs/1/stream"
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=5) as resp:
         assert resp.status == 200
         assert "text/event-stream" in resp.headers.get("Content-Type", "")
-        # Read the retry hint + first data event
-        data = resp.read(4096).decode("utf-8")
-        assert "retry:" in data  # reconnection hint
-        assert "data:" in data  # at least one event
-        # The data should be valid JSON
-        for line in data.split("\n"):
+        # Read lines until we find a data: line
+        found_data = False
+        for _ in range(20):
+            line = resp.readline().decode("utf-8").strip()
+            if line.startswith("retry:"):
+                continue  # reconnection hint
             if line.startswith("data: "):
                 payload = json.loads(line[6:])
                 assert payload["item_id"] == 1
                 assert payload["state"] == "running"
+                found_data = True
                 break
+        assert found_data, "No data: event received in SSE stream"
 
 
 def test_sse_stream_has_retry_hint(server):
@@ -237,9 +242,14 @@ def test_sse_stream_has_retry_hint(server):
     url = f"{_base_url(srv)}/api/jobs/1/stream"
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=5) as resp:
-        data = resp.read(1024).decode("utf-8")
-        # retry: hint tells the browser to reconnect after N ms
-        assert "retry:" in data
+        # Read lines until we find the retry: hint
+        found_retry = False
+        for _ in range(20):
+            line = resp.readline().decode("utf-8").strip()
+            if line.startswith("retry:"):
+                found_retry = True
+                break
+        assert found_retry, "No retry: hint in SSE stream"
 
 
 # --- AC 5: Abort endpoint ---------------------------------------------------

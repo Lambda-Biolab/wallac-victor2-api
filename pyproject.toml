@@ -31,7 +31,7 @@ max_complexity_allowed = 15
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = ["-ra", "--strict-markers"]
+addopts = ["-ra", "--strict-markers", "--timeout=30"]
 
 [tool.pyright]
 include = ["bridge"]
