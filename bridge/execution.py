@@ -66,21 +66,28 @@ def now_iso() -> str:
 class ElabftwWritebackClient(Protocol):
     """eLabFTW client methods needed for execution and write-back."""
 
-    def get_item(self, item_id: int) -> dict[str, Any]: ...
+    def get_item(self, item_id: int) -> dict[str, Any]:
+        raise NotImplementedError
 
-    def download_upload(self, item_id: int, upload_id: int) -> bytes: ...
+    def download_upload(self, item_id: int, upload_id: int) -> bytes:
+        raise NotImplementedError
 
-    def patch_metadata(self, item_id: int, extra_fields: dict[str, Any]) -> None: ...
+    def patch_metadata(self, item_id: int, extra_fields: dict[str, Any]) -> None:
+        raise NotImplementedError
 
     def upload_file(
         self, item_id: int, filename: str, content: bytes, comment: str = ""
-    ) -> dict[str, Any]: ...
+    ) -> dict[str, Any]:
+        raise NotImplementedError
 
-    def post_comment(self, item_id: int, comment: str) -> None: ...
+    def post_comment(self, item_id: int, comment: str) -> None:
+        raise NotImplementedError
 
-    def create_experiment(self, title: str, body: str = "") -> int: ...
+    def create_experiment(self, title: str, body: str = "") -> int:
+        raise NotImplementedError
 
-    def link_experiment_to_item(self, experiment_id: int, item_id: int) -> None: ...
+    def link_experiment_to_item(self, experiment_id: int, item_id: int) -> None:
+        raise NotImplementedError
 
 
 # --- Execution result ------------------------------------------------------
@@ -110,30 +117,25 @@ class ExecutionResult:
 
 
 def _normalize_well_name(name: str) -> str:
-    """Normalize a well name to canonical form (e.g. 'A01' -> 'A1').
+    """Deprecated thin wrapper around :func:`bridge.well_utils.normalize_well_name`.
 
-    The vm-agent returns zero-padded names (A01, A02, ..., A12), while
-    layout/analysis specs use non-padded names (A1, A2, ..., A12).
-    Normalize to non-padded form for consistent comparison.
+    Kept for backward compatibility with any external callers; new code
+    should import from :mod:`bridge.well_utils` directly.
     """
-    if not name:
-        return ""
-    # Match A01 -> A1, H12 -> H12 (no change), A1 -> A1 (no change)
-    import re
+    from .well_utils import normalize_well_name
 
-    m = re.match(r"^([A-H])(\d{1,2})$", name.upper().strip())
-    if m:
-        return f"{m.group(1)}{int(m.group(2))}"
-    return name
+    return normalize_well_name(name)
 
 
 def _well_key(w: dict[str, Any]) -> str:
-    """Extract and normalize the well address from a raw result dict.
+    """Deprecated thin wrapper around :func:`bridge.well_utils.well_key`.
 
-    The vm-agent uses 'well', layout/analysis specs use 'well_name'.
-    Normalizes to non-padded form (A1, not A01).
+    Kept for backward compatibility with any external callers; new code
+    should import from :mod:`bridge.well_utils` directly.
     """
-    return _normalize_well_name(w.get("well_name") or w.get("well") or "")
+    from .well_utils import well_key
+
+    return well_key(w)
 
 
 def check_result_completeness(

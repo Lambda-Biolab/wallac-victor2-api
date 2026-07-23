@@ -70,15 +70,15 @@ class ElabftwInterface(Protocol):
 
     def list_automation_jobs(self) -> list[AutomationJob]:
         """Return all Automation Job items in the configured category."""
-        ...
+        raise NotImplementedError
 
     def list_uploads(self, item_id: int) -> list[dict[str, Any]]:
         """Return uploads (attachments) for an item."""
-        ...
+        raise NotImplementedError
 
     def download_upload(self, item_id: int, upload_id: int) -> bytes:
         """Download the raw bytes of an upload."""
-        ...
+        raise NotImplementedError
 
     def patch_metadata(self, item_id: int, extra_fields: dict[str, Any]) -> None:
         """Update extra_fields metadata on an item.
@@ -87,7 +87,7 @@ class ElabftwInterface(Protocol):
         has at least ``{"value": ...}``.  Only the provided fields are updated;
         other fields are left unchanged.
         """
-        ...
+        raise NotImplementedError
 
     def upload_file(
         self, item_id: int, filename: str, content: bytes, comment: str = ""
@@ -97,11 +97,11 @@ class ElabftwInterface(Protocol):
         Returns the upload metadata dict (with at least ``id`` and
         ``real_name``).
         """
-        ...
+        raise NotImplementedError
 
     def post_comment(self, item_id: int, comment: str) -> None:
         """Append a comment to an item (used for event log entries)."""
-        ...
+        raise NotImplementedError
 
 
 # --- HTTP client ------------------------------------------------------------

@@ -27,6 +27,12 @@ dashboard.
 > or installation media — you must supply a legitimately licensed OEM
 > installation in the VM.
 
+> **Deployment scope:** the bridge, designer, and dashboard services are
+> designed for deployment on a **trusted local area network or Tailscale
+> network** and must not be exposed to the public internet without
+> additional hardening. See [`SECURITY.md`](SECURITY.md) for the threat
+> model and the steps required to deploy beyond a trusted LAN.
+
 ## Demo
 
 ![Wallac Victor2 API and run-builder UI demonstration](gif/wallac-api.gif)

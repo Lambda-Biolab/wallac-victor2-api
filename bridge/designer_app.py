@@ -241,6 +241,7 @@ def _register_elabftw_proxy(app: FastAPI, config: Any) -> None:
     import json as _json
     import ssl
     import urllib.error
+    import urllib.parse
     import urllib.request
 
     @app.get("/elabftw/events")
@@ -248,19 +249,29 @@ def _register_elabftw_proxy(app: FastAPI, config: Any) -> None:
         if not config:
             raise HTTPException(status_code=503, detail="No eLabFTW config")
 
-        params = f"?items_id={items_id}"
+        # Reason: build the query string via urlencode so any characters in
+        # `start`/`end` are percent-encoded and cannot inject additional query
+        # parameters or path segments into the eLabFTW URL. ``items_id`` is
+        # typed as ``int`` and the base URL comes from server config, so the
+        # only user-controllable input is the query string, which we now
+        # encode. This addresses the CodeQL ``py/partial-ssrf`` finding at
+        # designer_app.py:258.
+        query: dict[str, str | int] = {"items_id": items_id}
         if start:
-            params += f"&start={start}"
+            query["start"] = start
         if end:
-            params += f"&end={end}"
+            query["end"] = end
 
-        url = f"{config.elabftw_url}/api/v2/events{params}"
+        url = f"{config.elabftw_url}/api/v2/events?{urllib.parse.urlencode(query)}"
         req = urllib.request.Request(url)
         req.add_header("Authorization", config.elabftw_api_key)
 
         ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        if not config.elabftw_verify_tls:
+            # Operator opt-out for self-signed eLabFTW certs. Set
+            # WALLAC_ELABFTW_VERIFY_TLS=0 in deploy/bridge.env.
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
 
         try:
             with urllib.request.urlopen(req, context=ctx) as resp:
@@ -291,12 +302,21 @@ def create_designer_app(
         client = ElabftwClient(
             base_url=config.elabftw_url,
             api_key=config.elabftw_api_key,
-            verify_tls=False,  # dev instances use self-signed certs
+            verify_tls=config.elabftw_verify_tls,
             automation_job_category=config.elabftw_category,
         )
         service = DesignerService(client)  # type: ignore[arg-type]
 
     designer_token = os.environ.get("WALLAC_DESIGNER_TOKEN", "")
+
+    # Strict-auth mode: refuse to start with empty designer token.
+    if config is not None and config.require_auth and not designer_token:
+        raise RuntimeError(
+            "WALLAC_REQUIRE_AUTH is set but WALLAC_DESIGNER_TOKEN is empty; "
+            "refusing to start the designer with auth disabled. "
+            "Either unset WALLAC_REQUIRE_AUTH or set WALLAC_DESIGNER_TOKEN."
+        )
+
     auth_dep = _make_auth_check(designer_token)
 
     app = FastAPI(
@@ -309,9 +329,14 @@ def create_designer_app(
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/config")
+    @app.get("/config", dependencies=[Depends(auth_dep)])
     def get_config() -> dict[str, str]:
-        """Return client-side config (URLs) so the Run Builder can auto-fill."""
+        """Return client-side config (URLs) so the Run Builder can auto-fill.
+
+        This endpoint is now behind the same bearer-token check as the rest
+        of the designer API and omits the internal ``vm_agent_url`` (which
+        was leaking the libvirt NAT address). See ``SECURITY.md``.
+        """
         import os
 
         return {
@@ -319,7 +344,6 @@ def create_designer_app(
             if config
             else os.environ.get("WALLAC_ELABFTW_URL", ""),
             "bridge_url": os.environ.get("WALLAC_BRIDGE_URL", ""),
-            "vm_agent_url": config.vm_agent_url if config else "",
         }
 
     _register_elabftw_proxy(app, config)

@@ -14,7 +14,10 @@ the interactive session:  PsExec -i 1 -d C:\\Windows\\py.exe C:\\install\\probe.
 """
 
 import datetime
+import logging
 import traceback
+
+logger = logging.getLogger(__name__)
 
 PROGID = "Wallac1420.Server"
 # Public is writable by the UAC-filtered standard token the probe runs under
@@ -29,7 +32,10 @@ def log(msg):
     try:
         print(line)
     except Exception:
-        pass
+        # Reason: console handle can be detached on Windows diagnostic scripts
+        # when launched non-interactively. The file write above has already
+        # recorded the message; failing to mirror to stdout is harmless.
+        logger.debug("console write unavailable", exc_info=True)
 
 
 def getval(obj, name):

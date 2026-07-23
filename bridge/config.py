@@ -15,7 +15,7 @@ Source contract: eLabFTW-lambdabiolab/docs/wallac-plate-reader-integration.md
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # --- Environment variable names --------------------------------------------
 
@@ -23,6 +23,7 @@ from dataclasses import dataclass
 ENV_ELABFTW_URL = "WALLAC_ELABFTW_URL"
 ENV_ELABFTW_API_KEY = "WALLAC_ELABFTW_API_KEY"
 ENV_ELABFTW_CATEGORY = "WALLAC_ELABFTW_CATEGORY"
+ENV_ELABFTW_VERIFY_TLS = "WALLAC_ELABFTW_VERIFY_TLS"
 
 # vm-agent REST API (the instrument microservice)
 ENV_VM_AGENT_URL = "WALLAC_VM_AGENT_URL"
@@ -48,11 +49,21 @@ ENV_POLL_INTERVAL = "WALLAC_POLL_INTERVAL"
 # Dry-run mode: validate signed bundles without touching the instrument
 ENV_DRY_RUN = "WALLAC_DRY_RUN"
 
+# CORS allowlist for the bridge HTTP API (comma-separated origins).
+# When unset (default), the bridge API does not emit any
+# Access-Control-Allow-Origin header — the previous wildcard default
+# has been removed for defense in depth. See SECURITY.md.
+ENV_CORS_ORIGINS = "WALLAC_CORS_ORIGINS"
+
+# Strict-auth mode. When set to 1/true/yes, the bridge/designer
+# services refuse to start with empty bearer tokens.
+ENV_REQUIRE_AUTH = "WALLAC_REQUIRE_AUTH"
 
 # --- Defaults ---------------------------------------------------------------
 
 DEFAULT_ELABFTW_URL = "https://localhost:3148"
 DEFAULT_ELABFTW_CATEGORY = 21  # items_categories ID for Automation Job (NOT items_types ID)
+DEFAULT_ELABFTW_VERIFY_TLS = True
 DEFAULT_VM_AGENT_URL = "http://192.168.122.203:8420"
 DEFAULT_DASHBOARD_HOST = "0.0.0.0"
 DEFAULT_DASHBOARD_PORT = 8421
@@ -80,6 +91,7 @@ class BridgeConfig:
     elabftw_url: str
     elabftw_api_key: str
     elabftw_category: int
+    elabftw_verify_tls: bool
     vm_agent_url: str
     vm_agent_token: str
     dashboard_token: str
@@ -90,6 +102,8 @@ class BridgeConfig:
     spool_dir: str
     poll_interval: float
     dry_run: bool = False
+    cors_origins: list[str] = field(default_factory=list)
+    require_auth: bool = False
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> BridgeConfig:
@@ -112,10 +126,16 @@ class BridgeConfig:
                 "do NOT use a human admin key."
             )
 
+        cors_raw = e.get(ENV_CORS_ORIGINS, "").strip()
+        cors_origins = [o.strip() for o in cors_raw.split(",") if o.strip()]
+
         return cls(
             elabftw_url=e.get(ENV_ELABFTW_URL, DEFAULT_ELABFTW_URL).rstrip("/"),
             elabftw_api_key=api_key,
             elabftw_category=int(e.get(ENV_ELABFTW_CATEGORY, DEFAULT_ELABFTW_CATEGORY)),
+            elabftw_verify_tls=_parse_bool(
+                e.get(ENV_ELABFTW_VERIFY_TLS, ""), DEFAULT_ELABFTW_VERIFY_TLS
+            ),
             vm_agent_url=e.get(ENV_VM_AGENT_URL, DEFAULT_VM_AGENT_URL).rstrip("/"),
             vm_agent_token=e.get(ENV_VM_AGENT_TOKEN, "").strip(),
             dashboard_token=e.get(ENV_DASHBOARD_TOKEN, "").strip(),
@@ -125,7 +145,9 @@ class BridgeConfig:
             device_identity=e.get(ENV_DEVICE_IDENTITY, DEFAULT_DEVICE_IDENTITY),
             spool_dir=e.get(ENV_SPOOL_DIR, DEFAULT_SPOOL_DIR),
             poll_interval=float(e.get(ENV_POLL_INTERVAL, str(DEFAULT_POLL_INTERVAL))),
-            dry_run=e.get(ENV_DRY_RUN, "").lower() in ("1", "true", "yes"),
+            dry_run=_parse_bool(e.get(ENV_DRY_RUN, ""), False),
+            cors_origins=cors_origins,
+            require_auth=_parse_bool(e.get(ENV_REQUIRE_AUTH, ""), False),
         )
 
     @property
@@ -148,6 +170,7 @@ class BridgeConfig:
             "elabftw_url": self.elabftw_url,
             "elabftw_api_key": "***REDACTED***",
             "elabftw_category": str(self.elabftw_category),
+            "elabftw_verify_tls": str(self.elabftw_verify_tls),
             "vm_agent_url": self.vm_agent_url,
             "vm_agent_token": "***REDACTED***" if self.vm_agent_token else "(unset)",
             "dashboard_token": "***REDACTED***" if self.dashboard_token else "(unset)",
@@ -158,4 +181,14 @@ class BridgeConfig:
             "spool_dir": self.spool_dir,
             "poll_interval": str(self.poll_interval),
             "dry_run": str(self.dry_run),
+            "cors_origins": str(self.cors_origins) if self.cors_origins else "(none)",
+            "require_auth": str(self.require_auth),
         }
+
+
+def _parse_bool(value: str, default: bool) -> bool:
+    """Parse a boolean env value. Empty string returns default."""
+    v = value.strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "on")

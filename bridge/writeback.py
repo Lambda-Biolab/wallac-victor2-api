@@ -201,18 +201,17 @@ class WriteBackManager:
 
         Retries up to ``max_retries`` times with ``retry_delay`` between
         attempts.  Non-transient errors (BridgeError) are re-raised
-        immediately.
+        immediately.  After exhausting retries the last transient exception
+        is re-raised.
         """
         import time as _time
 
-        last_exc: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
                 return fn(*args, **kwargs)
             except BridgeError:
                 raise  # non-transient, don't retry
             except (ConnectionError, OSError, TimeoutError) as e:
-                last_exc = e
                 if attempt < self.max_retries:
                     logger.warning(
                         "Write-back attempt %d/%d failed: %s, retrying in %ss",
@@ -223,8 +222,10 @@ class WriteBackManager:
                     )
                     _time.sleep(self.retry_delay)
                 else:
+                    # Final attempt: re-raise the last transient exception
+                    # so callers can distinguish it from non-transient
+                    # BridgeError.
                     raise
-        raise last_exc  # type: ignore[misc]
 
     # --- Claim fields ------------------------------------------------------
 

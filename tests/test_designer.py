@@ -12,6 +12,7 @@ Tests cover:
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -58,7 +59,12 @@ class MockDesignerClient:
                         if spec.get("schema_name") == expected_schema:
                             filtered.append(item)
                     except Exception:
-                        pass
+                        # Reason: best-effort parse of a draft's Designer-spec
+                        # JSON in the mock client; malformed JSON is simply
+                        # skipped from the filtered result.
+                        logging.getLogger(__name__).debug(
+                            "Mock designer spec parse failed", exc_info=True
+                        )
             return filtered
         return items
 
@@ -491,3 +497,88 @@ class TestDesignerAppErrorMapping:
         assert r2.status_code == 409
         detail = r2.json()["detail"]
         assert detail["code"] == "operator_review_required"
+
+
+# --- Defense-in-depth: /config auth + SSRF hardening (2026-07) -----------
+
+
+class TestDesignerConfigEndpoint:
+    """The /config endpoint must be behind auth and must not leak
+    internal URLs (vm_agent_url was the libvirt NAT address)."""
+
+    def test_config_requires_auth_when_token_set(self, authed_client: TestClient) -> None:
+        r = authed_client.get("/config")
+        # Without bearer token: 401.
+        assert r.status_code == 401
+
+    def test_config_returns_urls_with_auth(self, authed_client: TestClient) -> None:
+        r = authed_client.get("/config", headers={"Authorization": "Bearer secret-token"})
+        assert r.status_code == 200
+        body = r.json()
+        # vm_agent_url is now an internal-only field and must not leak.
+        assert "vm_agent_url" not in body
+        # elabftw_url and bridge_url are still returned for the SPA.
+        assert "elabftw_url" in body
+        assert "bridge_url" in body
+
+
+class TestDesignerElabftwEventsSSRF:
+    """The /elabftw/events proxy must percent-encode user-supplied
+    query parameters so they cannot inject additional parameters or
+    path segments into the eLabFTW URL."""
+
+    def test_url_encodes_injected_chars(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """start='2026-01-01#evil&host=bad' is URL-encoded, not raw."""
+        from bridge.config import BridgeConfig
+        from bridge.designer_app import create_designer_app
+
+        captured: dict[str, str] = {}
+
+        class FakeResponse:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *a):
+                return False
+
+            def read(self_inner):
+                return b"[]"
+
+        def fake_urlopen(req, context=None):  # noqa: ARG001
+            captured["url"] = req.full_url
+            return FakeResponse()
+
+        import urllib.request
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+        # Build a config so the proxy has a base URL to use.
+        config = BridgeConfig.from_env(
+            env={
+                "WALLAC_ELABFTW_API_KEY": "5-key",
+                "WALLAC_ELABFTW_URL": "https://elab.local:3148",
+            }
+        )
+        # Build with a real config (the proxy will use config.elabftw_url).
+        app = create_designer_app(config=config, service=object())  # type: ignore[arg-type]
+        with TestClient(app) as client:
+            client.get(
+                "/elabftw/events",
+                params={
+                    "items_id": "42",
+                    "start": "2026-01-01#evil&host=bad",
+                    "end": "2026-12-31",
+                },
+            )
+
+        # We just need to confirm the URL was URL-encoded.
+        assert captured.get("url"), "urlopen was not called"
+        url = captured["url"]
+        # The literal '#' must be encoded as %23, '&' as %26.
+        assert "#evil" not in url, f"raw '#' leaked into URL: {url}"
+        assert "host=bad" not in url, f"raw 'host=bad' leaked into URL: {url}"
+        # Confirm the host is still the configured eLabFTW (not a redirect).
+        assert url.startswith("https://elab.local:3148/api/v2/events?")
+        # The encoded payload is present.
+        assert "items_id=42" in url
+        assert "%26" in url or "%23" in url

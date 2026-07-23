@@ -69,35 +69,35 @@ class MdbClient(Protocol):
 
     def get_protocol_group_id(self, group_name: str) -> int | None:
         """Look up a ProtocolGroup by name. Returns GroupID or None."""
-        ...
+        raise NotImplementedError
 
     def get_protocol(self, assay_prot_id: int) -> dict[str, Any] | None:
         """Get an AssayProtocol by ID. Returns dict or None."""
-        ...
+        raise NotImplementedError
 
     def find_protocol_by_name(self, name: str) -> dict[str, Any] | None:
         """Find an AssayProtocol by exact name. Returns dict or None."""
-        ...
+        raise NotImplementedError
 
     def get_max_protocol_id(self) -> int:
         """Return the highest existing AssayProtID."""
-        ...
+        raise NotImplementedError
 
     def insert_protocol(self, protocol: dict[str, Any]) -> int:
         """Insert a new AssayProtocol row. Returns the new AssayProtID."""
-        ...
+        raise NotImplementedError
 
     def delete_protocol(self, assay_prot_id: int) -> bool:
         """Delete an AssayProtocol by ID. Returns True if deleted."""
-        ...
+        raise NotImplementedError
 
     def backup_mdb(self, backup_path: str) -> str:
         """Create a timestamped backup of the MDB file. Returns the backup path."""
-        ...
+        raise NotImplementedError
 
     def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         """Execute a SELECT query and return rows as dicts."""
-        ...
+        raise NotImplementedError
 
 
 # --- Data structures -------------------------------------------------------
