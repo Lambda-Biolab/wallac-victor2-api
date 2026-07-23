@@ -15,7 +15,7 @@ protocol generation → execution → analysis → write-back.
 ## Prerequisites
 
 1. **vm-agent running** on `win7-wallac` (192.168.122.203:8420)
-2. **Bridge daemon running** on `lambdabiolab-computer` (or `python3 main.py`)
+2. **Bridge daemon running** on `lambdabiolab-computer`
 3. **eLabFTW** accessible at `https://localhost:3148`
 4. **Designer app** running (optional, for Run Builder UI)
 5. **Feature flag enabled:** `WALLAC_ENABLE_PROTOCOL_AUTHORING=true` on the vm-agent
@@ -42,7 +42,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 # Query existing protocols
 curl -s -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"sql":"SELECT AssayProtID, ProtName FROM AssayProtocol WHERE ProtName LIKE '\''ELAB-Job-%'\''"}' \
+  -d '{"sql":"SELECT AssayProtID, ProtName FROM AssayProtocol WHERE ProtName ALIKE '\''ELAB-Run-%'\''"}' \
   "http://192.168.122.203:8420/mdb/query" | jq
 ```
 
@@ -74,7 +74,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 # Insert a test protocol
 curl -s -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"AssayProtID":2000099,"ProtName":"ELAB-Job-test-stage7","ProtNumber":99,"ProtVersion":1,"FactoryPreset":false,"ProtGroup":1}' \
+  -d '{"AssayProtID":2000099,"ProtName":"ELAB-Run-test-stage7","ProtNumber":99,"ProtVersion":1,"FactoryPreset":false,"ProtGroup":1}' \
   "http://192.168.122.203:8420/mdb/protocols" | jq
 
 # Verify it exists
@@ -83,7 +83,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 # Find by name
 curl -s -H "Authorization: Bearer $TOKEN" \
-  "http://192.168.122.203:8420/mdb/protocols?name=ELAB-Job-test-stage7" | jq '.ProtName'
+  "http://192.168.122.203:8420/mdb/protocols?name=ELAB-Run-test-stage7" | jq '.ProtName'
 
 # Delete it
 curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
@@ -127,30 +127,39 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
 
 6. **Sign the Automation Job** in eLabFTW
 
-7. **Submit the job**: Set `Requested action = submit` in eLabFTW
+7. **Submit the job** via ``POST /jobs`` on the bridge HTTP API:
 
-8. **Monitor execution** via the dashboard at `http://lambdabiolab-computer:8421`
+   ```bash
+   curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "title": "Stage 7 Test 4 generated protocol",
+       "execution_mode": "generated_protocol",
+       "method_ref": {"object_id": <method_id>, "attachment_id": <method_att_id>, "hash": "<method_hash>"},
+       "layout_ref": {"object_id": <layout_id>, "attachment_id": <layout_att_id>, "hash": "<layout_hash>"},
+       "analysis_ref": {"object_id": <analysis_id>, "attachment_id": <analysis_att_id>, "hash": "<analysis_hash>"}
+     }' \
+     "http://lambdabiolab-computer:8423/jobs" | jq
+   ```
+
+8. **Monitor execution** via ``GET /jobs/{job_id}`` on the bridge HTTP API
+   (``http://lambdabiolab-computer:8423/jobs/{job_id}``) — polls status, live
+   well values, and event log.
 
 **Pass criteria:**
-- [ ] Bridge claims the job within 5 seconds (state → `accepted`)
-- [ ] Validation passes (signed bundle hashes verified)
-- [ ] MDB backup created (check `MDB backup path` field in eLabFTW)
-- [ ] Generated protocol created with name `ELAB-Job-<id>-<hash>`
-- [ ] Post-write verification passes (protocol exists in MDB with correct name)
+- [ ] ``POST /jobs`` returns ``201 Created`` with ``job_id`` and ``status: "accepted"``
+- [ ] Validation passes (signed bundle hashes verified via ``_download_ref``)
+- [ ] Protocol template cloned as ``ELAB-Run-{new_id}`` (visible in executor event log as ``protocol_cloned``)
+- [ ] Temporary clone cleaned up after execution (``_cleanup_cloned_protocol`` called; no ``ELAB-Run-*`` remains in MDB)
 - [ ] Run starts by numeric AssayProtID (not by name)
-- [ ] Run completes (state → `measured`)
+- [ ] Run completes (state → ``measured``)
 - [ ] Raw results retrieved (96 wells)
 - [ ] Result completeness check passes (all expected wells present)
 - [ ] Analysis runs (blank subtraction, replicate aggregation, pass/fail)
-- [ ] Artifacts uploaded to eLabFTW:
-  - `raw_results.json`
-  - `analyzed_wells.csv`
-  - `replicate_summary.csv`
-  - `replicate_summary.json`
-  - `analysis_summary.json`
-- [ ] Assay experiment created and linked to the Automation Job
-- [ ] Job state → `completed`
-- [ ] Event log posted as comment on the Automation Job
+- [ ] eLabFTW experiment created/patched with rich HTML body (plate heatmap + results table)
+- [ ] ``{job_id}_raw_results.json`` uploaded as experiment attachment
+- [ ] ``{job_id}_analyzed.csv`` uploaded when analysis provides results
+- [ ] Job state → ``completed``
 
 ### Test 5: OEM OD comparison
 
@@ -165,20 +174,24 @@ curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
 - [ ] Well ordering matches (A1-H12, row-major)
 - [ ] No missing or extra wells
 
-### Test 6: Cleanup dry-run
+### Test 6: Cleanup query
 
-**Goal:** Verify cleanup lists only eligible generated protocols.
+**Goal:** Verify the ``POST /mdb/query`` read-only endpoint can list generated
+protocols by name prefix, and that factory/user protocols are excluded.
 
 ```bash
-# Dry-run cleanup
+# Query for run-clone protocols by prefix (safe read-only, no MDB writes)
 curl -s -H "Authorization: Bearer $TOKEN" \
-  "http://192.168.122.203:8420/mdb/protocols?name=ELAB-Job-*" | jq
+  -H "Content-Type: application/json" \
+  -d '{"sql":"SELECT AssayProtID, ProtName FROM AssayProtocol WHERE ProtName ALIKE '\''ELAB-Run-%'\''"}' \
+  "http://192.168.122.203:8420/mdb/query" | jq
 ```
 
 **Pass criteria:**
-- [ ] Only `ELAB-Job-*` protocols are listed
+- [ ] Returns at most the protocol rows whose ``ProtName`` starts with ``ELAB-Run-``
 - [ ] Factory presets are NOT listed
 - [ ] User GUI protocols are NOT listed
+- [ ] The query does not modify the MDB (read-only)
 
 ### Test 7: Feature flag enforcement
 
@@ -193,7 +206,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"AssayProtID":2000098,"ProtName":"ELAB-Job-test-flag","ProtNumber":98,"ProtVersion":1,"FactoryPreset":false,"ProtGroup":1}' \
+  -d '{"AssayProtID":2000098,"ProtName":"ELAB-Run-test-flag","ProtNumber":98,"ProtVersion":1,"FactoryPreset":false,"ProtGroup":1}' \
   "http://192.168.122.203:8420/mdb/protocols" | jq
 ```
 
@@ -207,16 +220,26 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 **Steps:**
 1. Create and submit a generated protocol job (same as Test 4)
-2. Wait for the run to start (state → `running`)
-3. Set `Requested action = abort` in eLabFTW
-4. Wait for the abort poller to detect it (≤5 seconds)
+2. Wait for the run to start (state → ``running``)
+3. Call ``POST /jobs/{job_id}/abort`` on the bridge HTTP API:
+
+   ```bash
+   curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+     "http://lambdabiolab-computer:8423/jobs/{job_id}/abort" | jq
+   ```
+
+4. The bridge forwards the abort to vm-agent ``POST /runs/{id}/abort``
+   and polls until the instrument stops. If the run is younger than the
+   vm-agent's 60 s minimum abort age, the bridge retries on the next poll
+   cycle.
 
 **Pass criteria:**
-- [ ] Bridge detects abort within 5 seconds
-- [ ] vm-agent abort_run() is called
-- [ ] Job state → `aborted` (or `unknown_requires_operator_review` if abort fails)
-- [ ] Generated protocol is NOT automatically deleted
-- [ ] Event log records the abort
+- [ ] ``POST /jobs/{job_id}/abort`` returns ``{"abort_requested": true}``
+- [ ] vm-agent ``abort_run()`` is called (verify via vm-agent logs)
+- [ ] Job state → ``aborted`` (or ``failed`` if abort was rejected)
+- [ ] Temporary cloned protocol is cleaned up (``_cleanup_cloned_protocol`` is called in ``finally``; verify via executor logs)
+- [ ] Factory template protocol is never deleted
+- [ ] Event log records the abort sequence
 
 ## Production enablement checklist
 
@@ -225,20 +248,21 @@ Before enabling generated-protocol authoring in production:
 - [ ] All tests 1-8 pass
 - [ ] OEM OD comparison matches (Test 5)
 - [ ] Operator has reviewed and approved the generated protocol format
-- [ ] `WALLAC_ENABLE_PROTOCOL_AUTHORING=true` set in `/etc/wallac-bridge/bridge.env`
-- [ ] vm-agent has `WALLAC_ENABLE_PROTOCOL_AUTHORING=true` set
+- [ ] vm-agent has ``WALLAC_ENABLE_PROTOCOL_AUTHORING=true`` set (in ``C:\install\run_agent.bat`` or equivalent)
 - [ ] Protocol group `eLabFTW Generated` exists in the MDB
 - [ ] Template protocols are installed and verified
 - [ ] Backup directory `C:\Users\Public\mdb_backups` is accessible
 - [ ] Bridge daemon is running as a systemd service
-- [ ] Dashboard is accessible to operators
 
 ## Notes
 
 - **Plate presence:** The Victor2 COM API does not expose plate-loaded status.
   The operator must verify the plate is loaded before submitting a job.
-- **Abort latency:** eLabFTW abort is non-real-time (5-15s latency). Emergency
+- **Abort latency:** ``POST /jobs/{id}/abort`` is sub-second on the bridge.
+  The vm-agent enforces a 60 s minimum abort age (returns 425 "too early" if
+  the run is too young); the bridge retries on the next poll cycle. Emergency
   stops use the physical button on the instrument.
-- **Generated protocol cleanup:** Is operator/admin-only maintenance, never
-  automatic. Generated protocols are preserved for audit until explicit cleanup.
+- **Cleanup:** Temporary ``ELAB-Run-*`` clones are cleaned up automatically
+  after execution. The ``DELETE /mdb/protocols/{id}`` endpoint is available
+  for ad-hoc removal of any leftover protocols.
 - **No auto-restore:** MDB backups are never automatically restored in v1.

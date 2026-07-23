@@ -23,7 +23,7 @@ per-endpoint contract, see [`api-reference.md`](api-reference.md) and
   └────┬─────────────────────────────────────────────────────────┘
        │  libvirt NAT (optional bearer token)
        ▼
-  Windows 7 VM ── vm-agent/agent.py   (Python 3.8 + comtypes, console user)
+  Windows 7 VM ──   vm-agent/agent.py  :8420   (Python 3.8 + comtypes, console user)
        │  COM automation   (ProgID Wallac1420.Server)
        ▼
   OEM MlrServ / MlrMgr ──► Victor2 / 1420 reader
@@ -55,17 +55,15 @@ Supporting pieces:
 
 The bridge sits between the user and the vm-agent. It accepts job submissions
 (via HTTP from the Run Builder), executes them against the vm-agent, and
-writes results back to eLabFTW as experiment records. Three FastAPI apps:
+writes results back to eLabFTW as experiment records. Two FastAPI apps:
 
 - **`bridge/bridge_app.py`** (`:8423`) — direct-submit job API. Accepts
   `POST /jobs`, executes on a background worker thread, writes results to
-  eLabFTW. Replaces the old eLabFTW-polling daemon (`main.py`).
+  eLabFTW.
 - **`bridge/designer_app.py`** (`:8422`) — Run Builder backend. CRUD for
   Method, Plate Layout, Analysis Plan, and Automation Job draft objects;
   finalize (canonicalize + SHA-256 hash); clone signed objects. Serves the
   Run Builder single-page app at `GET /run-builder`.
-- **`bridge/dashboard.py`** (`:8421`) — live status dashboard, served by
-  `main.py`.
 
 ## Key design decisions
 
@@ -79,5 +77,5 @@ rationale and rejected alternatives.)
   deterministically serialized and SHA-256 hashed.
 - The browser never receives the eLabFTW API key or vm-agent token — all
   eLabFTW interaction happens server-side.
-- Result write-back is resilient: if eLabFTW is unreachable, results are
-  spooled to disk (`bridge/spool.py`) and retried.
+- Result write-back writes results directly to an eLabFTW experiment after
+  execution. If eLabFTW is unreachable the job fails; no spooling.

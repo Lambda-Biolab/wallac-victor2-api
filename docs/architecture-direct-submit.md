@@ -60,9 +60,8 @@ Validated workflow:
   eLabFTW (or via the Run Builder, which calls the eLabFTW API).
 - **vm-agent REST API** — unchanged.
 - **Analysis pipeline** — unchanged.
-- **Result spool** — unchanged (still used for write-back resilience).
-- **Dashboard** — still served by the bridge, but no longer needs to poll
-  eLabFTW for state. The bridge knows its own state.
+- **Result write-back** — results are written directly to an eLabFTW experiment;
+  the old spool module was removed.
 
 ## What changes
 
@@ -162,12 +161,14 @@ Signing is for provenance, not for gating. The bridge receives the job directly.
 ## Migration
 
 The old polling modules (`intake.py`, `abort.py`, `lifecycle.py`, `models.py`,
-`writeback.py`) are deprecated. They remain in the repo for reference but are
-not used by the new direct-submit path. New modules:
+`writeback.py`, `execution.py`, `spool.py`, `signature.py`, `validation.py`,
+`generated_protocols.py`, `remote_mdb_client.py`, `factory.py`) and the
+`main.py` daemon have been **removed**. The `bridge/dashboard.py` module was
+also removed; there is no separate dashboard service.
+
+Replaced by a simpler module set:
 
 - `bridge/jobs.py` — job manager (receive, queue, execute, status)
-- `bridge/execution.py` — updated to work without eLabFTW polling
-- `bridge/writeback.py` — updated to write to experiments, not Automation Jobs
-
-The `main.py` bridge daemon no longer runs a poll loop. Instead, it starts an
-HTTP server (FastAPI) that accepts job submissions.
+- `bridge/executor.py` — direct-submit executor (both existing_protocol and
+  generated_protocol modes) that connects JobManager to vm-agent + eLabFTW
+- `bridge/elabftw.py` — eLabFTW API client (no polling, no claiming)

@@ -93,6 +93,16 @@ def test_designer_require_auth_rejects_empty_token(monkeypatch: pytest.MonkeyPat
         create_designer_app(config=config, service=object())
 
 
+def test_designer_events_proxy_requires_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WALLAC_DESIGNER_TOKEN", "designer-token")
+    config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key"})
+    app = create_designer_app(config=config, service=object())
+
+    response = TestClient(app).get("/elabftw/events?items_id=1")
+
+    assert response.status_code == 401
+
+
 def test_bridge_default_cors_emits_no_allow_origin() -> None:
     config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key"})
     manager = JobManager()

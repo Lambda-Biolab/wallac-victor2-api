@@ -10,6 +10,8 @@ __pycache__/
 ._*
 
 # Never commit private keys / tokens
+.env
+.env.*
 *.pem
 *_key
 *_key.*

@@ -18,8 +18,7 @@ photometry, luminescence, fluorescence polarization).
 
 A second stack — the **bridge** — runs on the Linux host and integrates the
 instrument with **eLabFTW** (electronic lab notebook): a Run Builder UI for
-protocol authoring, a direct-submit job API, result write-back, and a live
-dashboard.
+protocol authoring, a direct-submit job API, result write-back, and live status streaming.
 
 > **Scope:** this repository contains the instrument API microservice
 > (`vm-agent/`), the eLabFTW bridge (`bridge/`), and documentation. It does
@@ -27,11 +26,11 @@ dashboard.
 > or installation media — you must supply a legitimately licensed OEM
 > installation in the VM.
 
-> **Deployment scope:** the bridge, designer, and dashboard services are
-> designed for deployment on a **trusted local area network or Tailscale
-> network** and must not be exposed to the public internet without
-> additional hardening. See [`SECURITY.md`](SECURITY.md) for the threat
-> model and the steps required to deploy beyond a trusted LAN.
+> **Deployment scope:** the bridge and designer services are designed for
+> deployment on a **trusted local area network or Tailscale network** and
+> must not be exposed to the public internet without additional hardening.
+> See [`SECURITY.md`](SECURITY.md) for the threat model and the steps
+> required to deploy beyond a trusted LAN.
 
 ## Demo
 
@@ -100,9 +99,11 @@ auth model live in [`docs/bridge-api.md`](docs/bridge-api.md).
 **Auth (summary):** all three services use optional
 `Authorization: Bearer <token>`. The vm-agent reads its token from a file on
 the VM (`TOKEN_FILE` in `agent.py`); the bridge and designer read from env
-vars (`WALLAC_BRIDGE_TOKEN`, `WALLAC_DESIGNER_TOKEN`). If unset, auth is
-disabled and the service logs a warning. **No token is ever stored in this
-repository.** See [`docs/auth-secrets-policy.md`](docs/auth-secrets-policy.md).
+vars (`WALLAC_BRIDGE_TOKEN`, `WALLAC_DESIGNER_TOKEN`). The vm-agent logs a
+warning when its token file is absent; bridge/designer disable auth with no
+warning when their env token is unset. **Tokens must not be committed to
+this repository; tracked templates contain placeholder values.**
+See [`docs/auth-secrets-policy.md`](docs/auth-secrets-policy.md).
 
 Full request/response details: [`docs/api-reference.md`](docs/api-reference.md)
 and [`docs/bridge-api.md`](docs/bridge-api.md).
@@ -118,7 +119,7 @@ and [`docs/bridge-api.md`](docs/bridge-api.md).
 - In the guest: **Python 3.8 (32-bit)** + `comtypes` (the OEM COM server and
   DAO are 32-bit).
 - On the host: **Python 3.11+** + `uv` (for tooling) and the bridge
-  dependencies (`fastapi`, `uvicorn`, `pydantic`, `pynacl`).
+  dependencies (`fastapi`, `uvicorn`, `pydantic`).
 
 **Deploy the vm-agent (in the VM)**
 
@@ -135,7 +136,7 @@ On boot the agent listens on the guest's libvirt NAT address, port **8420**.
 
 1. Copy `deploy/bridge.env.example` to `/etc/wallac-bridge/bridge.env` and
    fill in the eLabFTW URL + API key, vm-agent URL + token, and optional
-   dashboard/designer/bridge tokens.
+   designer/bridge tokens.
 2. Install the systemd services:
 
    ```bash
@@ -189,37 +190,28 @@ Quality gates apply to both maintained stacks — the vm-agent
 (`bridge/*.py`). Tools run via `uv`, so no global installs are needed:
 
 ```bash
-make validate    # ruff lint + format-check + complexity (<=15) + pytest
+make setup       # create/update the locked project environment
+make validate    # ruff lint + typecheck + format-check + pytest
 make format      # auto-fix lint + format
 make test        # unit tests only
-make setup_dev   # install the pre-commit hooks
+make setup_dev   # create environment + install pre-commit hooks
 ```
 
-The unit tests (342 tests) cover the pure data-shaping helpers in both stacks:
-vm-agent background parsing, OD computation, plate-grid CSV; bridge intake,
-lifecycle, writeback, validation, analysis, jobs, designer, execution,
-canonical hashing, and generated protocols. They run on any OS; the COM/HTTP
-paths require Windows, `comtypes`, and a live instrument.
+The unit tests cover the pure data-shaping helpers in both stacks: vm-agent
+background parsing, OD computation, plate-grid CSV; bridge analysis, canonical
+schemas, designer CRUD, executor, job manager, and config. They run on any OS;
+the COM/HTTP paths require Windows, `comtypes`, and a live instrument.
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) — system overview, vm-agent/bridge
-  components, threading model, key design decisions
-- [vm-agent API reference](docs/api-reference.md) — full `:8420`
-  request/response details
-- [Bridge & designer API](docs/bridge-api.md) — `:8423` / `:8422` endpoints
-  and auth model
-- [Direct-submit architecture](docs/architecture-direct-submit.md) — bridge
-  design decision (eLabFTW as archive, not job queue)
-- [eLabFTW object model](docs/elabftw-object-model.md) — resource categories,
-  draft/signed lifecycle, canonical JSON schemas
-- [Auth & secrets policy](docs/auth-secrets-policy.md) — token handling, what
-  is and isn't stored
-- [Deployment notes](docs/deployment-notes.md) — OEM install path gotchas,
-  VM-operations pointer
-- [Abort recovery](docs/abort-recovery.md) — job abort flow and spool recovery
-- [Stage 7 hardware E2E test plan](docs/stage7-hardware-e2e-test-plan.md) —
-  hardware validation protocol
+| Authority | What it covers |
+|---|---|
+| [README](README.md) | Entry point — overview, quick-start, API summary, this index |
+| [Architecture](docs/architecture.md) | System design, vm-agent/bridge components, threading model |
+| [Bridge & designer API](docs/bridge-api.md) | `:8423` / `:8422` endpoints and auth model |
+| [vm-agent API reference](docs/api-reference.md) | Full `:8420` request/response reference |
+| [Security](SECURITY.md) | Threat model, hardening steps, vulnerability reporting |
+| [Deployment notes](docs/deployment-notes.md) | OEM install path gotchas, VM-operations pointer |
 
 ## License
 

@@ -93,7 +93,7 @@ The vm-agent returns `A01`, `A02`, etc. (zero-padded), but layout specs
 use canonical non-padded names (`A1`, `A2`, ..., `A12`). The bridge
 normalizes both sides to non-padded form via `_normalize_well_name()`.
 
-See `bridge/execution.py` (`_well_key`, `_normalize_well_name`) and
+See `bridge/executor.py` (`_well_key`, `_normalize_well_name`) and
 `bridge/analysis.py` (`_load_raw`).
 
 ## Jet SQL — wildcard and quoting gotchas
@@ -237,14 +237,12 @@ API key:
 - **Old keys deleted:** id=5 (old service key with unrecoverable secret)
 
 The service user can: list/read items (`?type=` not `?cat=` — see gotcha
-#6 above), create experiments, upload files, read events. Verified
+number 6 above), create experiments, upload files, read events. Verified
 end-to-end: job submitted → run completed → writeback to eLabFTW.
 
-**Systemd service fix:** `wallac-bridge.service` was running `main.py`
-(the old poll-based daemon). Updated `ExecStart` to run the direct-submit
-FastAPI app via uvicorn on port 8423, matching the designer service pattern.
-The old `main.py` daemon is retained for the dashboard (port 8421) but
-is not the primary bridge entry point in the direct-submit architecture.
+**Current architecture:** direct-submit only — no polling daemon, no
+dashboard. Bridge (`bridge.bridge_app:create_bridge_app`) and designer
+(`bridge.designer_app:create_designer_app`) run as FastAPI/uvicorn apps.
 
 ## VM Agent Restart — always use start_agent.bat (NEVER taskkill solo)
 

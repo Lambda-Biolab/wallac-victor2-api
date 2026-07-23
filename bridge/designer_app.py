@@ -231,7 +231,11 @@ def _register_crud_endpoints(
     )
 
 
-def _register_elabftw_proxy(app: FastAPI, config: Any) -> None:
+def _register_elabftw_proxy(
+    app: FastAPI,
+    config: Any,
+    auth_dep: Callable[..., None],
+) -> None:
     """Register a proxy endpoint for eLabFTW API calls.
 
     The Run Builder is served over HTTP but eLabFTW uses HTTPS with a
@@ -244,7 +248,7 @@ def _register_elabftw_proxy(app: FastAPI, config: Any) -> None:
     import urllib.parse
     import urllib.request
 
-    @app.get("/elabftw/events")
+    @app.get("/elabftw/events", dependencies=[Depends(auth_dep)])
     def get_elabftw_events(items_id: int, start: str = "", end: str = "") -> list:
         if not config:
             raise HTTPException(status_code=503, detail="No eLabFTW config")
@@ -345,7 +349,7 @@ def create_designer_app(
             "bridge_url": os.environ.get("WALLAC_BRIDGE_URL", ""),
         }
 
-    _register_elabftw_proxy(app, config)
+    _register_elabftw_proxy(app, config, auth_dep)
 
     @app.get("/run-builder")
     def run_builder() -> Any:

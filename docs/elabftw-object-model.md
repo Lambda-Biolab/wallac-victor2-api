@@ -15,10 +15,11 @@ eLabFTW is the canonical source of truth for Methods, Plate Layouts, Analysis
 Plans, Automation Jobs, Assays, signatures, provenance, and results. Wallac MDB
 protocols are generated execution artifacts/cache — never canonical records.
 
-The bridge executes only the exact canonical JSON bytes whose SHA-256 hash
-matches signed eLabFTW metadata. Any missing signature, invalid signature,
-unauthorized signer, attachment mismatch, hash mismatch, stale lifecycle state,
-unsupported schema, or post-signature mutation fails closed before MDB
+The bridge accepts jobs via authenticated HTTP requests (bridge bearer token).
+It downloads the eLabFTW attachment referenced by the job request, computes its
+SHA-256 hash, and compares the result to the hash supplied in the request — a
+byte-level integrity check against caller-supplied reference hashes. Missing
+attachment, hash mismatch, or unsupported schema fails closed before MDB
 generation or execution.
 
 ## Object types
@@ -30,7 +31,7 @@ Five eLabFTW object types participate in the v1 authoring flow:
 | Wallac Victor2 Method | resource category (`items_types`) | Reusable acquisition settings |
 | Wallac Victor2 Plate Layout | resource category | Well/sample map and measured/skipped/excluded well intent |
 | Wallac Victor2 Analysis Plan | resource category | Reusable analysis rules |
-| Wallac Victor2 Automation Job | resource category | One execution attempt — frozen bundle, state, artifacts |
+| Wallac Victor2 Automation Job | resource category | One execution attempt — intent and provenance; frozen bundle and input refs |
 | Wallac Victor2 Assay | experiment template (`experiments_template`) | Human scientific narrative |
 
 Existing generic templates are renamed in place:
@@ -74,16 +75,19 @@ normalization, thresholds/pass-fail, exclusions, and output requirements.
 
 ### Automation Job
 
-One execution attempt. Owns the final frozen execution bundle, state
-transitions, signed input bundle, generated `AssayProtID`, validation report,
-event log, raw/analyzed artifacts, errors, rollback hints, spool status, and
-result manifest.
+One execution attempt. Records intent and provenance: owns the frozen execution
+bundle, signed input refs (attachment IDs and hashes), and binding metadata.
+Runtime state, events, and clone protocol ID are tracked in the bridge's
+in-memory JobManager. Execution results and analyzed artifacts are written to
+the linked eLabFTW experiment, not the Automation Job resource.
 
 ### Assay
 
 Human scientific narrative: purpose, sample/control summary, selected analyzed
-results, conclusions, and links back to the Automation Job/artifacts. The Run
-Builder creates one new Assay per submitted run by default.
+results, and conclusions. The bridge records the Automation Job metadata (job
+ID and execution summary) in the experiment HTML body, but does not create
+eLabFTW item links. The Run Builder creates one new Assay per submitted run by
+default.
 
 ## Canonical JSON contracts
 
@@ -107,8 +111,8 @@ identity. The backend, not the browser, is the canonicalization authority.
 - no insignificant whitespace
 - explicit `schema_name` and `schema_version`
 - SHA-256 computed over exact attached bytes
-- bridge downloads the exact signed attachment ID, hashes bytes, compares to
-  signed metadata, and only then parses JSON
+- bridge downloads the attachment by the caller-supplied ID, hashes bytes,
+  compares to the caller-supplied hash, and only then parses JSON
 
 The bridge accepts only explicitly supported schema versions. Unknown/future
 versions fail closed with `SCHEMA_UNSUPPORTED`. Schema migrations create new
@@ -117,8 +121,10 @@ JSON in place.
 
 ## Signature binding metadata
 
-Each executable eLabFTW object must have signed metadata binding both attachment
-identity and content hash:
+The metadata fields below are populated during the eLabFTW signing workflow.
+The bridge does not verify eLabFTW cryptographic signatures; it compares
+downloaded bytes against the caller-supplied hash (see
+[Canonical JSON contracts](#canonical-json-contracts)).
 
 | Object | Metadata fields |
 |---|---|
@@ -155,17 +161,19 @@ creates a new draft clone/version with lineage fields:
 - canonical JSON attachment ID
 
 Automation Jobs bind to specific signed object versions by ID and hash. They
-must never resolve `latest active` at execution time. The bridge revalidates
-eligibility immediately before MDB generation and again before run start.
+must never resolve `latest active` at execution time. The caller supplies the
+exact referenced hashes in the job request; the bridge compares downloaded
+bytes against those refs before MDB generation.
 
 ## Signing and authorization
 
 Signing is for **audit trail and provenance**, not a runtime gate. In the
 direct-submit model, the Run Builder submits jobs directly to the bridge via
-`POST /jobs` with references to signed specs. The bridge validates signed specs
-before execution, but signing does not block submission.
+`POST /jobs` with reference hashes from signed eLabFTW objects. The bridge
+compares downloaded attachment bytes to the caller-supplied hashes and validates
+the schema version before execution.
 
-Required signatures for generated-protocol execution:
+Required signatures for generated-protocol execution (eLabFTW authoring convention — not enforced by the bridge at runtime):
 
 1. Method
 2. reusable Plate Layout (if used)
@@ -183,10 +191,6 @@ Signing order:
 4. Create Automation Job referencing exact signed object IDs and hashes.
 5. Include one-off layout hash/attachment directly in `job.json` when applicable.
 6. Require the Automation Job signature last.
-
-Signature validity is necessary but not sufficient. The bridge must also check
-signer identity against a static configured authorized-signer allowlist for v1.
-Dynamic eLabFTW team/group lookup is future work.
 
 The Wallac bridge/designer service identity may create/update drafts, attach
 canonical JSON, update metadata summaries/hashes, and write back results, but it
@@ -298,17 +302,8 @@ bridge-managed runtime fields:
 | Request | Expected outputs | text | operator | Expected measurement outputs |
 | Bundle | Job JSON attachment ID | text | bridge | eLabFTW upload ID of `job.json` |
 | Bundle | Job hash | text | bridge | SHA-256 of canonical `job.json` |
-| Bundle | Generated AssayProtID | text | bridge | Generated MDB protocol ID |
-| Bundle | MDB backup path | text | bridge | Timestamped backup path |
-| Bundle | Validation report | url | bridge | Link to validation report |
 | Wallac | Wallac run ID | text | bridge | Instrument run identifier |
 | Wallac | Device identity | text | bridge | Device name/version |
-| Wallac | Live Monitor | url | bridge | Dashboard URL |
-| Results | Final state | select | bridge | completed, failed, aborted, unknown_requires_operator_review |
-| Results | Result summary | text | bridge | Summary of measurement results |
-| Results | Artifact manifest | url | bridge | Link to result artifacts |
-| Errors | Last error code | text | bridge | Stable error code |
-| Errors | Operator hint | text | bridge | Human-readable hint |
 
 Removed fields (managed internally by the bridge, not in eLabFTW metadata):
 
@@ -318,12 +313,16 @@ Removed fields (managed internally by the bridge, not in eLabFTW metadata):
 | `Automation state` | Bridge tracks state in-memory |
 | `Claimed by` / `Claimed at` | Bridge doesn't claim — it receives |
 | `Last heartbeat` | Bridge health is independent of eLabFTW metadata |
-| `Progress percent` / `Current step` | Progress is reported via the bridge HTTP API and dashboard, not eLabFTW |
+| `Progress percent` / `Current step` | Progress is reported via the bridge HTTP API (GET /jobs/{job_id}), not eLabFTW |
+| `Generated AssayProtID` | Runtime-only; exists in JobManager state, not persisted in eLabFTW metadata |
+| `Final state` / `Result summary` | Successful: written to eLabFTW experiment. Failures: in-memory JobManager only. Not Automation Job metadata |
+| `Last error code` / `Operator hint` | In-memory JobManager only. Not written to eLabFTW experiment or Automation Job metadata |
 
 ### Automation Job lifecycle states
 
 In the direct-submit model, the bridge manages runtime state internally.
-eLabFTW records only the terminal outcome and result summary. The simplified
+Only successful runs write outcome and result summary to the linked eLabFTW
+experiment; failures remain in in-memory JobManager only. The simplified
 state set is:
 
 ```
@@ -342,10 +341,17 @@ experiment record (not the Automation Job resource metadata) for audit.
 
 ## Generated MDB protocol model
 
-One generated MDB protocol per Automation Job. Generated `AssayProtID` stored
-back on the Automation Job.
+A temporary clone protocol is created for the run, started, and cleaned up
+after execution. The clone's AssayProtID exists only in bridge runtime state
+(JobManager), not persisted on the Automation Job.
 
-- Name format: `ELAB-Job-<automation_job_id>-<short_hash>`
+- Temporary clone per run, not a persistent generated protocol
+- Name format: `ELAB-Run-{new_id}` where `new_id` is derived from
+  `int(time.time()) % 100000 + 2001000`
+- Clone is cleaned up after execution (deleted in a `finally` block via
+  `_cleanup_cloned_protocol()`)
+- Factory template is never modified; the original template ID is used
+  for name resolution, the clone ID only for starting the run
 - Execute by stored numeric `AssayProtID`, not by name
 - Never automatically reuse generated protocols or IDs
 - ID namespace: reserve high range starting at `2000000`

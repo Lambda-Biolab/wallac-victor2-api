@@ -7,16 +7,22 @@ host. For the vm-agent (`:8420`) contract, see
 
 ## Authentication
 
-All three services use optional `Authorization: Bearer <token>`.
+Both FastAPI apps use optional `Authorization: Bearer <token>`:
 
-- The **vm-agent** reads its token from a file on the VM
-  (`TOKEN_FILE` in `agent.py`, default `C:\Users\Public\agent_token.txt`).
-- The **bridge** and **designer** read from env vars:
-  `WALLAC_BRIDGE_TOKEN`, `WALLAC_DESIGNER_TOKEN`.
+- The **bridge** reads from `WALLAC_BRIDGE_TOKEN`.
+- The **designer** reads from `WALLAC_DESIGNER_TOKEN`.
 
-If unset, auth is disabled and the service logs a warning. **No token is ever
-stored in this repository.** For the full policy, see
-[`auth-secrets-policy.md`](auth-secrets-policy.md).
+(The vm-agent on the Windows VM authenticates separately via a token file on
+disk; see [`api-reference.md`](api-reference.md).)
+
+If unset, auth is disabled with no warning. **Never commit real tokens** —
+tracked templates (`deploy/bridge.env.example`) use placeholder values.
+See [`auth-secrets-policy.md`](auth-secrets-policy.md) for the full policy.
+
+> **Run Builder single-token limitation.** The Run Builder UI reuses the same
+> bearer token for both designer and bridge requests. Operators using the UI
+> must set `WALLAC_BRIDGE_TOKEN` and `WALLAC_DESIGNER_TOKEN` to matching values.
+> Direct API clients may use separate tokens per service.
 
 ## bridge API — `:8423`
 
@@ -33,9 +39,9 @@ stored in this repository.** For the full policy, see
 | Method & path | Purpose |
 |---|---|
 | `GET /health` | liveness |
-| `GET /config` | client-side URLs (bridge, eLabFTW, vm-agent) for auto-fill |
+| `GET /config` | returns `{elabftw_url, bridge_url}` for the Run Builder (explicitly omits `vm_agent_url` — security) |
 | `GET /run-builder` | Run Builder single-page app |
-| `GET /elabftw/events` | proxy for eLabFTW calendar (self-signed cert workaround) |
+| `GET /elabftw/events?items_id=&start=&end=` | eLabFTW events API proxy; requires designer bearer auth (self-signed cert workaround) |
 | `POST/GET /api/{methods\|layouts\|analyses\|jobs}` | create / list drafts |
 | `GET/PATCH /api/{...}/{item_id}` | read / update a draft |
 | `POST /api/{...}/{item_id}/finalize` | canonicalize + hash + attach JSON |

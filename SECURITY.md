@@ -7,17 +7,17 @@
 
 ## Threat model
 
-The bridge, designer, dashboard, and vm-agent services are written for a
-lab environment where:
+The bridge, designer, and vm-agent services are written for a lab
+environment where:
 
-- All three HTTP services (bridge, designer, dashboard) bind to
-  `0.0.0.0` and accept bearer-token authentication. If the corresponding
-  `WALLAC_*_TOKEN` environment variable is unset, the service runs
-  **open** on the network and relies entirely on the network boundary
-  for access control.
+- Both HTTP services (bridge, designer) bind to `0.0.0.0` and accept
+  bearer-token authentication. If the corresponding `WALLAC_*_TOKEN`
+  environment variable is unset, the service runs **open** on the
+  network and relies entirely on the network boundary for access
+  control.
 - The vm-agent runs inside a Windows 7 libvirt VM behind a host-only NAT
-  on `192.168.122.x`. It is expected to be reached only by the bridge
-  over an SSH tunnel; the NAT provides the access-control boundary.
+  on `192.168.122.x`. It is reached directly over the private libvirt
+  network; the NAT provides the access-control boundary.
 - All services communicate over plain HTTP. There is no built-in TLS.
 - The `/config` endpoint on the designer service historically returned
   internal URLs (eLabFTW, bridge, vm-agent). It is now behind
@@ -38,8 +38,8 @@ For the per-endpoint authentication contract, see
 To deploy the bridge beyond a trusted LAN (for example, behind a public
 reverse proxy or a public Tailscale node):
 
-1. **Set every auth token.** `WALLAC_BRIDGE_TOKEN`, `WALLAC_DESIGNER_TOKEN`,
-   and `WALLAC_DASHBOARD_TOKEN` must be set to long, random values.
+1. **Set every auth token.** `WALLAC_BRIDGE_TOKEN` and
+   `WALLAC_DESIGNER_TOKEN` must be set to long, random values.
    Alternatively, set `WALLAC_REQUIRE_AUTH=1` to hard-fail at startup if
    any are unset.
 2. **Front every service with a TLS-terminating reverse proxy** (nginx,
@@ -52,13 +52,12 @@ reverse proxy or a public Tailscale node):
 4. **Keep eLabFTW TLS verification on.** If your eLabFTW uses a
    self-signed certificate, install it in the system trust store
    instead of disabling verification globally.
-5. **Bind to a specific interface, not `0.0.0.0`.** Set
-   `WALLAC_DASHBOARD_HOST` to the reverse proxy's loopback address if
-   appropriate. (Bridge and designer bind via systemd unit; update the
-   unit to use `--host 127.0.0.1` and let the proxy reach them.)
-6. **Review the firewall.** Confirm that ports `8420-8423` are not
-   reachable from outside the trusted boundary, even with the reverse
-   proxy in place.
+5. **Bind to a specific interface, not `0.0.0.0`.** Bridge and designer
+   bind via systemd unit; update the unit to use `--host 127.0.0.1`
+   and let the proxy reach them.
+6. **Review the firewall.** Confirm that ports `8420`, `8422`, and `8423`
+   are not reachable from outside the trusted boundary, even with the
+   reverse proxy in place.
 
 ## Reporting a vulnerability
 
@@ -70,9 +69,8 @@ unpatched security bugs.
 ## Related documentation
 
 - [`docs/auth-secrets-policy.md`](docs/auth-secrets-policy.md) — token
-  configuration, dashboard network assumptions, secrets-in-browser
-  guarantees.
+  configuration, secrets-in-browser guarantees.
 - [`docs/deployment-notes.md`](docs/deployment-notes.md) — production
-  deployment topology and SSH-tunneling for the vm-agent.
+  deployment topology and vm-agent networking details.
 - [`docs/architecture.md`](docs/architecture.md) — component
   responsibilities and trust boundaries.
