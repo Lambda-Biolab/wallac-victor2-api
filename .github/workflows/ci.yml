@@ -24,17 +24,8 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install tools and test dependencies
-        run: |
-          uv pip install --system \
-            ruff==0.15.15 \
-            pyright \
-            pytest \
-            pytest-timeout \
-            fastapi \
-            httpx \
-            pydantic \
-            pynacl
+      - name: Install locked dependencies
+        run: uv sync --locked
 
       - name: Validate (lint + typecheck + format-check + tests)
         run: make validate

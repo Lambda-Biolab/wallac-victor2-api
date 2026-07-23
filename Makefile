@@ -1,34 +1,29 @@
-# Quality gates for the maintained stacks (docs/102).
-# vm-agent/agent.py is excluded from complexity (Windows COM code with
-# inherently complex API handlers; bridge/ is the maintained stack).
-GATED := bridge/elabftw.py bridge/signature.py bridge/intake.py \
-         bridge/models.py bridge/errors.py bridge/lifecycle.py bridge/abort.py \
-         bridge/writeback.py bridge/dashboard.py bridge/config.py bridge/secrets_check.py \
-         bridge/canonical.py bridge/schemas.py bridge/designer.py bridge/designer_app.py \
-         bridge/validation.py bridge/generated_protocols.py bridge/analysis.py \
-         bridge/vm_agent_client.py bridge/spool.py bridge/execution.py \
-         bridge/jobs.py bridge/bridge_app.py bridge/executor.py
-
-.PHONY: validate format test typecheck complexity setup_dev
+.PHONY: validate format test typecheck complexity setup setup_dev setup_prod
 
 validate:  ## lint + typecheck + format-check + tests
-	ruff check .
-	pyright bridge/
-	ruff format --check .
-	pytest -q
+	uv run --locked ruff check .
+	uv run --locked pyright bridge/
+	uv run --locked ruff format --check .
+	uv run --locked pytest -q
 
 format:  ## auto-fix lint + format
-	ruff check . --fix
-	ruff format .
+	uv run --locked ruff check . --fix
+	uv run --locked ruff format .
 
 test:  ## run the unit tests
-	pytest -q
+	uv run --locked pytest -q
 
 typecheck:  ## static type check (pyright, bridge/ only — vm-agent is Windows/comtypes)
-	pyright bridge/
+	uv run --locked pyright bridge/
 
 complexity:  ## cognitive complexity (informational only — not gated)
-	@echo "Complexity check is informational only. Run: complexipy bridge/ -mx 15"
+	@echo "Complexity check is informational only. Run: uv run --locked complexipy bridge/ -mx 15"
 
-setup_dev:  ## install the pre-commit hooks
-	uvx pre-commit install --hook-type pre-commit --hook-type commit-msg
+setup:  ## create/update the locked project environment
+	uv sync --locked
+
+setup_dev: setup  ## create the environment and install pre-commit hooks
+	uv run --locked pre-commit install --hook-type pre-commit --hook-type commit-msg
+
+setup_prod:  ## install only locked bridge runtime dependencies
+	uv sync --locked --no-default-groups

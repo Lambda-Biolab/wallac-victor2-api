@@ -18,4 +18,4 @@ id_rsa*
 agent_token.txt
 *.token
 .playwright-mcp/
-uv.lock
+.complexipy_cache/

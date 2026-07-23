@@ -1,5 +1,5 @@
 # Quality gates for the maintained agent stack (docs/102). Install with:
-#   uvx pre-commit install --hook-type pre-commit --hook-type commit-msg
+#   make setup_dev
 # Run on demand:  make validate
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
@@ -13,7 +13,7 @@ repos:
     hooks:
       - id: complexipy
         name: complexipy (cognitive <=15, agent stack)
-        entry: complexipy -mx 15
+        entry: uv run --locked complexipy -mx 15
         language: system
         files: ^(vm-agent/(agent|lid_watcher|launch_as_user)\.py|bridge/(elabftw|signature|intake|models|errors|lifecycle|abort|writeback|dashboard|config|secrets_check)\.py)$
         pass_filenames: true
