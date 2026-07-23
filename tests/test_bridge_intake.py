@@ -37,7 +37,7 @@ from bridge.models import JobState
 def setup():
     """Return a bundle of (client, intake, signing_key, pubkey_content)."""
     client = MockElabftwClient()
-    signing_key, pubkey_bytes, pubkey_content = generate_minisign_keypair()
+    signing_key, _pubkey_bytes, pubkey_content = generate_minisign_keypair()
     intake = JobIntake(
         client=client,
         bridge_identity="wallac-bridge-test",

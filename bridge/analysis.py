@@ -105,7 +105,7 @@ class ReplicateGroup:
     cv: float = 0.0
     n: int = 0
     wells: list[str] = field(default_factory=list)
-    pass_fail: str = "pass"  # "pass" or "fail"
+    pass_fail: str = "pass"  # noqa: S105  # Result status, not a credential.
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -128,7 +128,7 @@ class AnalysisResult:
     blank_value: float | None = None
     normalization_factor: float | None = None
     summary: dict[str, Any] = field(default_factory=dict)
-    pass_fail: str = "pass"
+    pass_fail: str = "pass"  # noqa: S105  # Result status, not a credential.
 
     def to_analyzed_wells_csv(self) -> str:
         """Export analyzed per-well results as CSV."""
@@ -444,10 +444,10 @@ class AnalysisPipeline:
 
                 if _check_threshold(rule.operator, metric_value, rule.value):
                     if rule.action == "fail":
-                        group.pass_fail = "fail"
-                        result.pass_fail = "fail"
+                        group.pass_fail = "fail"  # noqa: S105  # Result status.
+                        result.pass_fail = "fail"  # noqa: S105  # Result status.
                     elif rule.action == "flag":
-                        group.pass_fail = "flag"
+                        group.pass_fail = "flag"  # noqa: S105  # Result status.
 
     def _build_summary(self, result: AnalysisResult, spec: AnalysisSpec) -> None:
         """Step 10: Build analysis summary."""

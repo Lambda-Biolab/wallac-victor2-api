@@ -162,7 +162,7 @@ _VALID_WELL_NAMES_SET = frozenset(VALID_WELL_NAMES)
 
 
 def is_valid_well_name(name: str) -> bool:
-    """Return True if ``name`` is a valid 96-well plate well name (A1–H12)."""
+    """Return True if ``name`` is a valid 96-well plate well name (A1-H12)."""
     return name in _VALID_WELL_NAMES_SET
 
 
@@ -374,7 +374,7 @@ class WellSpec:
     def from_dict(cls, d: dict[str, Any]) -> WellSpec:
         well_name = str(d["well_name"])
         if not is_valid_well_name(well_name):
-            raise ValueError(f"Invalid well name '{well_name}' (must be A1–H12)")
+            raise ValueError(f"Invalid well name '{well_name}' (must be A1-H12)")
 
         role = str(d["role"])
         if role not in {r.value for r in WellRole}:

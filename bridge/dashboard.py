@@ -409,7 +409,7 @@ class DashboardServer:
         state_store: DashboardStateStore,
         abort_handler: Any | None = None,
         artifact_store: dict[tuple[int, str], tuple[bytes, str]] | None = None,
-        host: str = "0.0.0.0",
+        host: str = "0.0.0.0",  # noqa: S104  # Intentional lab-LAN binding.
         port: int = 8421,
         session_token: str | None = None,
         require_auth: bool = False,

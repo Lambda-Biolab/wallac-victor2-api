@@ -263,7 +263,7 @@ def _register_elabftw_proxy(app: FastAPI, config: Any) -> None:
             query["end"] = end
 
         url = f"{config.elabftw_url}/api/v2/events?{urllib.parse.urlencode(query)}"
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(url)  # noqa: S310  # Base URL is server config.
         req.add_header("Authorization", config.elabftw_api_key)
 
         ctx = ssl.create_default_context()
@@ -274,7 +274,7 @@ def _register_elabftw_proxy(app: FastAPI, config: Any) -> None:
             ctx.verify_mode = ssl.CERT_NONE
 
         try:
-            with urllib.request.urlopen(req, context=ctx) as resp:
+            with urllib.request.urlopen(req, context=ctx) as resp:  # noqa: S310
                 return _json.loads(resp.read())
         except urllib.error.HTTPError as e:
             raise HTTPException(status_code=e.code, detail=str(e.read().decode()[:200])) from e

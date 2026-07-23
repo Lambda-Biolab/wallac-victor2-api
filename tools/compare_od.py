@@ -197,7 +197,7 @@ def main() -> None:
         sys.exit(1)
 
     oem_path = sys.argv[1]
-    bridge_path = "/tmp/elabftw_raw_results.json"
+    bridge_path = "/tmp/elabftw_raw_results.json"  # noqa: S108  # Read-only CLI default.
 
     if "--bridge" in sys.argv:
         idx = sys.argv.index("--bridge")

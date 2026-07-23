@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
@@ -391,7 +392,3 @@ class TestBridgeAppAuth:
     def test_invalid_token(self, authed_client: TestClient) -> None:
         r = authed_client.get("/jobs", headers={"Authorization": "Bearer wrong"})
         assert r.status_code == 401
-
-
-# Need threading import for the queue test
-import threading  # noqa: E402

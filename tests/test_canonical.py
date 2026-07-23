@@ -325,7 +325,7 @@ def test_valid_well_names_accepted():
 
 
 def test_invalid_well_names_rejected():
-    """is_valid_well_name returns False for names outside A1–H12."""
+    """is_valid_well_name returns False for names outside A1-H12."""
     assert is_valid_well_name("A13") is False
     assert is_valid_well_name("I1") is False
     assert is_valid_well_name("") is False

@@ -69,12 +69,14 @@ def _request(
 ) -> Any:
     url = f"{base}{path}"
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method)
+    req = urllib.request.Request(  # noqa: S310  # Base URL is operator config.
+        url, data=data, method=method
+    )
     req.add_header("Authorization", api_key)
     if body is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, context=ctx) as resp:
+        with urllib.request.urlopen(req, context=ctx) as resp:  # noqa: S310
             content = resp.read()
             if not content:
                 loc = resp.headers.get("Location") or ""
@@ -146,10 +148,12 @@ def _upload_file(
         + content
         + f"\r\n--{boundary}--\r\n".encode()
     )
-    req = urllib.request.Request(f"{base}/items/{item_id}/uploads", data=body, method="POST")
+    req = urllib.request.Request(  # noqa: S310  # Base URL is operator config.
+        f"{base}/items/{item_id}/uploads", data=body, method="POST"
+    )
     req.add_header("Authorization", api_key)
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-    with urllib.request.urlopen(req, context=ctx) as resp:
+    with urllib.request.urlopen(req, context=ctx) as resp:  # noqa: S310
         loc = resp.headers.get("Location") or ""
         # Upload ID is the last numeric segment
         parts = loc.rstrip("/").rsplit("/", 1)

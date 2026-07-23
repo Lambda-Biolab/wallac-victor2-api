@@ -110,7 +110,7 @@ def main():
     while True:
         try:
             scan()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log(f"scan error: {exc!r}")
         time.sleep(1.0)
 

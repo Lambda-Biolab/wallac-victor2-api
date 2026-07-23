@@ -127,7 +127,7 @@ def _get(url: str, token: str | None = None) -> tuple[int, bytes]:
 
 def test_dashboard_rejects_no_token(secured_server):
     """Without a token, all endpoints return 401."""
-    srv, store = secured_server
+    srv, _store = secured_server
     base = f"http://{srv.address[0]}:{srv.address[1]}"
 
     code, _ = _get(f"{base}/")
@@ -139,7 +139,7 @@ def test_dashboard_rejects_no_token(secured_server):
 
 def test_dashboard_rejects_wrong_token(secured_server):
     """With a wrong token, endpoints return 401."""
-    srv, store = secured_server
+    srv, _store = secured_server
     base = f"http://{srv.address[0]}:{srv.address[1]}"
 
     code, _ = _get(f"{base}/", token="wrong-token")
@@ -148,7 +148,7 @@ def test_dashboard_rejects_wrong_token(secured_server):
 
 def test_dashboard_accepts_correct_token(secured_server):
     """With the correct token, endpoints return 200."""
-    srv, store = secured_server
+    srv, _store = secured_server
     base = f"http://{srv.address[0]}:{srv.address[1]}"
 
     code, body = _get(f"{base}/", token="test-session-token")
@@ -158,7 +158,7 @@ def test_dashboard_accepts_correct_token(secured_server):
 
 def test_dashboard_api_requires_token(secured_server):
     """The JSON API also requires the session token."""
-    srv, store = secured_server
+    srv, _store = secured_server
     base = f"http://{srv.address[0]}:{srv.address[1]}"
 
     # Without token → 401

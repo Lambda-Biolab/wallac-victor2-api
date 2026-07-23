@@ -141,12 +141,14 @@ class ElabftwClient:
     ) -> Any:
         url = f"{self.base}{path}"
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method)
+        req = urllib.request.Request(  # noqa: S310  # Base URL is operator config.
+            url, data=data, method=method
+        )
         req.add_header("Authorization", self.api_key)
         if body is not None:
             req.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(req, context=self._ssl_ctx) as resp:
+            with urllib.request.urlopen(req, context=self._ssl_ctx) as resp:  # noqa: S310
                 content = resp.read()
                 if not content:
                     # POST may return 201 with Location header but empty body.
@@ -193,9 +195,9 @@ class ElabftwClient:
         Uses ``?format=binary`` because the default response is JSON metadata.
         """
         url = f"{self.base}/items/{item_id}/uploads/{upload_id}?format=binary"
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(url)  # noqa: S310  # Base URL is operator config.
         req.add_header("Authorization", self.api_key)
-        with urllib.request.urlopen(req, context=self._ssl_ctx) as resp:
+        with urllib.request.urlopen(req, context=self._ssl_ctx) as resp:  # noqa: S310
             return resp.read()
 
     def patch_metadata(self, item_id: int, extra_fields: dict[str, Any]) -> None:
@@ -239,11 +241,13 @@ class ElabftwClient:
         data = b"".join(body_parts)
 
         url = f"{self.base}/items/{item_id}/uploads"
-        req = urllib.request.Request(url, data=data, method="POST")
+        req = urllib.request.Request(  # noqa: S310  # Base URL is operator config.
+            url, data=data, method="POST"
+        )
         req.add_header("Authorization", self.api_key)
         req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
         try:
-            with urllib.request.urlopen(req, context=self._ssl_ctx) as resp:
+            with urllib.request.urlopen(req, context=self._ssl_ctx) as resp:  # noqa: S310
                 content_resp = resp.read()
                 if content_resp:
                     return json.loads(content_resp)
@@ -420,11 +424,13 @@ class ElabftwClient:
         data = b"".join(body_parts)
 
         url = f"{self.base}/experiments/{experiment_id}/uploads"
-        req = urllib.request.Request(url, data=data, method="POST")
+        req = urllib.request.Request(  # noqa: S310  # Base URL is operator config.
+            url, data=data, method="POST"
+        )
         req.add_header("Authorization", self.api_key)
         req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
         try:
-            with urllib.request.urlopen(req, context=self._ssl_ctx) as resp:
+            with urllib.request.urlopen(req, context=self._ssl_ctx) as resp:  # noqa: S310
                 content_resp = resp.read()
                 if content_resp:
                     return json.loads(content_resp)

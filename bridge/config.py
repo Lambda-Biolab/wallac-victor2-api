@@ -27,10 +27,10 @@ ENV_ELABFTW_VERIFY_TLS = "WALLAC_ELABFTW_VERIFY_TLS"
 
 # vm-agent REST API (the instrument microservice)
 ENV_VM_AGENT_URL = "WALLAC_VM_AGENT_URL"
-ENV_VM_AGENT_TOKEN = "WALLAC_VM_AGENT_TOKEN"
+ENV_VM_AGENT_TOKEN = "WALLAC_VM_AGENT_TOKEN"  # noqa: S105  # Env name, not a token.
 
 # Dashboard session token (optional; if unset, dashboard is open on the LAN)
-ENV_DASHBOARD_TOKEN = "WALLAC_DASHBOARD_TOKEN"
+ENV_DASHBOARD_TOKEN = "WALLAC_DASHBOARD_TOKEN"  # noqa: S105  # Env name, not a token.
 
 # Dashboard network binding
 ENV_DASHBOARD_HOST = "WALLAC_DASHBOARD_HOST"
@@ -65,7 +65,7 @@ DEFAULT_ELABFTW_URL = "https://localhost:3148"
 DEFAULT_ELABFTW_CATEGORY = 21  # items_categories ID for Automation Job (NOT items_types ID)
 DEFAULT_ELABFTW_VERIFY_TLS = True
 DEFAULT_VM_AGENT_URL = "http://192.168.122.203:8420"
-DEFAULT_DASHBOARD_HOST = "0.0.0.0"
+DEFAULT_DASHBOARD_HOST = "0.0.0.0"  # noqa: S104  # Intentional lab-LAN binding.
 DEFAULT_DASHBOARD_PORT = 8421
 DEFAULT_BRIDGE_IDENTITY = "wallac-bridge"
 DEFAULT_DEVICE_IDENTITY = "victor2-unknown"

@@ -451,7 +451,11 @@ class BridgeExecutor:
                             }
                         job.live_wells = list(existing.values())
                 except Exception:
-                    pass  # live fetch is best-effort
+                    logger.debug(
+                        "Live result fetch failed for job %s",
+                        job.job_id,
+                        exc_info=True,
+                    )
 
                 # Emit a progress event every ~3s (every 3rd live fetch)
                 # so the orchestrator can show well count progress to the user.

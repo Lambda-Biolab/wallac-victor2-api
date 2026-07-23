@@ -49,13 +49,15 @@ class RemoteMdbClient(MdbClient):
     ) -> Any:
         url = f"{self.base}{path}"
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method)
+        req = urllib.request.Request(  # noqa: S310  # Base URL is operator config.
+            url, data=data, method=method
+        )
         if self.token:
             req.add_header("Authorization", f"Bearer {self.token}")
         if body is not None:
             req.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
                 content = resp.read()
                 if not content:
                     return None

@@ -350,7 +350,7 @@ class TestGeneratedProtocolHashVerification:
         matching protocol available, it should proceed to protocol cloning
         and run start.
         """
-        method_spec, method_bytes, method_hash = self._make_method_spec()
+        _method_spec, method_bytes, method_hash = self._make_method_spec()
         elabftw.add_upload(42, 5001, method_bytes)
 
         ref = {
@@ -378,7 +378,7 @@ class TestGeneratedProtocolHashVerification:
         elabftw: MockElabftwClient,
     ) -> None:
         """Hash mismatch blocks execution — job is failed with appropriate error."""
-        method_spec, method_bytes, method_hash = self._make_method_spec()
+        _method_spec, method_bytes, _method_hash = self._make_method_spec()
         elabftw.add_upload(42, 5001, method_bytes)
 
         # Use a wrong hash
@@ -405,7 +405,7 @@ class TestGeneratedProtocolHashVerification:
         elabftw: MockElabftwClient,
     ) -> None:
         """Missing hash in ref blocks execution — job is failed."""
-        method_spec, method_bytes, method_hash = self._make_method_spec()
+        _method_spec, method_bytes, _method_hash = self._make_method_spec()
         elabftw.add_upload(42, 5001, method_bytes)
 
         # Ref without hash (but with valid object_id and attachment_id)
@@ -428,7 +428,7 @@ class TestGeneratedProtocolHashVerification:
         elabftw: MockElabftwClient,
     ) -> None:
         """Dry-run with valid ref completes successfully (validation only)."""
-        method_spec, method_bytes, method_hash = self._make_method_spec()
+        _method_spec, method_bytes, method_hash = self._make_method_spec()
         elabftw.add_upload(42, 5001, method_bytes)
 
         ref = {
@@ -449,7 +449,7 @@ class TestGeneratedProtocolHashVerification:
         elabftw: MockElabftwClient,
     ) -> None:
         """Dry-run with hash mismatch still fails closed (pre-execution check)."""
-        method_spec, method_bytes, method_hash = self._make_method_spec()
+        _method_spec, method_bytes, _method_hash = self._make_method_spec()
         elabftw.add_upload(42, 5001, method_bytes)
 
         wrong_hash = "b" * 64

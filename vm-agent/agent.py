@@ -19,6 +19,7 @@ file is absent, auth is disabled (the NAT is host-only) and a warning logs.
 
 import contextlib
 import json
+import logging
 import math
 import os
 import queue
@@ -41,9 +42,9 @@ ABORT_FLAG = r"C:\Users\Public\abort.flag"
 # Aborting earlier fails and can WEDGE the OEM state machine (doc 101), so we
 # refuse an abort until the run is at least this old.
 MIN_ABORT_AGE = 60.0
-BIND_HOST = "0.0.0.0"  # VM has only the libvirt NAT NIC -> host-only
+BIND_HOST = "0.0.0.0"  # noqa: S104  # VM has only the host-only libvirt NAT NIC.
 BIND_PORT = 8420
-TOKEN_FILE = r"C:\Users\Public\agent_token.txt"  # readable by lambda token
+TOKEN_FILE = r"C:\Users\Public\agent_token.txt"  # noqa: S105  # File path, not a token.
 CALL_TIMEOUT = 20.0
 
 # Protocols are not in the COM API -- read from the Jet DB (doc 95).
@@ -58,6 +59,7 @@ _PROT_SQL = (
     "ON p.ProtGroup = g.GroupID ORDER BY g.GroupName, p.ProtName"
 )
 _protocols_cache = None
+logger = logging.getLogger(__name__)
 
 
 def now_iso():
@@ -200,7 +202,7 @@ class ComWorker(threading.Thread):
         try:
             self._ensure()
             fut["result"] = {"reconnected": True}
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             fut["error"] = exc
 
     def _exec(self, fn, fut):
@@ -208,7 +210,7 @@ class ComWorker(threading.Thread):
             try:
                 fut["result"] = fn(self._ensure())
                 return
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 hr = getattr(exc, "hresult", None)
                 if hr is None:
                     hr = getattr(exc, "winerror", None)
@@ -224,7 +226,7 @@ class ComWorker(threading.Thread):
         comtypes.CoInitialize()
         try:
             self._ensure()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.init_error = f"{type(exc).__name__}: {exc}"
         self.ready.set()
         while True:
@@ -288,7 +290,7 @@ class Monitor(threading.Thread):
                 srv = self._ensure()
                 self._snapshot_state(srv, snap, cycle)
                 self._snapshot_live_wells(srv, snap)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 self._srv = None
                 snap.update(connected=False, error=f"{type(exc).__name__}: {exc}")
             with _monitor_lock:
@@ -314,7 +316,7 @@ class Monitor(threading.Thread):
         if cycle % 10 == 0:
             try:
                 snap["target_temperature"] = float(srv.GetTargetTemperature)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 with _monitor_lock:
                     snap["target_temperature"] = _monitor.get("target_temperature")
         else:
@@ -335,7 +337,7 @@ class Monitor(threading.Thread):
                             if bool(assay.IsMeasured) or not bool(assay.IsRunning):
                                 r["state"] = "completed"
                                 r["ended_at"] = now_iso()
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             # COM assay object is stale/invalid — the
                             # instrument is idle, so the run is done.
                             r["state"] = "completed"
@@ -362,8 +364,8 @@ class Monitor(threading.Thread):
             else:
                 with _monitor_lock:
                     snap["live_wells"] = _monitor.get("live_wells", [])
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:
+            logger.debug("Live result polling failed", exc_info=True)
 
     @staticmethod
     def _read_live_buffer(live) -> list:
@@ -700,7 +702,7 @@ def op_results(srv):
             )
             if not bool(live.Next):
                 break
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return {"wells": wells, "note": f"live read stopped: {exc!r}"}
     return {"wells": wells}
 
@@ -826,7 +828,7 @@ def op_job_results(assay_id):
             # cols: 0=PlateNumber, 1=LabelPlateBackgrounds
             bg_by_plate = {}
             rs = db.OpenRecordset(
-                "SELECT PlateNumber, LabelPlateBackgrounds FROM PlateResult "
+                "SELECT PlateNumber, LabelPlateBackgrounds FROM PlateResult "  # noqa: S608
                 f"WHERE AssayID = {int(assay_id)}"
             )
             while not rs.EOF:
@@ -1089,7 +1091,7 @@ def op_mdb_get_group_id(group_name):
         db = _open_mdb_r()
         try:
             rs = db.OpenRecordset(
-                "SELECT GroupID FROM ProtocolGroup WHERE GroupName = '"
+                "SELECT GroupID FROM ProtocolGroup WHERE GroupName = '"  # noqa: S608
                 + group_name.replace("'", "''")
                 + "'"
             )
@@ -1109,7 +1111,8 @@ def op_mdb_get_protocol(assay_prot_id):
         db = _open_mdb_r()
         try:
             rs = db.OpenRecordset(
-                "SELECT * FROM AssayProtocol WHERE AssayProtID = " + str(int(assay_prot_id))
+                "SELECT * FROM AssayProtocol WHERE AssayProtID = "  # noqa: S608
+                + str(int(assay_prot_id))
             )
             if rs.EOF:
                 return None
@@ -1127,7 +1130,9 @@ def op_mdb_find_protocol_by_name(name):
         db = _open_mdb_r()
         try:
             rs = db.OpenRecordset(
-                "SELECT * FROM AssayProtocol WHERE ProtName = '" + name.replace("'", "''") + "'"
+                "SELECT * FROM AssayProtocol WHERE ProtName = '"  # noqa: S608
+                + name.replace("'", "''")
+                + "'"
             )
             if rs.EOF:
                 return None
@@ -1158,7 +1163,10 @@ def op_mdb_get_max_protocol_id():
 
 def _mdb_column_names(db, template_id):
     """Get column names from the template AssayProtocol row."""
-    rs = db.OpenRecordset("SELECT * FROM AssayProtocol WHERE AssayProtID = " + str(template_id))
+    rs = db.OpenRecordset(
+        "SELECT * FROM AssayProtocol WHERE AssayProtID = "  # noqa: S608
+        + str(template_id)
+    )
     if rs.EOF:
         raise RuntimeError(f"Template protocol {template_id} not found")
     names = [rs.Fields.Item(i).Name for i in range(rs.Fields.Count)]
@@ -1170,7 +1178,7 @@ def _build_clone_sql(col_names, new_id, template_id):
     """Build INSERT INTO ... SELECT to clone a template row with a new ID."""
     select_parts = [str(new_id) if cn == "AssayProtID" else cn for cn in col_names]
     return (
-        "INSERT INTO AssayProtocol ("
+        "INSERT INTO AssayProtocol ("  # noqa: S608
         + ", ".join(col_names)
         + ") SELECT "
         + ", ".join(select_parts)
@@ -1256,7 +1264,7 @@ def op_mdb_insert_protocol(protocol_row):
             set_clauses = _build_override_set_clauses(protocol_row, _OVERRIDABLE_COLS)
             if set_clauses:
                 update_sql = (
-                    "UPDATE AssayProtocol SET "
+                    "UPDATE AssayProtocol SET "  # noqa: S608
                     + ", ".join(set_clauses)
                     + " WHERE AssayProtID = "
                     + str(new_id)
@@ -1274,7 +1282,10 @@ def op_mdb_delete_protocol(assay_prot_id):
     def _op(_srv):
         db = _open_mdb_w()
         try:
-            db.Execute("DELETE FROM AssayProtocol WHERE AssayProtID = " + str(int(assay_prot_id)))
+            db.Execute(
+                "DELETE FROM AssayProtocol WHERE AssayProtID = "  # noqa: S608
+                + str(int(assay_prot_id))
+            )
             return True
         except Exception:
             return False
@@ -1362,7 +1373,8 @@ def op_mdb_update_plate_map(assay_prot_id, plate_map):
         db = _open_mdb_w()
         try:
             rs = db.OpenRecordset(
-                "SELECT PlateMap FROM AssayProtocol WHERE AssayProtID = " + str(int(assay_prot_id))
+                "SELECT PlateMap FROM AssayProtocol WHERE AssayProtID = "  # noqa: S608
+                + str(int(assay_prot_id))
             )
             if rs.EOF:
                 raise ApiError(404, "protocol_not_found", f"AssayProtID {assay_prot_id} not found")
@@ -1422,7 +1434,7 @@ def op_mdb_ensure_group(group_name, group_id):
         db = _open_mdb_r()
         try:
             rs = db.OpenRecordset(
-                "SELECT GroupID FROM ProtocolGroup WHERE GroupName = '"
+                "SELECT GroupID FROM ProtocolGroup WHERE GroupName = '"  # noqa: S608
                 + group_name.replace("'", "''")
                 + "' OR GroupID = "
                 + str(int(group_id))
@@ -1944,7 +1956,7 @@ class Handler(BaseHTTPRequestHandler):
         parts = path.strip("/").split("/")
         try:
             self._route_get(path, parts)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._com_error(exc)
 
     def _route_get(self, path, parts):
@@ -2016,7 +2028,7 @@ class Handler(BaseHTTPRequestHandler):
                 }
         try:
             res = w.call(op_start_run(run_id, proto["id"], dry), timeout=60)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             if not dry:
                 with _runs_lock:
                     if run_id in _runs:
@@ -2166,7 +2178,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._mdb_ensure_group()
             else:
                 self._send(404, {"error": "not_found", "hint": "see GET /docs", "path": path})
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._com_error(exc)
 
     def do_DELETE(self):
@@ -2184,7 +2196,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._mdb_delete_protocol(parts[2])
             else:
                 self._send(404, {"error": "not_found", "hint": "see GET /docs", "path": path})
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._com_error(exc)
 
     def do_PATCH(self):
@@ -2212,7 +2224,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._mdb_set_wells(parts[2])
             else:
                 self._send(404, {"error": "not_found", "hint": "see GET /docs", "path": path})
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._com_error(exc)
 
     def _mdb_update_plate_map(self, assay_prot_id):

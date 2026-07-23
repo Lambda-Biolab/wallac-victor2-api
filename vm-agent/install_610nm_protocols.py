@@ -44,7 +44,7 @@ label_id_1s = max_label + 1
 label_id_01s = max_label + 2
 
 db.Execute(
-    f"INSERT INTO Photometry (LabelID, LabelName, CWLampFilterID, "
+    f"INSERT INTO Photometry (LabelID, LabelName, CWLampFilterID, "  # noqa: S608
     f"CWLampFilterID2, MeasTime, PolarizerAperture, UVAbsorbance, "
     f"FlashLampFilter, FactoryPreset, LastEditedWho, LastEditedTime, "
     f"ReadFromInstrument) "
@@ -53,7 +53,7 @@ db.Execute(
 print(f"Label 1.0s: id={label_id_1s}")
 
 db.Execute(
-    f"INSERT INTO Photometry (LabelID, LabelName, CWLampFilterID, "
+    f"INSERT INTO Photometry (LabelID, LabelName, CWLampFilterID, "  # noqa: S608
     f"CWLampFilterID2, MeasTime, PolarizerAperture, UVAbsorbance, "
     f"FlashLampFilter, FactoryPreset, LastEditedWho, LastEditedTime, "
     f"ReadFromInstrument) "
@@ -71,7 +71,7 @@ prot_id_01s = max_prot + 2
 # Copy the 490nm protocol's PlateMap using SQL
 # INSERT INTO ... SELECT with modifications
 db.Execute(
-    f"INSERT INTO AssayProtocol (AssayProtID, ProtVersion, ProtName, ProtNumber, "
+    f"INSERT INTO AssayProtocol (AssayProtID, ProtVersion, ProtName, ProtNumber, "  # noqa: S608
     f"ProtGroup, MeasSequence, MeasHeight, PlateTypeID, RepCount, RepDelta, "
     f"PlateMap, MeasurementMode, PlateHeating, Temperature, CreatedTime, "
     f"CreatedWho, LastEditedTime, LastEditedWho, RunCount, PrnOutput, "
@@ -87,7 +87,7 @@ db.Execute(
 print(f"Protocol 1.0s: id={prot_id_1s}")
 
 db.Execute(
-    f"INSERT INTO AssayProtocol (AssayProtID, ProtVersion, ProtName, ProtNumber, "
+    f"INSERT INTO AssayProtocol (AssayProtID, ProtVersion, ProtName, ProtNumber, "  # noqa: S608
     f"ProtGroup, MeasSequence, MeasHeight, PlateTypeID, RepCount, RepDelta, "
     f"PlateMap, MeasurementMode, PlateHeating, Temperature, CreatedTime, "
     f"CreatedWho, LastEditedTime, LastEditedWho, RunCount, PrnOutput, "

@@ -118,7 +118,7 @@ def make_state(item_id: int = 1, **kwargs) -> DashboardJobState:
 
 def test_dashboard_html_served(server):
     """GET / returns the dashboard HTML page."""
-    srv, store, _ = server
+    srv, _store, _ = server
     code, body, content_type = _get(f"{_base_url(srv)}/")
     assert code == 200
     assert "text/html" in content_type
@@ -142,8 +142,8 @@ def test_dashboard_html_served(server):
 
 def test_no_secrets_in_html(server):
     """The dashboard HTML must not contain any API keys or secrets."""
-    srv, store, _ = server
-    code, body, _ = _get(f"{_base_url(srv)}/")
+    srv, _store, _ = server
+    _code, body, _ = _get(f"{_base_url(srv)}/")
     html = body.decode("utf-8")
     # No API key patterns
     assert "api_key" not in html.lower()
@@ -196,7 +196,7 @@ def test_job_state_json(server):
 
 def test_job_not_found(server):
     """GET /api/jobs/{id} for a non-existent job returns 404."""
-    srv, store, _ = server
+    srv, _store, _ = server
     code, body, _ = _get(f"{_base_url(srv)}/api/jobs/999")
     assert code == 404
     data = json.loads(body)
@@ -257,7 +257,7 @@ def test_sse_stream_has_retry_hint(server):
 
 def test_abort_endpoint(server):
     """POST /api/jobs/{id}/abort requests a controlled abort."""
-    srv, store, abort_handler = server
+    srv, _store, abort_handler = server
 
     # Register a job with the abort handler (start from accepted, progress to running)
     job = AutomationJob(
@@ -283,8 +283,8 @@ def test_abort_endpoint(server):
 
 def test_abort_not_active(server):
     """POST /api/jobs/{id}/abort for a non-active job returns 404."""
-    srv, store, _ = server
-    code, body = _post(f"{_base_url(srv)}/api/jobs/999/abort")
+    srv, _store, _ = server
+    code, _body = _post(f"{_base_url(srv)}/api/jobs/999/abort")
     assert code == 404
 
 
@@ -304,7 +304,7 @@ def test_unauthorized_without_token():
     srv.start()
     time.sleep(0.1)
     try:
-        code, body, _ = _get(f"http://{srv.address[0]}:{srv.address[1]}/api/jobs/1")
+        code, _body, _ = _get(f"http://{srv.address[0]}:{srv.address[1]}/api/jobs/1")
         assert code == 401
     finally:
         srv.stop()
@@ -340,7 +340,7 @@ def test_authorized_with_token():
 
 def test_artifact_download(server):
     """GET /api/jobs/{id}/artifacts/{filename} downloads an artifact."""
-    srv, store, _ = server
+    srv, _store, _ = server
     # The artifact store is on the server
     csv_content = b"well,od\nA01,0.071\n"
     srv._httpd.artifact_store[(1, "results.csv")] = (csv_content, "text/csv")  # type: ignore[attr-defined]
@@ -353,7 +353,7 @@ def test_artifact_download(server):
 
 def test_artifact_not_found(server):
     """GET /api/jobs/{id}/artifacts/{filename} for missing file returns 404."""
-    srv, store, _ = server
+    srv, _store, _ = server
     code, _, _ = _get(f"{_base_url(srv)}/api/jobs/1/artifacts/nonexistent.csv")
     assert code == 404
 

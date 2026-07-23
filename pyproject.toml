@@ -47,6 +47,16 @@ extend-exclude = [
 select = ["E", "W", "F", "I", "B", "UP", "SIM", "S", "RUF"]
 ignore = ["E501"]  # line length handled by the formatter
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "S101",  # pytest uses assert for behavioral checks
+    "S104",  # test-only bind addresses
+    "S105",  # fixture tokens and pass/fail labels
+    "S106",  # fixture token arguments
+    "S108",  # test-only temporary paths
+    "S310",  # mocked or local test URLs
+]
+
 [tool.ruff.format]
 quote-style = "double"
 

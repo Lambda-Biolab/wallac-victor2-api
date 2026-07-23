@@ -544,7 +544,7 @@ class TestDesignerElabftwEventsSSRF:
             def read(self):
                 return b"[]"
 
-        def fake_urlopen(req, context=None):  # noqa: ARG001
+        def fake_urlopen(req, context=None):
             captured["url"] = req.full_url
             return FakeResponse()
 

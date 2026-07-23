@@ -444,7 +444,7 @@ class GeneratedProtocolManager:
         cleanup to target non-generated protocols.
         """
         sql = (
-            "SELECT AssayProtID, ProtName FROM AssayProtocol "
+            "SELECT AssayProtID, ProtName FROM AssayProtocol "  # noqa: S608
             "WHERE ProtName ALIKE '" + GENERATED_NAME_PREFIX + "%' "
             "ORDER BY AssayProtID"
         )
