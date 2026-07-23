@@ -225,13 +225,12 @@ Builder populates with a direct link to the external designer for that object.
 
 ## Auth and secrets
 
-- Designer and Run Builder require authenticated operator access.
-- Browser never receives the eLabFTW API key.
-- Browser never receives the vm-agent bearer token.
-- Browser talks to the Linux-side Wallac service only.
-- Wallac service talks to eLabFTW with its service identity.
-- Wallac service talks to vm-agent using configured URL/token.
-- vm-agent remains private hardware/MDB adapter behind the bridge.
+See [`auth-secrets-policy.md`](auth-secrets-policy.md) for the full
+auth and secrets policy. Summary (one-line pointer to that doc):
+
+> Designer and Run Builder require authenticated operator access; the
+> browser never receives the eLabFTW API key or vm-agent bearer token;
+> the Linux-side Wallac service is the only bearer of those credentials.
 
 Browser validation is advisory only. The backend repeats all executable
 validation. The backend finalizes canonical JSON and computes hashes.

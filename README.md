@@ -218,10 +218,17 @@ vm-agent require Windows, `comtypes`, and a live instrument.
 |---|---|
 | [README](README.md) | Entry point — overview, quick-start, API summary, this index |
 | [Architecture](docs/architecture.md) | System design, vm-agent/bridge components, threading model |
+| [Direct-submit architecture](docs/architecture-direct-submit.md) | Direct-submit decision, role changes vs the legacy polling model |
 | [Bridge & designer API](docs/bridge-api.md) | `:8423` / `:8422` endpoints and auth model |
 | [vm-agent API reference](docs/api-reference.md) | Full `:8420` request/response reference |
+| [Abort & recovery](docs/abort-recovery.md) | Abort state machine, race guarantees, incident/rollback |
+| [eLabFTW object model](docs/elabftw-object-model.md) | Signed object types, canonical JSON, signing model |
+| [Auth & secrets policy](docs/auth-secrets-policy.md) | Service identity, token handling, strict-auth mode |
 | [Security](SECURITY.md) | Threat model, hardening steps, vulnerability reporting |
 | [Deployment notes](docs/deployment-notes.md) | OEM install path gotchas, VM-operations pointer |
+| [Protocol authoring plan](docs/plans/wallac-protocol-authoring.md) | Generated protocol design + spec contract |
+| [Stage-7 hardware e2e plan](docs/stage7-hardware-e2e-test-plan.md) | Manual integration test plan for the instrument |
+| [Agent learnings](AGENT_LEARNINGS.md) | Dev-only gotchas and patterns (not user-facing) |
 
 ## License
 

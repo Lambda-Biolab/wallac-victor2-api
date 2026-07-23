@@ -32,7 +32,7 @@ See [`auth-secrets-policy.md`](auth-secrets-policy.md) for the full policy.
 | `POST /jobs` | submit a job for execution (idempotent: duplicate spec → `409`; `422` when `wells_spec` is non-empty in `existing_protocol` mode — see below) |
 | `GET /jobs` | list all jobs |
 | `GET /jobs/{job_id}` | job status, events, artifacts, live wells |
-| `POST /jobs/{job_id}/abort` | abort a running job |
+| `POST /jobs/{job_id}/abort` | abort a running job — see [`abort-recovery.md`](abort-recovery.md) for state-machine semantics, race-window guarantees, and incident recovery |
 
 ## designer API — `:8422`
 

@@ -245,15 +245,13 @@ The main user-facing workflow is one guided Plate Reader Run Builder wizard. Use
 
 Rich Method/Layout/Analysis/Run Builder UIs live outside eLabFTW in this Wallac service repo. eLabFTW stores links that open designers in a new tab. No iframe/embed is required or assumed.
 
-Authentication and secrets:
+Authentication and secrets: see [`auth-secrets-policy.md`](../auth-secrets-policy.md)
+for the full policy. The bullet list below is condensed to a one-line
+pointer; the authoritative version lives in that doc.
 
-- designer and Run Builder require authenticated operator access;
-- browser never receives the eLabFTW API key;
-- browser never receives the vm-agent bearer token;
-- browser talks to the Linux-side Wallac service only;
-- Wallac service talks to eLabFTW with its service identity;
-- Wallac service talks to vm-agent using configured URL/token;
-- vm-agent remains private hardware/MDB adapter behind the bridge.
+> Designer and Run Builder require authenticated operator access; the
+> browser never receives the eLabFTW API key or vm-agent bearer token;
+> the Linux-side Wallac service is the only bearer of those credentials.
 
 Browser validation is advisory only. The backend repeats all executable validation. The backend finalizes canonical JSON and computes hashes.
 
@@ -468,14 +466,9 @@ fails:
 
 ## State model and events
 
-In the direct-submit model, the bridge manages state internally (not in eLabFTW metadata). The simplified state set is:
-
-- `accepted` — job received and queued;
-- `running` — execution in progress;
-- `completed` — execution succeeded, results written to eLabFTW experiment;
-- `failed` — execution failed before instrument work;
-- `aborted` — execution halted by operator;
-- `unknown_requires_operator_review` — ambiguous state after restart or partial failure.
+In the direct-submit model, the bridge manages state internally (not in eLabFTW metadata). The simplified state set is described in
+[`elabftw-object-model.md`](../elabftw-object-model.md#automation-job-lifecycle-states)
+— that doc is authoritative; this plan only restates the boundary.
 
 The bridge tracks additional metadata internally (validation status, generated protocol status, write-back status) without encoding them as job-level states.
 
