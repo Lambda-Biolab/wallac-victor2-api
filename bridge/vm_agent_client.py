@@ -170,6 +170,23 @@ class VmAgentClient:
             body={"plate_map": plate_map},
         )
 
+    def set_protocol_wells(self, protocol_id: int, wells: list[str]) -> dict[str, Any]:
+        """PATCH /mdb/protocols/{id}/wells — set which wells to measure.
+
+        Accepts the same ``{"wells": [...]}`` / ``{"rows": [...]}`` /
+        ``{"all": true}`` shapes the bridge documents in its ``wells_spec``
+        field. The vm-agent builds the 108-byte PlateMap binary internally,
+        so the bridge does not need to duplicate that construction.
+
+        Returns the response from the vm-agent (currently
+        ``{"protocol_id": ..., "bytes_written": 108}``).
+        """
+        return self._request(
+            "PATCH",
+            f"/mdb/protocols/{protocol_id}/wells",
+            body={"wells": wells},
+        )
+
     # --- Runs ---
 
     def start_run(

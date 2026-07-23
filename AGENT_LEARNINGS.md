@@ -2,6 +2,20 @@
 
 Concise, laser-focused patterns and gotchas discovered during development.
 
+## Plate-map override on existing_protocol — clone-then-PATCH
+
+For `existing_protocol` jobs with a non-empty `wells_spec`, the bridge
+clones the resolved factory protocol into a per-run id (`ELAB-Run-<id>`),
+applies the plate-map override on the clone via the vm-agent's
+`PATCH /mdb/protocols/{id}/wells` endpoint, runs on the clone, and deletes
+the clone in `finally`. The factory preset is never written to. Clone +
+PATCH + cleanup are wired in `BridgeExecutor._execute_existing_protocol` /
+`_clone_with_wells`; the well-list normalization is in
+`_extract_wells_from_spec`; the vm-agent call is
+`VmAgentClient.set_protocol_wells`. The OEM software caches protocols in
+memory and does not re-read the PlateMap from MDB — a fresh protocol id
+is the only way to force a fresh read of the new plate map.
+
 ## Phase 6 coverage gate — volatile adapters excluded from unit metric
 
 `pyproject.toml` omits `bridge/elabftw.py` and `bridge/vm_agent_client.py`

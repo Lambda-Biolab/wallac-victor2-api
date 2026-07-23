@@ -603,13 +603,12 @@ class TestBridgeApp:
 class TestWellsSpecContract:
     """Behavioral contract for the ``wells_spec`` field on POST /jobs.
 
-    The ``existing_protocol`` execution path does not honor ``wells_spec``
-    (the executor runs the protocol's factory plate map — see
-    ``BridgeExecutor._execute_existing_protocol``). Until plate-map override
-    is implemented, the HTTP boundary rejects a non-empty ``wells_spec`` in
-    that mode with 422 so clients see an explicit failure instead of a
-    silently-ignored override. Empty/omitted values and ``generated_protocol``
-    behavior are preserved.
+    The ``existing_protocol`` executor clones the resolved protocol into a
+    per-run id, applies the override on the clone, runs on the clone, and
+    deletes the clone when the run ends — so a non-empty ``wells_spec`` is
+    now accepted (previously it was rejected with 422). ``generated_protocol``
+    behavior is preserved (the field is accepted at the boundary, the
+    executor derives its plate map from the signed Layout spec).
     """
 
     _EXISTING: ClassVar[dict[str, Any]] = {
@@ -626,21 +625,21 @@ class TestWellsSpecContract:
             {"wells": ["A1", "A2"]},
         ],
     )
-    def test_existing_protocol_rejects_nonempty_wells_spec(
+    def test_existing_protocol_accepts_nonempty_wells_spec(
         self, client: TestClient, spec: dict[str, Any]
     ) -> None:
-        """Non-empty wells_spec in existing_protocol mode fails closed (422)."""
+        """A non-empty wells_spec in existing_protocol mode is accepted
+        (the executor clones the protocol and applies the override on the
+        clone — the factory preset is never written to)."""
         r = client.post("/jobs", json={**self._EXISTING, "wells_spec": spec})
-        assert r.status_code == 422
+        assert r.status_code == 201
         body = r.json()
-        # FastAPI surfaces model_validator failures in the standard error array.
-        assert "detail" in body
-        messages = " ".join(entry.get("msg", "") for entry in body["detail"])
-        assert "wells_spec" in messages
-        assert "existing_protocol" in messages
+        # The spec round-trips through the job model.
+        assert body["wells_spec"] == spec
 
     def test_existing_protocol_accepts_empty_wells_spec(self, client: TestClient) -> None:
-        """Empty wells_spec preserves the pre-existing default behavior."""
+        """Empty wells_spec preserves the pre-existing default behavior (run
+        the protocol's factory 96-well plate map)."""
         r = client.post("/jobs", json={**self._EXISTING, "wells_spec": {}})
         assert r.status_code == 201
         assert r.json()["wells_spec"] == {}
@@ -650,6 +649,28 @@ class TestWellsSpecContract:
         r = client.post("/jobs", json=self._EXISTING)
         assert r.status_code == 201
         assert r.json()["wells_spec"] == {}
+
+    def test_existing_protocol_wells_spec_invalid_wells_rejected_at_vm_agent(
+        self, client: TestClient
+    ) -> None:
+        """An invalid well name (e.g. 'Z9') is accepted at the bridge
+        boundary (the bridge does not parse well addresses — it just
+        passes them to the vm-agent) but fails at the vm-agent, which
+        fails the job. The 422 gate was removed because the boundary can
+        no longer reject without parsing the wells; the executor's
+        cleanup in ``finally`` still runs so no stub protocol leaks."""
+        r = client.post(
+            "/jobs",
+            json={
+                **self._EXISTING,
+                "wells_spec": {"wells": ["Z9"]},
+            },
+        )
+        assert r.status_code == 201
+        body = r.json()
+        # The job is accepted; the executor's _clone_with_wells will
+        # surface the vm-agent's 400 to the job's events/error.
+        assert body["wells_spec"] == {"wells": ["Z9"]}
 
     def test_generated_protocol_preserves_nonempty_wells_spec(self, client: TestClient) -> None:
         """generated_protocol behavior is unchanged: a non-empty wells_spec

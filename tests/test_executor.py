@@ -78,6 +78,8 @@ class MockVmAgentClient:
         self.abort_permanent_error: VmAgentError | None = None
         self.abort_calls: list[str] = []
         self.deleted_protocols: list[int] = []
+        self.cloned_protocols: list[tuple[int, int, str]] = []
+        self.plate_map_writes: list[tuple[int, list[str]]] = []
         self.abort_responses: list[dict[str, Any]] | None = None
         self.abort_default_response: dict[str, Any] = {
             "ok": True,
@@ -162,10 +164,20 @@ class MockVmAgentClient:
     def clone_protocol(self, template_id: int, new_id: int, name: str) -> None:
         if self.fail_clone:
             raise RuntimeError("clone failed")
+        self.cloned_protocols.append((template_id, new_id, name))
 
     def update_plate_map(self, protocol_id: int, wells: list[str]) -> None:
         if self.fail_plate_map:
             raise RuntimeError("plate map failed")
+        self.plate_map_writes.append((protocol_id, list(wells)))
+
+    def set_protocol_wells(self, protocol_id: int, wells: list[str]) -> None:
+        # Reason: same backing-store hook as update_plate_map; the new
+        # PATCH /wells endpoint is what BridgeExecutor._clone_with_wells
+        # uses for existing-protocol plate-map override.
+        if self.fail_plate_map:
+            raise RuntimeError("plate map failed")
+        self.plate_map_writes.append((protocol_id, list(wells)))
 
     def delete_protocol(self, protocol_id: int) -> None:
         self.deleted_protocols.append(protocol_id)
@@ -2533,3 +2545,183 @@ class TestExistingProtocolIdAssayLookup:
             )
             == 5
         )
+
+
+class TestExistingProtocolPlateMapOverride:
+    """Regression tests for the plate-map-override path on existing_protocol.
+
+    With a non-empty ``wells_spec`` the executor must clone the resolved
+    factory protocol, apply the override on the clone via
+    ``PATCH /mdb/protocols/{id}/wells``, run on the clone, and delete the
+    clone in ``finally`` so the factory preset is never written to. This is
+    the wiring that removed the 422 gate on ``POST /jobs`` (the previous
+    fail-closed behavior).
+    """
+
+    def _make_job(
+        self,
+        protocol_id: int,
+        wells_spec: dict[str, Any],
+    ) -> Job:
+        return Job(
+            job_id="test-existing-override",
+            title="Existing override",
+            execution_mode="existing_protocol",
+            protocol_id=protocol_id,
+            protocol_name="",
+            wells_spec=wells_spec,
+            created_at="2026-01-01T00:00:00",
+        )
+
+    def test_5_well_override_clones_patches_runs_and_cleans_up(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """A 5-well override on existing_protocol clones, PATCHes, runs,
+        and cleans up — and the factory preset is never written to."""
+        vm_agent.jobs = [
+            {
+                "assay_id": 200,
+                "protocol_name": "Absorbance @ 610 (0.1s)",
+                "protocol_id": 2000009,
+            }
+        ]
+        job = self._make_job(
+            protocol_id=2000009,
+            wells_spec={"wells": ["A1", "B2", "C3", "D4", "E5"]},
+        )
+        # Force the run to go through 5 wells in the persisted MDB.
+        vm_agent.job_wells = [
+            {"well": "A01", "od": 0.123, "counts": 1000},
+            {"well": "B02", "od": 0.456, "counts": 1000},
+            {"well": "C03", "od": 0.789, "counts": 1000},
+            {"well": "D04", "od": 0.012, "counts": 1000},
+            {"well": "E05", "od": 0.345, "counts": 1000},
+        ]
+        # Disable the live-wells path so the persisted read is the one that
+        # populates the result; the mock's get_run_results returns empty
+        # unless live_batches is set.
+        vm_agent.live_batches = []
+
+        executor_wet(job)
+
+        # Outcome: completed, results written, plate map override honored.
+        assert job.status == "completed", job.events
+        # Reason: at least 5 raw well rows must be uploaded so the eLabFTW
+        # writeback produces a non-empty experiment.
+        assert any(name.endswith("_raw_results.json") for name in elabftw.uploaded_files), (
+            elabftw.uploaded_files
+        )
+        # Exactly one clone was created, and it was a clone of the factory
+        # preset (template_id 2000009), with a name like ELAB-Run-<id>.
+        assert len(vm_agent.cloned_protocols) == 1
+        template_id, new_id, name = vm_agent.cloned_protocols[0]
+        assert template_id == 2000009
+        assert new_id >= 2001000
+        assert name.startswith("ELAB-Run-")
+        # The plate-map override was applied to the clone, not the
+        # factory preset.
+        assert len(vm_agent.plate_map_writes) == 1
+        write_id, wells = vm_agent.plate_map_writes[0]
+        assert write_id == new_id
+        assert sorted(wells) == ["A1", "B2", "C3", "D4", "E5"]
+        # The cleanup ran — the clone is deleted in finally.
+        assert vm_agent.deleted_protocols == [new_id]
+        # The run used the clone id, not the factory preset.
+        # Reason: job.protocol_id is updated to the clone id before
+        # start_run, so the result lookup keys on the clone id. We
+        # verify this via the events log: starting_run was called with
+        # the clone id, not 2000009.
+        starting_run = next(e for e in job.events if e["event"] == "starting_run")
+        assert starting_run["detail"] == str(new_id)
+        # Protocol_resolved event references the factory preset (we keep
+        # the original protocol_name in the job for audit).
+        protocol_resolved = next(e for e in job.events if e["event"] == "protocol_resolved")
+        assert "id=2000009" in protocol_resolved["detail"]
+
+    def test_empty_wells_spec_uses_factory_plate_map_and_no_clone(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """Empty wells_spec preserves the pre-existing behavior: the
+        factory preset is run as-is, no clone, no PATCH, no cleanup."""
+        job = self._make_job(protocol_id=2000009, wells_spec={})
+
+        executor_wet(job)
+
+        assert job.status == "completed", job.events
+        assert vm_agent.cloned_protocols == []
+        assert vm_agent.plate_map_writes == []
+        assert vm_agent.deleted_protocols == []
+        # start_run was called with the factory preset id.
+        starting_run = next(e for e in job.events if e["event"] == "starting_run")
+        assert starting_run["detail"] == "2000009"
+
+    def test_clone_failure_fails_job_without_leaking_stub(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """A clone failure marks the job failed and does not start a run."""
+        vm_agent.fail_clone = True
+        job = self._make_job(
+            protocol_id=2000009,
+            wells_spec={"wells": ["A1", "B2"]},
+        )
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert any(e["event"] == "protocol_clone_failed" for e in job.events), job.events
+        # No run was started on the factory preset — the clone failure
+        # is honored before any hardware work.
+        assert vm_agent._runs == {}, vm_agent._runs
+        # No PATCH was issued (clone failed before PATCH could run).
+        assert vm_agent.plate_map_writes == []
+        # No cleanup needed (no clone was created).
+        assert vm_agent.deleted_protocols == []
+
+    def test_plate_map_failure_cleans_partial_clone(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """A PATCH failure on the clone cleans up the partial clone and
+        fails the job before any run starts."""
+        vm_agent.fail_plate_map = True
+        job = self._make_job(
+            protocol_id=2000009,
+            wells_spec={"wells": ["A1", "B2"]},
+        )
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        # A clone was created, then the PATCH failed, then the cleanup
+        # deleted the clone. No run was started.
+        assert len(vm_agent.cloned_protocols) == 1
+        assert vm_agent.plate_map_writes == []
+        assert len(vm_agent.deleted_protocols) == 1
+        assert vm_agent.deleted_protocols[0] == vm_agent.cloned_protocols[0][1]
+        assert any(e["event"] == "plate_map_apply_failed" for e in job.events), job.events
+        assert vm_agent._runs == {}
+
+    def test_extract_wells_from_spec_normalizes_to_upper(self, executor: BridgeExecutor) -> None:
+        """_extract_wells_from_spec uppercases well names so the
+        vm-agent's regex (which expects uppercase) accepts them."""
+        assert executor._extract_wells_from_spec({"wells": ["a1", "b2"]}) == [
+            "A1",
+            "B2",
+        ]
+        # Empty/absent spec returns None (caller uses factory plate map).
+        assert executor._extract_wells_from_spec({}) is None
+        assert executor._extract_wells_from_spec({"wells": []}) is None
+        # An all-keys spec with no recognized selector returns None too
+        # so we don't accidentally run an empty plate map.
+        assert executor._extract_wells_from_spec({"foo": "bar"}) is None

@@ -418,7 +418,20 @@ class BridgeExecutor:
     # --- existing_protocol mode ---
 
     def _execute_existing_protocol(self, job: Job) -> None:
-        """Run a factory preset protocol by name or ID."""
+        """Run a factory preset protocol by name or ID.
+
+        With no ``wells_spec`` override the instrument runs the resolved
+        protocol against its factory 96-well plate map. When the caller
+        supplies a non-empty ``wells_spec`` (any of ``{"wells": [...]}``,
+        ``{"rows": [...]}``, ``{"all": true}``), the executor clones the
+        protocol into a per-run ID, applies the override via
+        ``PATCH /mdb/protocols/{id}/wells`` on the clone, runs against the
+        clone, and deletes the clone in ``finally`` so the factory preset
+        is never touched. Cloning is required because the OEM stack caches
+        protocols in memory and does not re-read the PlateMap from the MDB —
+        the only way to force a fresh read of the new plate map is to give
+        the run a new protocol id.
+        """
         if not job.protocol_name and not job.protocol_id:
             self._fail_job(
                 job,
@@ -430,25 +443,164 @@ class BridgeExecutor:
             return
 
         if self.dry_run:
+            # Reason: dry-run is a no-op for plate-map override too. The
+            # factory plate map is the run the bridge *would* have executed;
+            # we surface the requested wells in the event so operators can
+            # audit what would happen.
+            wells_summary = self._wells_spec_summary(job)
             job.status = "completed"
-            job.add_event("dry_run_complete", f"Would run protocol {job.protocol_name}")
+            job.add_event(
+                "dry_run_complete",
+                f"Would run protocol {job.protocol_name}{wells_summary}",
+            )
             return
 
+        # Plate-map override path: clone the factory preset, PATCH the plate
+        # map on the clone, run on the clone, and clean up the clone in
+        # ``finally``. The factory preset is never written to.
+        cloned_proto_id = 0
+        run_protocol = protocol.get("id", job.protocol_name)
+        wells_to_measure = self._extract_wells_from_spec(job.wells_spec)
+        if wells_to_measure is not None:
+            try:
+                run_protocol, cloned_proto_id = self._clone_with_wells(
+                    job, protocol, wells_to_measure
+                )
+            except Exception as error:
+                self._fail_job(
+                    job,
+                    f"Protocol clone or plate-map apply failed: {error}",
+                )
+                return
+            job.protocol_name = protocol.get("name", job.protocol_name)
+            job.protocol_id = run_protocol
+            # Reason: MDB assay_id resolution filters by protocol_id, so
+            # the clone id is authoritative for the post-run result lookup.
+            # If the snapshot fails we must clean up the clone before
+            # returning; otherwise the instrument is left with a stub
+            # protocol that floats in the MDB until manual cleanup.
+            if not self._snapshot_max_assay_id(job):
+                self._fail_job(job, "Could not safely snapshot assays before starting run")
+                self._cleanup_cloned_protocol(cloned_proto_id)
+                return
+            try:
+                self._run_to_completion(job, run_protocol, cloned_proto_id)
+            finally:
+                self._cleanup_cloned_protocol(cloned_proto_id)
+            return
+
+        # No override: use the factory plate map as-is.
         if not self._snapshot_max_assay_id(job):
             self._fail_job(job, "Could not safely snapshot assays before starting run")
             return
-        run_id = self._start_job_run(job, protocol.get("id", job.protocol_name))
+        self._run_to_completion(job, run_protocol, cloned_proto_id)
+
+    def _run_to_completion(self, job: Job, run_protocol: int | str, cloned_proto_id: int) -> None:
+        """Start the run, poll, and write back. No clone cleanup here —
+        callers using the plate-map-override path own the cleanup via the
+        ``finally`` block in :meth:`_execute_existing_protocol`."""
+        run_id = self._start_job_run(job, run_protocol)
         if not run_id:
             return
-
-        # Poll for completion
         self._poll_run(job, run_id)
         if job.status in ("failed", "aborted"):
             return
-
-        # Fetch results (assay_id is resolved in _fetch_and_writeback
-        # using the pre-run MDB snapshot).
         self._fetch_and_writeback(job, run_id)
+
+    def _extract_wells_from_spec(self, wells_spec: dict[str, Any]) -> list[str] | None:
+        """Normalize ``wells_spec`` to a list of well names, or None if empty.
+
+        Returns ``None`` when the spec is empty or absent (caller should
+        run the factory plate map). Returns a (possibly empty) list of
+        explicit well names when the spec is populated. The vm-agent's
+        ``/wells`` endpoint handles both ``{"wells": [...]}`` and
+        ``{"rows": [...]}`` shapes natively; this method just normalizes
+        what the bridge has stored on the job to that input format.
+        """
+        if not wells_spec:
+            return None
+        # Reason: an empty list inside the spec is a valid no-op (run the
+        # factory plate map). Treat it the same as an absent spec so the
+        # caller does not have to know that {"wells": []} is equivalent
+        # to omitting the field.
+        wells = wells_spec.get("wells") or []
+        if not wells and not wells_spec.get("rows") and not wells_spec.get("all"):
+            return None
+        return [str(w).upper() for w in wells]
+
+    def _clone_with_wells(
+        self,
+        job: Job,
+        protocol: dict[str, Any],
+        wells: list[str],
+    ) -> tuple[int, int]:
+        """Clone a factory preset and apply the plate-map override on the clone.
+
+        Returns ``(run_protocol_id, cloned_proto_id)``. Raises on any
+        clone or PATCH failure so the caller can fail the job without
+        leaking a stub protocol on the instrument. The factory preset
+        is never written to.
+
+        The cloned protocol is named ``ELAB-Run-<new_id>`` so operators
+        can audit any stub that survives a crash (e.g. crash between
+        the clone and the ``finally`` cleanup) by name.
+        """
+        template_id = int(protocol.get("id", 0))
+        if not template_id:
+            raise ValueError(f"Protocol {protocol.get('name', '?')!r} has no id to clone from")
+        # Reason: pick a fresh id in the ELAB-Run- namespace (the same
+        # window used by the existing generated-protocol clone helper).
+        # Modulo 100000 plus 2001000 means a run every second for ~27
+        # hours before id collision risk; the MDB write lock serializes
+        # simultaneous creates.
+        new_id = int(time.time()) % 100000 + 2001000
+        try:
+            self.vm_agent.clone_protocol(template_id, new_id, f"ELAB-Run-{new_id}")
+        except Exception as error:
+            job.add_event("protocol_clone_failed", str(error))
+            logger.warning(
+                "Protocol clone failed for %s (template=%s): %s",
+                job.protocol_name,
+                template_id,
+                error,
+            )
+            raise
+        # Reason: clone succeeded → partial protocol exists on the
+        # instrument. If the PATCH then fails we must clean up the
+        # partial clone before re-raising, otherwise the instrument is
+        # left with a stub protocol that floats in the MDB until manual
+        # cleanup and may shadow the factory protocol on the next
+        # assay lookup.
+        try:
+            self.vm_agent.set_protocol_wells(new_id, wells)
+        except Exception as error:
+            job.add_event("plate_map_apply_failed", str(error))
+            logger.warning(
+                "Plate map apply failed for clone %s of %s: %s",
+                new_id,
+                job.protocol_name,
+                error,
+            )
+            self._cleanup_cloned_protocol(new_id)
+            raise
+        job.add_event("protocol_cloned", f"id={new_id} wells={len(wells)}")
+        return new_id, new_id
+
+    @staticmethod
+    def _wells_spec_summary(job: Job) -> str:
+        """Compact human-readable summary of the requested wells for events."""
+        spec = job.wells_spec or {}
+        if not spec:
+            return ""
+        if spec.get("all"):
+            return " (all 96 wells)"
+        if spec.get("rows"):
+            rows = ",".join(str(r) for r in spec["rows"])
+            return f" (rows {rows})"
+        wells = spec.get("wells") or []
+        if wells:
+            return f" (wells: {','.join(str(w) for w in wells)})"
+        return ""
 
     def _load_generated_specs(
         self, job: Job
