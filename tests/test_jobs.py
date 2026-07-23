@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from bridge.bridge_app import create_bridge_app
 from bridge.jobs import (
+    ABORTED,
     ACCEPTED,
     COMPLETED,
     FAILED,
@@ -65,6 +66,39 @@ class TestJobManager:
         job = mgr.submit_job({"title": "Test"})
         job.status = COMPLETED
         assert mgr.request_abort(job.job_id) is False
+
+    def test_abort_while_queued_skips_executor_and_marks_aborted(self) -> None:
+        """A job aborted while still accepted/queued must transition directly
+        to aborted without invoking the executor — the documented
+        accepted -> aborted contract (docs/abort-recovery.md). No physical
+        work may be started."""
+        mgr = JobManager()
+        executed: list[str] = []
+
+        def executor(job: Job) -> None:
+            executed.append(job.job_id)
+            job.status = COMPLETED
+            job.add_event("done")
+
+        mgr.set_executor(executor)
+        try:
+            job = mgr.submit_job({"title": "Test"})
+            # Request abort before the worker can pick the job up.
+            assert mgr.request_abort(job.job_id) is True
+
+            mgr.start_worker()
+            for _ in range(50):
+                if job.status in {COMPLETED, FAILED, ABORTED, UNKNOWN}:
+                    break
+                time.sleep(0.1)
+
+            assert job.status == ABORTED
+            # The executor must never have run — no hardware was started.
+            assert executed == []
+            assert job.started_at == ""
+            assert any(e["event"] == "execution_aborted" for e in job.events)
+        finally:
+            mgr.stop_worker()
 
     def test_worker_executes_job(self) -> None:
         mgr = JobManager()
@@ -200,6 +234,126 @@ class TestJobManager:
         assert job.events[0]["event"] == "test_event"
         assert job.events[0]["detail"] == "detail"
         assert job.events[0]["ts"] != ""
+
+
+# --- HIGH: accepted -> aborted race (atomic transition) ---
+
+
+class TestAbortRaceAtomicity:
+    """Regression for the HIGH abort race in ``JobManager._execute_job``.
+
+    The accepted -> aborted contract (no physical work) requires the abort
+    check and the RUNNING transition to be atomic with ``request_abort``.
+
+    The race is deterministic here because the worker thread is gated after
+    the queue pick (so it has NOT yet committed to RUNNING) and the abort is
+    issued from the test thread while the worker is gated — placing the abort
+    precisely in the window the old non-atomic check-then-set left open. The
+    fixed atomic block then observes ``abort_requested`` and goes aborted
+    without invoking the executor. A regression that hoists the check out of
+    the lock and sets RUNNING outside it would let the executor run here.
+    """
+
+    def test_abort_in_transition_window_is_honored_without_executor(self) -> None:
+        mgr = JobManager()
+        executed: list[str] = []
+
+        def executor(job: Job) -> None:
+            executed.append(job.job_id)
+            job.status = COMPLETED
+            job.add_event("done")
+
+        mgr.set_executor(executor)
+        job = mgr.submit_job({"title": "Race"})
+        mgr._current_job = job  # mimic _worker_loop having popped the job
+
+        release = threading.Event()
+        started = threading.Event()
+
+        def gated_worker() -> None:
+            started.set()
+            release.wait(timeout=5.0)
+            mgr._execute_job(job.job_id, job)
+
+        worker = threading.Thread(target=gated_worker, daemon=True)
+        worker.start()
+        started.wait(timeout=5.0)
+
+        # Worker has not entered _execute_job yet (gated) and the job is
+        # still accepted: issue the abort in the race window.
+        assert job.status == ACCEPTED
+        assert mgr.request_abort(job.job_id) is True
+        assert job.abort_requested is True
+
+        release.set()
+        worker.join(timeout=5.0)
+
+        assert job.status == ABORTED, job.events
+        # No physical work may be started for an abort requested while accepted.
+        assert executed == []
+        assert job.started_at == ""
+        assert any(e["event"] == "execution_aborted" for e in job.events)
+        assert mgr.current_job is None
+        assert job.completed_at != ""
+
+    def test_abort_intent_is_visible_before_waiting_for_run_start_lock(self) -> None:
+        mgr = JobManager()
+        executed: list[str] = []
+
+        def executor(job: Job) -> None:
+            executed.append(job.job_id)
+
+        mgr.set_executor(executor)
+        job = mgr.submit_job({"title": "Abort intent ordering"})
+        mgr._current_job = job
+        abort_returned = threading.Event()
+
+        def request_abort() -> None:
+            mgr.request_abort(job.job_id)
+            abort_returned.set()
+
+        with job._run_start_lock:
+            abort_thread = threading.Thread(target=request_abort, daemon=True)
+            abort_thread.start()
+            for _ in range(100):
+                if job.abort_requested:
+                    break
+                time.sleep(0.001)
+            assert job.abort_requested is True
+            assert abort_returned.is_set() is False
+
+            mgr._execute_job(job.job_id, job)
+
+        abort_thread.join(timeout=5.0)
+
+        assert abort_returned.is_set()
+        assert job.status == ABORTED
+        assert job.started_at == ""
+        assert executed == []
+        assert not any(event["event"] == "execution_started" for event in job.events)
+
+
+# --- MEDIUM: no-executor terminal exit cleanup ---
+
+
+class TestNoExecutorCleanup:
+    def test_no_executor_exit_clears_current_job_and_records_completed_at(
+        self,
+    ) -> None:
+        """A pre-executor terminal exit must clean up _current_job and set
+        completed_at like every other terminal path, so consumers never
+        observe a stale current job or a missing completion timestamp."""
+        mgr = JobManager()
+        job = mgr.submit_job({"title": "NoExec"})
+        mgr._current_job = job  # mimic _worker_loop having popped the job
+
+        mgr._execute_job(job.job_id, job)
+
+        assert job.status == FAILED
+        assert "No executor" in (job.error or "")
+        assert job.completed_at != "", "completed_at must be set on terminal exit"
+        assert any(e["event"] == "execution_failed" for e in job.events)
+        assert mgr.current_job is None, "_current_job must be cleared on terminal exit"
 
 
 # --- Bridge HTTP API tests ---
@@ -354,12 +508,109 @@ class TestDuplicateDetection:
         j2 = mgr.submit_job({"title": "B", "elabftw_experiment_id": 8})
         assert j2.job_id != j1.job_id
 
+    def test_different_protocol_ids_are_not_duplicates(self) -> None:
+        mgr = JobManager()
+        first = mgr.submit_job(
+            {
+                "title": "A",
+                "execution_mode": "existing_protocol",
+                "protocol_id": 101,
+                "protocol_name": "Shared name",
+            }
+        )
+        second = mgr.submit_job(
+            {
+                "title": "B",
+                "execution_mode": "existing_protocol",
+                "protocol_id": 102,
+                "protocol_name": "Shared name",
+            }
+        )
+
+        assert second.job_id != first.job_id
+
+    def test_protocol_id_precedence_deduplicates_different_names(self) -> None:
+        mgr = JobManager()
+        first = mgr.submit_job(
+            {
+                "title": "A",
+                "execution_mode": "existing_protocol",
+                "protocol_id": 101,
+                "protocol_name": "Stale client name",
+            }
+        )
+
+        with pytest.raises(DuplicateJobError) as exc:
+            mgr.submit_job(
+                {
+                    "title": "B",
+                    "execution_mode": "existing_protocol",
+                    "protocol_id": 101,
+                    "protocol_name": "Current instrument name",
+                }
+            )
+
+        assert exc.value.existing_job_id == first.job_id
+
     def test_aborted_job_allows_resubmit(self) -> None:
         mgr = JobManager()
         j1 = mgr.submit_job({"title": "A", "elabftw_experiment_id": 9})
         j1.status = FAILED
         j2 = mgr.submit_job({"title": "B", "elabftw_experiment_id": 9})
         assert j2.job_id != j1.job_id
+
+    def test_generated_protocol_ignores_protocol_id_and_name(self) -> None:
+        """generated_protocol dedup keys must ignore protocol_id and
+        protocol_name — only the signed refs matter."""
+        mgr = JobManager()
+        spec_a = {
+            "title": "A",
+            "execution_mode": "generated_protocol",
+            "protocol_id": 999,
+            "protocol_name": "Generated Alpha",
+            "method_ref": {"object_id": 1},
+            "layout_ref": {"object_id": 2},
+        }
+        spec_b = {
+            "title": "B",
+            "execution_mode": "generated_protocol",
+            "protocol_id": 777,
+            "protocol_name": "Generated Beta",
+            "method_ref": {"object_id": 1},
+            "layout_ref": {"object_id": 2},
+        }
+
+        mgr.submit_job(spec_a)
+        with pytest.raises(DuplicateJobError):
+            mgr.submit_job(spec_b)
+
+    def test_existing_protocol_deduplicates_by_name_when_no_id(self) -> None:
+        """existing_protocol without protocol_id falls back to name-based
+        dedup — same name, same refs => duplicate."""
+        mgr = JobManager()
+        spec = {
+            "title": "Run",
+            "execution_mode": "existing_protocol",
+            "protocol_name": "Absorbance @ 600 nm",
+            "method_ref": {"object_id": 10},
+            "layout_ref": {"object_id": 20},
+        }
+        mgr.submit_job(dict(spec, title="First"))
+        with pytest.raises(DuplicateJobError):
+            mgr.submit_job(dict(spec, title="Second"))
+
+    def test_existing_protocol_different_names_no_id_are_not_duplicates(self) -> None:
+        """existing_protocol without protocol_id: different names => different
+        dedup keys, both accepted."""
+        mgr = JobManager()
+        common = {
+            "execution_mode": "existing_protocol",
+            "method_ref": {"object_id": 10},
+            "layout_ref": {"object_id": 20},
+        }
+        first = mgr.submit_job(dict(common, title="A", protocol_name="Protocol One"))
+        second = mgr.submit_job(dict(common, title="B", protocol_name="Protocol Two"))
+        assert second.job_id != first.job_id
 
 
 # --- Auth tests ---

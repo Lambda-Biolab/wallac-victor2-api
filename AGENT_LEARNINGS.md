@@ -2,6 +2,16 @@
 
 Concise, laser-focused patterns and gotchas discovered during development.
 
+## Phase 6 coverage gate — volatile adapters excluded from unit metric
+
+`pyproject.toml` omits `bridge/elabftw.py` and `bridge/vm_agent_client.py`
+from the coverage gate (`[tool.coverage.run] omit`). These are thin HTTP
+wrappers that change frequently with external API changes; their behaviour
+is validated by hardware/integration tests and end-to-end smoke tests, not
+by Linux CI unit tests. When new adapter-like modules are added, they should
+be omitted from the unit gate for the same reason, with a comment in
+`pyproject.toml` explaining the testing strategy that covers them.
+
 ## eLabFTW API v2 — gotchas discovered during live e2e testing
 
 ### 1. Item creation: use `type`, not `category`

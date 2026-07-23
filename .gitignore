@@ -21,3 +21,5 @@ agent_token.txt
 *.token
 .playwright-mcp/
 .complexipy_cache/
+.coverage
+coverage.json

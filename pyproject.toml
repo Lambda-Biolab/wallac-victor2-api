@@ -20,10 +20,12 @@ dependencies = [
 [dependency-groups]
 dev = [
     "complexipy>=5.5,<6",
+    "hypothesis>=6,<7",
     "httpx>=0.28,<1",
     "pre-commit>=4,<5",
     "pyright>=1.1.411,<2",
     "pytest>=9.1,<10",
+    "pytest-cov>=7,<8",
     "pytest-timeout>=2.4,<3",
     "ruff==0.15.15",
 ]
@@ -61,6 +63,18 @@ quote-style = "double"
 
 [tool.complexipy]
 max_complexity_allowed = 15
+
+[tool.coverage.run]
+branch = true
+source = ["bridge"]
+# Network adapters are exercised by hardware/integration tests. The unit gate
+# measures the pure orchestration and domain logic that runs in Linux CI.
+omit = ["bridge/elabftw.py", "bridge/vm_agent_client.py"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_covered = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

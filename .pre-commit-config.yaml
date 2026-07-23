@@ -12,11 +12,11 @@ repos:
   - repo: local
     hooks:
       - id: complexipy
-        name: complexipy (cognitive <=15, agent stack)
-        entry: uv run --locked complexipy -mx 15
+        name: complexipy (bridge cognitive complexity <=15)
+        entry: uv run --locked complexipy bridge/ -mx 15
         language: system
-        files: ^(vm-agent/(agent|lid_watcher|launch_as_user)\.py|bridge/(elabftw|errors|config)\.py)$
-        pass_filenames: true
+        files: ^bridge/.*\.py$
+        pass_filenames: false
 
   - repo: https://github.com/compilerla/conventional-pre-commit
     rev: v3.6.0

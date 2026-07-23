@@ -1,7 +1,7 @@
 """Job manager for the direct-submit bridge.
 
-Replaces the old polling/claiming model (intake.py, lifecycle.py, models.py).
-Jobs arrive via HTTP POST, are queued in-memory, and executed one at a time
+Replaces the legacy polling/claiming model. Jobs arrive via HTTP POST, are
+queued in-memory, and executed one at a time
 (oldest first). State is tracked in-memory and exposed via HTTP endpoints.
 
 States (simplified from the old 16-state lifecycle):
@@ -61,16 +61,26 @@ def dedup_key(spec: dict[str, Any]) -> str:
 
     Priority:
       1. elabftw_experiment_id (>0) — one experiment = one instrument run.
-      2. Hash of execution_mode + protocol_name + method_ref + layout_ref
-         + analysis_ref — catches re-submits of the same finalized design.
+      2. Hash of execution_mode + signed refs, plus effective protocol identity
+         for ``existing_protocol`` jobs — catches re-submits of the same
+         finalized design. ``protocol_id`` supersedes ``protocol_name``.
     """
     exp_id = spec.get("elabftw_experiment_id", 0) or 0
     if exp_id:
         return f"exp:{exp_id}"
+    execution_mode = spec.get("execution_mode", "existing_protocol")
+    protocol_id = (spec.get("protocol_id", 0) or 0) if execution_mode == "existing_protocol" else 0
     payload = json.dumps(
         {
-            "execution_mode": spec.get("execution_mode", "existing_protocol"),
-            "protocol_name": spec.get("protocol_name", ""),
+            "execution_mode": execution_mode,
+            # Reason: execution resolves protocol_id first, so duplicate
+            # detection must use the same identity precedence.
+            "protocol_id": protocol_id,
+            "protocol_name": (
+                spec.get("protocol_name", "")
+                if execution_mode == "existing_protocol" and not protocol_id
+                else ""
+            ),
             "method_ref": spec.get("method_ref", {}),
             "layout_ref": spec.get("layout_ref", {}),
             "analysis_ref": spec.get("analysis_ref", {}),
@@ -124,6 +134,9 @@ class Job:
 
     # Abort
     abort_requested: bool = False
+    # Serializes abort requests with the physical start_run call. This lock is
+    # intentionally excluded from the public job representation.
+    _run_start_lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def add_event(self, event: str, detail: str = "") -> None:
         self.events.append({"ts": now_iso(), "event": event, "detail": detail})
@@ -239,13 +252,17 @@ class JobManager:
         """Request abort for a job. Returns True if the job exists and is abortable."""
         with self._lock:
             job = self._jobs.get(job_id)
-            if job is None:
+            if job is None or job.status in TERMINAL_STATES:
                 return False
-            if job.status in TERMINAL_STATES:
-                return False
+            # Record intent before releasing the manager lock so the atomic
+            # accepted -> running transition cannot publish a spurious start.
             job.abort_requested = True
             job.add_event("abort_requested")
-            return True
+        # Then synchronize with BridgeExecutor._start_job_run. Do not hold the
+        # manager lock while start_run performs network I/O.
+        with job._run_start_lock:
+            pass
+        return True
 
     def start_worker(self) -> None:
         """Start the background worker thread that executes jobs."""
@@ -281,30 +298,57 @@ class JobManager:
             if job is None:
                 continue
 
-            if self._executor is None:
-                job.status = FAILED
-                job.error = "No executor configured"
-                job.add_event("execution_failed", "No executor configured")
-                continue
+            self._execute_job(job_id, job)
 
+    def _execute_job(self, job_id: str, job: Job) -> None:
+        """Execute a single job on the worker thread."""
+        if self._executor is None:
+            # Reason: this is a terminal pre-executor exit, so it must clean
+            # up _current_job (already set by _worker_loop) and record
+            # completed_at like every other terminal path — otherwise
+            # consumers observe a stale current job and a missing
+            # completion timestamp.
+            job.status = FAILED
+            job.completed_at = now_iso()
+            job.error = "No executor configured"
+            job.add_event("execution_failed", "No executor configured")
+            with self._lock:
+                self._current_job = None
+            return
+
+        # Atomic accepted -> {aborted | running} transition.
+        # Reason: request_abort() sets abort_requested under self._lock and
+        # the accepted -> aborted contract (no physical work) holds only when
+        # the abort is observed while the job is still accepted. Performing
+        # the abort check and the RUNNING transition under the same lock
+        # closes the race where an abort requested while accepted could slip
+        # between the check and RUNNING, starting physical work the contract
+        # forbids. See docs/abort-recovery.md.
+        with self._lock:
+            if job.abort_requested:
+                job.status = ABORTED
+                job.completed_at = now_iso()
+                job.add_event("execution_aborted", "aborted before run start")
+                self._current_job = None
+                return
             job.status = RUNNING
             job.started_at = now_iso()
             job.add_event("execution_started")
 
-            try:
-                self._executor(job)
-                if job.status not in TERMINAL_STATES:
-                    job.status = COMPLETED
-                    job.add_event("execution_completed")
-            except Exception as e:
-                job.status = UNKNOWN
-                job.error = f"Unexpected error: {e}"
-                job.add_event("unexpected_error", str(e))
-                logger.exception("Job %s failed unexpectedly", job_id)
+        try:
+            self._executor(job)
+            if job.status not in TERMINAL_STATES:
+                job.status = COMPLETED
+                job.add_event("execution_completed")
+        except Exception as e:
+            job.status = UNKNOWN
+            job.error = f"Unexpected error: {e}"
+            job.add_event("unexpected_error", str(e))
+            logger.exception("Job %s failed unexpectedly", job_id)
 
-            job.completed_at = now_iso()
-            with self._lock:
-                self._current_job = None
+        job.completed_at = now_iso()
+        with self._lock:
+            self._current_job = None
 
     @property
     def current_job(self) -> Job | None:

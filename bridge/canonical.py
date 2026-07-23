@@ -5,8 +5,8 @@ produces stable, byte-for-byte reproducible JSON from any dict so that:
 
   - the same logical content always produces the same bytes;
   - SHA-256 hashes computed over those bytes are reproducible and comparable;
-  - the bridge can download a signed attachment, hash the exact bytes, compare
-    to the signed metadata hash, and fail closed on any mismatch before parsing.
+  - the bridge can download a referenced attachment, hash the exact bytes,
+    compare to the caller-supplied hash, and fail closed before parsing.
 
 Canonicalization rules (from docs/plans/wallac-protocol-authoring.md
 "Deterministic serialization"):
@@ -90,12 +90,12 @@ def verify_hash(data: bytes, expected_hash: str) -> None:
 
     Args:
         data: The raw bytes downloaded from an eLabFTW attachment.
-        expected_hash: The signed SHA-256 hex string from eLabFTW metadata.
+        expected_hash: The caller-supplied SHA-256 hex string.
 
     Raises:
         BridgeError: with code ``CANONICAL_HASH_MISMATCH`` if the hashes do
-            not match.  This is a fail-closed check — the bridge must not
-            parse or execute JSON whose hash does not match the signed value.
+            not match. This is a fail-closed check: the bridge must not parse
+            or execute JSON whose hash does not match the submitted reference.
     """
     actual_hash = compute_hash(data)
     if not hmac.compare_digest(actual_hash, expected_hash.lower()):
@@ -103,12 +103,11 @@ def verify_hash(data: bytes, expected_hash: str) -> None:
             code=CANONICAL_HASH_MISMATCH,
             human_message=(
                 "Canonical hash mismatch: the downloaded attachment bytes do "
-                "not match the signed SHA-256 hash."
+                "not match the submitted SHA-256 hash."
             ),
             operator_hint=(
-                "The attachment may have been replaced or corrupted after "
-                "signing.  Re-sign the object or restore the original "
-                "attachment."
+                "The attachment may be corrupted or the submitted reference "
+                "may be stale. Verify the object ID, attachment ID, and hash."
             ),
             retryable=False,
             details={

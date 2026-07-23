@@ -191,16 +191,23 @@ Quality gates apply to both maintained stacks — the vm-agent
 
 ```bash
 make setup       # create/update the locked project environment
-make validate    # ruff lint + typecheck + format-check + pytest
+make validate    # ruff + pyright + format-check + pytest (bridge cov >=80%) + complexipy (max 15/func)
 make format      # auto-fix lint + format
-make test        # unit tests only
+make test        # fast suite — unit tests only
+make coverage    # pytest with the bridge coverage gate (>=80%)
+make complexity  # cognitive complexity check (max 15 per function)
 make setup_dev   # create environment + install pre-commit hooks
 ```
 
-The unit tests cover the pure data-shaping helpers in both stacks: vm-agent
-background parsing, OD computation, plate-grid CSV; bridge analysis, canonical
-schemas, designer CRUD, executor, job manager, and config. They run on any OS;
-the COM/HTTP paths require Windows, `comtypes`, and a live instrument.
+The unit tests cover pure data-shaping helpers in both stacks: vm-agent
+parsing, OD computation, plate-grid CSV; bridge analysis, canonical schemas,
+designer CRUD, executor, job manager, and config. Hypothesis drives
+property-based tests for canonicalization, well-name normalization,
+dedup-key stability, and WellSpec round-trip invariants. The bridge coverage
+metric intentionally **excludes** `bridge/elabftw.py` and
+`bridge/vm_agent_client.py` — those volatile HTTP adapters are exercised by
+hardware/integration testing, not Linux unit tests. The COM/HTTP paths in the
+vm-agent require Windows, `comtypes`, and a live instrument.
 
 ## Documentation
 
