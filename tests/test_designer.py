@@ -535,13 +535,13 @@ class TestDesignerElabftwEventsSSRF:
         captured: dict[str, str] = {}
 
         class FakeResponse:
-            def __enter__(self_inner):
-                return self_inner
+            def __enter__(self):
+                return self
 
-            def __exit__(self_inner, *a):
+            def __exit__(self, *a):
                 return False
 
-            def read(self_inner):
+            def read(self):
                 return b"[]"
 
         def fake_urlopen(req, context=None):  # noqa: ARG001
