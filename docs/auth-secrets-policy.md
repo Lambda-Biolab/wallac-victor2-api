@@ -41,11 +41,16 @@ committed to the repository, stored in config files, or written to logs.
 | `WALLAC_ELABFTW_API_KEY` | eLabFTW service API key (write-back only) | **yes** |
 | `WALLAC_ELABFTW_URL` | eLabFTW base URL | no (default: `https://localhost:3148`) |
 | `WALLAC_ELABFTW_CATEGORY` | Automation Job category ID | no (default: 9) |
+| `WALLAC_ELABFTW_VERIFY_TLS` | Verify eLabFTW TLS certificate (0/false disables) | no (default: `1`/true) |
 | `WALLAC_VM_AGENT_URL` | vm-agent REST API URL | no (default: `http://192.168.122.203:8420`) |
 | `WALLAC_VM_AGENT_TOKEN` | vm-agent bearer token | no (if unset, no auth) |
+| `WALLAC_BRIDGE_TOKEN` | Bridge HTTP API bearer token | no (if unset, bridge is open on LAN) |
+| `WALLAC_DESIGNER_TOKEN` | Designer HTTP API bearer token | no (if unset, designer is open on LAN) |
 | `WALLAC_DASHBOARD_TOKEN` | Dashboard session token | no (if unset, dashboard is open on LAN) |
 | `WALLAC_DASHBOARD_HOST` | Dashboard bind address | no (default: `0.0.0.0`) |
 | `WALLAC_DASHBOARD_PORT` | Dashboard port | no (default: 8421) |
+| `WALLAC_CORS_ORIGINS` | Comma-separated CORS allowlist for bridge API | no (default: none) |
+| `WALLAC_REQUIRE_AUTH` | If set to 1/true, services refuse to start with empty tokens | no (default: `0`) |
 | `WALLAC_DEVICE_IDENTITY` | Device identity string | no (default: `victor2-unknown`) |
 
 Removed variables (no longer needed in direct-submit model):
@@ -109,6 +114,43 @@ The dashboard is designed for:
 The dashboard should **not** be exposed to the public internet without a
 reverse proxy that enforces authentication and TLS.
 
+## Bridge and Designer access controls
+
+The bridge (`POST /jobs`, `POST /jobs/{id}/abort`) and the designer
+(Run Builder drafts, finalize, `/config`) follow the same model as the
+dashboard:
+
+- Both bind to `0.0.0.0` by default and accept a bearer token from
+  `WALLAC_BRIDGE_TOKEN` / `WALLAC_DESIGNER_TOKEN`. When the token is
+  unset, the service runs open on the network.
+- The `/config` endpoint on the designer service is now behind the
+  same bearer-token check and no longer returns the internal
+  `vm_agent_url`.
+- All three services use plain HTTP; there is no built-in TLS. A
+  reverse proxy (nginx, Caddy, Traefik) is required to expose them
+  beyond a trusted LAN.
+
+### Network assumptions
+
+The bridge and designer services are designed for the same deployment
+environments as the dashboard:
+
+- **Lab LAN** — services run on the lab network, accessible only to
+  lab operators.
+- **Tailscale** — services reachable over Tailscale, with network-layer
+  access control via encrypted WireGuard tunnels.
+
+The bridge and designer should **not** be exposed to the public
+internet without a reverse proxy that enforces authentication and TLS.
+
+### Strict-auth mode
+
+For deployments where any open-on-LAN exposure is unacceptable, set
+`WALLAC_REQUIRE_AUTH=1`. With this flag set, the bridge and designer
+services refuse to start if their respective tokens are unset. The
+dashboard has its own token (`WALLAC_DASHBOARD_TOKEN`) and is not
+affected by this flag.
+
 ### Browser never receives secrets
 
 The browser receives only operator-visible data:
@@ -133,5 +175,5 @@ in `tests/test_bridge_hardening.py` enforce this at CI time.
 - Config: `bridge/config.py` — `BridgeConfig.from_env()`
 - Secrets scan: `bridge/secrets_check.py` — `scan_for_secrets()`
 - Dashboard auth: `bridge/dashboard.py` — `DashboardHandler._authorized()`
-- Bridge HTTP API auth: bearer token in `WALLAC_DESIGNER_TOKEN` env var
+- Bridge HTTP API auth: bearer token in `WALLAC_BRIDGE_TOKEN` env var
 - Tests: `tests/test_bridge_hardening.py`

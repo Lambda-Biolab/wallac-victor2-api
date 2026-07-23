@@ -15,18 +15,20 @@ IInstrumentEvents.OnError's Action out-param; see doc 100.)
 
 import contextlib
 import ctypes
+import logging
 import os
 import time
-from ctypes import wintypes
+
+logger = logging.getLogger(__name__)
 
 u = ctypes.windll.user32
 u.SendMessageW.argtypes = [
-    wintypes.HWND,
-    wintypes.UINT,
-    wintypes.WPARAM,
-    wintypes.LPARAM,
+    ctypes.wintypes.HWND,
+    ctypes.wintypes.UINT,
+    ctypes.wintypes.WPARAM,
+    ctypes.wintypes.LPARAM,
 ]
-u.SendMessageW.restype = wintypes.LPARAM
+u.SendMessageW.restype = ctypes.wintypes.LPARAM
 
 BM_CLICK = 0x00F5
 DIALOG_TITLE = "Wallac 1420 Exception"
@@ -36,7 +38,7 @@ LOG = r"C:\Users\Public\lid_watcher.log"
 # ABORT (cancel) instead of IGNORE (continue) on the next exception dialog.
 ABORT_FLAG = r"C:\Users\Public\abort.flag"
 
-EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+EnumProc = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
 
 
 def win_text(h):
@@ -56,7 +58,10 @@ def log(msg):
         with open(LOG, "a", encoding="utf-8") as fh:
             fh.write("{} {}\n".format(time.strftime("%Y-%m-%d %H:%M:%S"), msg))
     except OSError:
-        pass
+        # Reason: best-effort audit log to a public-path file. The log is
+        # observational; a write failure (locked file, full disk) should
+        # never crash the watcher loop.
+        logger.debug("lid_watcher log write failed", exc_info=True)
 
 
 def inspect_dialog(hdlg):

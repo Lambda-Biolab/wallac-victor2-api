@@ -184,7 +184,11 @@ class BridgeExecutor:
                 if aid > max_assay_before:
                     max_assay_before = aid
         except Exception:
-            pass
+            # Reason: best-effort snapshot of the pre-run assay id; if vm-agent
+            # is unreachable or returns an unexpected shape we still proceed
+            # with max_assay_before=0 and resolve the assay id from the
+            # post-run listing (the fallback loop below).
+            logger.debug("Failed to snapshot pre-run assay id", exc_info=True)
         job.max_assay_before = max_assay_before
         job.add_event("assay_snapshot_before", str(max_assay_before))
 
@@ -519,7 +523,9 @@ class BridgeExecutor:
                         )
                         break
                 except VmAgentError:
-                    pass
+                    # Reason: transient vm-agent error during the 10-attempt
+                    # retry loop; the loop will retry the lookup.
+                    logger.debug("MDB assay lookup retry", exc_info=True)
             # Emit progress every few attempts so the user knows we're fetching.
             if attempt > 0 and attempt % 5 == 0:
                 job.add_event(
@@ -550,7 +556,10 @@ class BridgeExecutor:
                     results = self.vm_agent.get_run_results(run_id)
                     raw_wells = results.get("wells", results.get("data", []))
                 except VmAgentError:
-                    pass
+                    # Reason: last-resort run-level results endpoint; if it
+                    # also fails we fall through with raw_wells empty and the
+                    # caller handles the "no data" path.
+                    logger.debug("Run-level results fallback failed", exc_info=True)
 
         job.add_event("results_fetched", f"{len(raw_wells)} wells")
 

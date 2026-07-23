@@ -45,13 +45,17 @@ logger = logging.getLogger(__name__)
 class ValidationElabftwClient(Protocol):
     """eLabFTW client methods needed for validation."""
 
-    def get_item(self, item_id: int) -> dict[str, Any]: ...
+    def get_item(self, item_id: int) -> dict[str, Any]:
+        raise NotImplementedError
 
-    def list_uploads(self, item_id: int) -> list[dict[str, Any]]: ...
+    def list_uploads(self, item_id: int) -> list[dict[str, Any]]:
+        raise NotImplementedError
 
-    def download_upload(self, item_id: int, upload_id: int) -> bytes: ...
+    def download_upload(self, item_id: int, upload_id: int) -> bytes:
+        raise NotImplementedError
 
-    def patch_metadata(self, item_id: int, extra_fields: dict[str, Any]) -> None: ...
+    def patch_metadata(self, item_id: int, extra_fields: dict[str, Any]) -> None:
+        raise NotImplementedError
 
 
 class VmAgentHealthClient(Protocol):
@@ -59,11 +63,11 @@ class VmAgentHealthClient(Protocol):
 
     def get_health(self) -> dict[str, Any]:
         """Return health dict with at least 'instrument_connected' and 'is_idle'."""
-        ...
+        raise NotImplementedError
 
     def get_instrument(self) -> dict[str, Any]:
         """Return instrument capabilities dict with 'technologies'."""
-        ...
+        raise NotImplementedError
 
 
 # --- Validation result -----------------------------------------------------

@@ -15,7 +15,6 @@ This is the unattended autostart mechanism for the instrument microservice.
 import ctypes
 import datetime
 import sys
-from ctypes import wintypes
 
 # Target: argv[1]=exe, argv[2:]=args. Defaults to the OEM GUI manager.
 if len(sys.argv) > 1:
@@ -39,33 +38,33 @@ CREATE_NEW_CONSOLE = 0x00000010
 
 class STARTUPINFOW(ctypes.Structure):
     _fields_ = [
-        ("cb", wintypes.DWORD),
-        ("lpReserved", wintypes.LPWSTR),
-        ("lpDesktop", wintypes.LPWSTR),
-        ("lpTitle", wintypes.LPWSTR),
-        ("dwX", wintypes.DWORD),
-        ("dwY", wintypes.DWORD),
-        ("dwXSize", wintypes.DWORD),
-        ("dwYSize", wintypes.DWORD),
-        ("dwXCountChars", wintypes.DWORD),
-        ("dwYCountChars", wintypes.DWORD),
-        ("dwFillAttribute", wintypes.DWORD),
-        ("dwFlags", wintypes.DWORD),
-        ("wShowWindow", wintypes.WORD),
-        ("cbReserved2", wintypes.WORD),
+        ("cb", ctypes.wintypes.DWORD),
+        ("lpReserved", ctypes.wintypes.LPWSTR),
+        ("lpDesktop", ctypes.wintypes.LPWSTR),
+        ("lpTitle", ctypes.wintypes.LPWSTR),
+        ("dwX", ctypes.wintypes.DWORD),
+        ("dwY", ctypes.wintypes.DWORD),
+        ("dwXSize", ctypes.wintypes.DWORD),
+        ("dwYSize", ctypes.wintypes.DWORD),
+        ("dwXCountChars", ctypes.wintypes.DWORD),
+        ("dwYCountChars", ctypes.wintypes.DWORD),
+        ("dwFillAttribute", ctypes.wintypes.DWORD),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("wShowWindow", ctypes.wintypes.WORD),
+        ("cbReserved2", ctypes.wintypes.WORD),
         ("lpReserved2", ctypes.c_void_p),
-        ("hStdInput", wintypes.HANDLE),
-        ("hStdOutput", wintypes.HANDLE),
-        ("hStdError", wintypes.HANDLE),
+        ("hStdInput", ctypes.wintypes.HANDLE),
+        ("hStdOutput", ctypes.wintypes.HANDLE),
+        ("hStdError", ctypes.wintypes.HANDLE),
     ]
 
 
 class PROCESS_INFORMATION(ctypes.Structure):
     _fields_ = [
-        ("hProcess", wintypes.HANDLE),
-        ("hThread", wintypes.HANDLE),
-        ("dwProcessId", wintypes.DWORD),
-        ("dwThreadId", wintypes.DWORD),
+        ("hProcess", ctypes.wintypes.HANDLE),
+        ("hThread", ctypes.wintypes.HANDLE),
+        ("dwProcessId", ctypes.wintypes.DWORD),
+        ("dwThreadId", ctypes.wintypes.DWORD),
     ]
 
 
@@ -87,14 +86,14 @@ def main():
         log("no active console session")
         return 1
 
-    htok = wintypes.HANDLE()
-    if not wts.WTSQueryUserToken(wintypes.DWORD(sid), ctypes.byref(htok)):
+    htok = ctypes.wintypes.HANDLE()
+    if not wts.WTSQueryUserToken(ctypes.wintypes.DWORD(sid), ctypes.byref(htok)):
         log(f"WTSQueryUserToken FAILED err={ctypes.get_last_error()}")
         return 1
     log("got console user token")
 
-    adv.DuplicateTokenEx.restype = wintypes.BOOL
-    hdup = wintypes.HANDLE()
+    adv.DuplicateTokenEx.restype = ctypes.wintypes.BOOL
+    hdup = ctypes.wintypes.HANDLE()
     if not adv.DuplicateTokenEx(
         htok,
         MAXIMUM_ALLOWED,
@@ -122,7 +121,7 @@ def main():
         cmdline += " " + " ".join(f'"{a}"' for a in ARGS)
     cmd_buf = ctypes.create_unicode_buffer(cmdline)
 
-    adv.CreateProcessAsUserW.restype = wintypes.BOOL
+    adv.CreateProcessAsUserW.restype = ctypes.wintypes.BOOL
     ok = adv.CreateProcessAsUserW(
         hdup,
         APP,

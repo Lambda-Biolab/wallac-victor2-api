@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 from .schemas import AnalysisSpec, WellRole
+from .well_utils import well_key
 
 logger = logging.getLogger(__name__)
 
@@ -260,11 +261,9 @@ class AnalysisPipeline:
         result: AnalysisResult,
     ) -> None:
         """Steps 1-2: Load raw values, mark skipped wells, merge layout info."""
-        from bridge.execution import _well_key
-
         # vm-agent returns 'well' (e.g. 'A01'), layout/analysis specs use
-        # 'well_name' (e.g. 'A1'). _well_key normalizes both to 'A1'.
-        raw_by_name = {_well_key(w): w for w in raw_wells}
+        # 'well_name' (e.g. 'A1'). well_key normalizes both to 'A1'.
+        raw_by_name = {well_key(w): w for w in raw_wells}
 
         # Include all 96 wells from the layout
         for well_name, layout_def in layout_wells.items():
