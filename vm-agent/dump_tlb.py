@@ -6,7 +6,10 @@ module path so the full interface/method signatures (incl. GetCounts) can be
 inspected. Read-only; does not contact the instrument.
 """
 
+import logging
 import traceback
+
+logger = logging.getLogger(__name__)
 
 OUT = r"C:\install\tlb_dump.txt"
 TLB = ("{08851F21-9C03-11CE-BAC1-857F25C070DD}", 2, 0)
@@ -18,7 +21,10 @@ def log(msg):
     try:
         print(msg)
     except Exception:
-        pass
+        # Reason: console handle can be detached on Windows diagnostic scripts
+        # when launched non-interactively. The file write above has already
+        # recorded the message; failing to mirror to stdout is harmless.
+        logger.debug("console write unavailable", exc_info=True)
 
 
 def main():

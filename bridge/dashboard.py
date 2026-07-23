@@ -341,7 +341,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_sse_event(state.to_dict())
             self._stream_updates(store, item_id)
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            # Reason: SSE client disconnected (browser closed tab, navigation,
+            # network drop). This is normal lifecycle termination, not an
+            # error. Logging at debug so it can be observed in diagnostics
+            # without polluting info-level output.
+            logger.debug("SSE client disconnected", exc_info=True)
 
     def _stream_updates(self, store: DashboardStateStore, item_id: int) -> None:
         """Stream SSE updates until terminal state or disconnect."""
@@ -408,7 +412,14 @@ class DashboardServer:
         host: str = "0.0.0.0",
         port: int = 8421,
         session_token: str | None = None,
+        require_auth: bool = False,
     ) -> None:
+        # Strict-auth mode: refuse to start with empty session token.
+        if require_auth and not session_token:
+            raise RuntimeError(
+                "Dashboard require_auth is set but session_token is empty; "
+                "refusing to start the dashboard open on the network."
+            )
         self._httpd = ThreadingHTTPServer((host, port), DashboardHandler)
         self._httpd.state_store = state_store  # type: ignore[attr-defined]
         self._httpd.abort_handler = abort_handler  # type: ignore[attr-defined]

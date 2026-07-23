@@ -286,3 +286,101 @@ def test_live_monitor_url_base():
         }
     )
     assert config.live_monitor_url_base == "http://wallac.local:8421"
+
+
+# --- Defense-in-depth: TLS, CORS, strict-auth (2026-07 hardening) ---------
+
+
+def test_config_elabftw_verify_tls_default_true():
+    """eLabFTW TLS verification is on by default (secure default)."""
+    config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key"})
+    assert config.elabftw_verify_tls is True
+
+
+def test_config_elabftw_verify_tls_can_be_disabled():
+    """Operator can disable TLS verification for self-signed dev certs."""
+    config = BridgeConfig.from_env(
+        env={ENV_ELABFTW_API_KEY: "5-key", "WALLAC_ELABFTW_VERIFY_TLS": "0"}
+    )
+    assert config.elabftw_verify_tls is False
+
+    config = BridgeConfig.from_env(
+        env={ENV_ELABFTW_API_KEY: "5-key", "WALLAC_ELABFTW_VERIFY_TLS": "false"}
+    )
+    assert config.elabftw_verify_tls is False
+
+
+def test_config_cors_origins_default_empty():
+    """No CORS allowlist by default (no Access-Control-Allow-Origin emitted)."""
+    config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key"})
+    assert config.cors_origins == []
+
+
+def test_config_cors_origins_parses_csv():
+    """CORS allowlist parses comma-separated values."""
+    config = BridgeConfig.from_env(
+        env={
+            ENV_ELABFTW_API_KEY: "5-key",
+            "WALLAC_CORS_ORIGINS": "http://localhost:8422, https://run.example.com",
+        }
+    )
+    assert config.cors_origins == ["http://localhost:8422", "https://run.example.com"]
+
+
+def test_config_require_auth_default_false():
+    """Strict-auth mode is off by default (preserves LAN behavior)."""
+    config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key"})
+    assert config.require_auth is False
+
+
+def test_config_require_auth_can_be_enabled():
+    """Strict-auth mode can be enabled via env var."""
+    config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key", "WALLAC_REQUIRE_AUTH": "1"})
+    assert config.require_auth is True
+
+
+def test_config_redacted_includes_new_fields():
+    """redacted() includes all new fields (verify_tls, cors_origins, require_auth)."""
+    config = BridgeConfig.from_env(
+        env={
+            ENV_ELABFTW_API_KEY: "5-key",
+            "WALLAC_CORS_ORIGINS": "http://localhost:8422",
+            "WALLAC_REQUIRE_AUTH": "true",
+        }
+    )
+    redacted = config.redacted()
+    assert "elabftw_verify_tls" in redacted
+    assert redacted["cors_origins"] == "['http://localhost:8422']"
+    assert redacted["require_auth"] == "True"
+
+
+def test_dashboard_server_require_auth_rejects_empty_token():
+    """DashboardServer with require_auth=True and empty token refuses to start."""
+    store = DashboardStateStore()
+    with pytest.raises(RuntimeError, match="require_auth is set"):
+        DashboardServer(
+            state_store=store,
+            host="127.0.0.1",
+            port=0,
+            session_token=None,
+            require_auth=True,
+        )
+
+
+def test_dashboard_server_require_auth_allows_set_token():
+    """DashboardServer with require_auth=True and a token starts normally."""
+    store = DashboardStateStore()
+    srv = DashboardServer(
+        state_store=store,
+        host="127.0.0.1",
+        port=0,
+        session_token="real-token",
+        require_auth=True,
+    )
+    srv.start()
+    try:
+        time.sleep(0.05)
+        # Just verify the server is alive (no exception on start).
+        assert srv._thread is not None and srv._thread.is_alive()
+    finally:
+        srv.stop()

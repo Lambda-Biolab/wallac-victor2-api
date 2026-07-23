@@ -68,6 +68,7 @@ class BridgeDaemon:
             host=config.dashboard_host,
             port=config.dashboard_port,
             session_token=config.dashboard_token or None,
+            require_auth=config.require_auth,
         )
 
         self._running = False

@@ -360,4 +360,7 @@ class ResultSpool:
                     findings.append(f"{f}: content contains '{pattern}'")
                     break
         except Exception:
-            pass
+            # Reason: best-effort content scan for secret patterns; unreadable
+            # files are skipped (already flagged separately) and never block
+            # the spool directory walk.
+            logger.debug("Secret-pattern scan skipped for %s", f, exc_info=True)

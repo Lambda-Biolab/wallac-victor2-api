@@ -144,6 +144,14 @@ def create_bridge_app(
 
     bridge_token = os.environ.get("WALLAC_BRIDGE_TOKEN", "")
 
+    # Strict-auth mode: refuse to start with empty bridge token.
+    if config is not None and config.require_auth and not bridge_token:
+        raise RuntimeError(
+            "WALLAC_REQUIRE_AUTH is set but WALLAC_BRIDGE_TOKEN is empty; "
+            "refusing to start the bridge with auth disabled. "
+            "Either unset WALLAC_REQUIRE_AUTH or set WALLAC_BRIDGE_TOKEN."
+        )
+
     # Wire the executor: connect JobManager to vm-agent + eLabFTW
     if config is not None:
         vm_agent = VmAgentClient(
@@ -153,7 +161,7 @@ def create_bridge_app(
         elabftw = ElabftwClient(
             base_url=config.elabftw_url,
             api_key=config.elabftw_api_key,
-            verify_tls=False,
+            verify_tls=config.elabftw_verify_tls,
         )
         executor = BridgeExecutor(
             vm_agent=vm_agent,
@@ -169,13 +177,26 @@ def create_bridge_app(
         version="2.0.0",
     )
 
-    # Allow the Run Builder (different port) to call the bridge API
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["GET", "POST"],
-        allow_headers=["*"],
-    )
+    # CORS: explicit allowlist from WALLAC_CORS_ORIGINS. The previous
+    # wildcard default has been removed. When no origins are configured,
+    # the middleware emits no Access-Control-Allow-Origin header at all,
+    # which is the safe-by-default posture. If a wildcard is explicitly
+    # set, log a warning so the operator sees the exposure.
+    cors_origins = list(config.cors_origins) if config is not None else []
+    if cors_origins:
+        if "*" in cors_origins:
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "WALLAC_CORS_ORIGINS includes '*'; the bridge API will "
+                "respond to any origin. Use an explicit allowlist."
+            )
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_origins,
+            allow_methods=["GET", "POST"],
+            allow_headers=["*"],
+        )
 
     # Store references for closures
     mgr = job_manager

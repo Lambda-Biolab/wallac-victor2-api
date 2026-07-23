@@ -80,37 +80,37 @@ class DesignerElabftwClient(Protocol):
 
     def list_items(self, category_id: int, expected_schema: str = "") -> list[dict[str, Any]]:
         """List all items in a resource category."""
-        ...
+        raise NotImplementedError
 
     def get_item(self, item_id: int) -> dict[str, Any]:
         """Get a single item by ID."""
-        ...
+        raise NotImplementedError
 
     def create_item(self, category_id: int, title: str, body: str = "") -> int:
         """Create a new item in a resource category. Returns the new item ID."""
-        ...
+        raise NotImplementedError
 
     def patch_item(self, item_id: int, fields: dict[str, Any]) -> None:
         """Patch fields on an item (title, body, etc.)."""
-        ...
+        raise NotImplementedError
 
     def patch_metadata(self, item_id: int, extra_fields: dict[str, Any]) -> None:
         """Update extra_fields metadata on an item."""
-        ...
+        raise NotImplementedError
 
     def upload_file(
         self, item_id: int, filename: str, content: bytes, comment: str = ""
     ) -> dict[str, Any]:
         """Upload a file attachment to an item."""
-        ...
+        raise NotImplementedError
 
     def list_uploads(self, item_id: int) -> list[dict[str, Any]]:
         """List uploads (attachments) for an item."""
-        ...
+        raise NotImplementedError
 
     def download_upload(self, item_id: int, upload_id: int) -> bytes:
         """Download the raw bytes of an upload."""
-        ...
+        raise NotImplementedError
 
 
 # --- Spec type mapping ------------------------------------------------------
