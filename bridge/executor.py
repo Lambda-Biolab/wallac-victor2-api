@@ -222,7 +222,7 @@ class BridgeExecutor:
         self._fetch_and_writeback(job, run_id)
 
     def _execute_generated_protocol(self, job: Job) -> None:
-        """Run a generated protocol from signed method/layout/analysis refs.
+        """Run a generated protocol from hash-verified method/layout/analysis refs.
 
         For v1, this downloads the canonical JSON from eLabFTW using the
         refs in the job spec, then uses the analysis pipeline on the
@@ -863,7 +863,7 @@ class BridgeExecutor:
                 ),
                 operator_hint=(
                     "Re-generate and re-sign the spec attachment, or restore the "
-                    "original signed version in eLabFTW."
+                    "original referenced version in eLabFTW."
                 ),
                 retryable=False,
                 details={

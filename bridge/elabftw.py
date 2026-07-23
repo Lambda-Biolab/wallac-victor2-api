@@ -1,13 +1,8 @@
-"""eLabFTW API v2 client for the Wallac bridge.
+"""eLabFTW API v2 client for the direct-submit bridge and Run Builder.
 
-Reads Automation Job resources, downloads signature archives, and writes back
-state/progress/result fields.  Uses the same API conventions documented in
-eLabFTW-lambdabiolab/AGENT_LEARNINGS.md (metadata may be double-encoded JSON,
-extra_fields need raw HTTP GET to deserialize, etc.).
-
-The :class:`ElabftwInterface` protocol defines the surface that
-:class:`~bridge.intake.JobIntake` depends on.  Tests provide a mock
-implementation; production uses :class:`ElabftwClient` over HTTP.
+Handles canonical attachment downloads, designer item CRUD, and assay result
+write-back. Metadata may be double-encoded JSON, so helpers normalize it before
+reading or updating ``extra_fields``.
 """
 
 from __future__ import annotations
@@ -18,9 +13,7 @@ import logging
 import ssl
 import urllib.error
 import urllib.request
-from typing import Any, Protocol
-
-from .models import AutomationJob, RequestFields
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -62,57 +55,14 @@ def get_field_value(extra_fields: dict[str, Any], name: str) -> str:
     return str(entry)
 
 
-# --- Interface --------------------------------------------------------------
-
-
-class ElabftwInterface(Protocol):
-    """Interface for eLabFTW API access (real HTTP client or mock)."""
-
-    def list_automation_jobs(self) -> list[AutomationJob]:
-        """Return all Automation Job items in the configured category."""
-        raise NotImplementedError
-
-    def list_uploads(self, item_id: int) -> list[dict[str, Any]]:
-        """Return uploads (attachments) for an item."""
-        raise NotImplementedError
-
-    def download_upload(self, item_id: int, upload_id: int) -> bytes:
-        """Download the raw bytes of an upload."""
-        raise NotImplementedError
-
-    def patch_metadata(self, item_id: int, extra_fields: dict[str, Any]) -> None:
-        """Update extra_fields metadata on an item.
-
-        ``extra_fields`` is a dict of field_name -> field_def where field_def
-        has at least ``{"value": ...}``.  Only the provided fields are updated;
-        other fields are left unchanged.
-        """
-        raise NotImplementedError
-
-    def upload_file(
-        self, item_id: int, filename: str, content: bytes, comment: str = ""
-    ) -> dict[str, Any]:
-        """Upload a file attachment to an item.
-
-        Returns the upload metadata dict (with at least ``id`` and
-        ``real_name``).
-        """
-        raise NotImplementedError
-
-    def post_comment(self, item_id: int, comment: str) -> None:
-        """Append a comment to an item (used for event log entries)."""
-        raise NotImplementedError
-
-
 # --- HTTP client ------------------------------------------------------------
 
 
 class ElabftwClient:
     """HTTP client for eLabFTW API v2.
 
-    Uses urllib (stdlib) so the bridge core has no hard third-party dependency
-    beyond PyNaCl (for signature verification).  The mock test client
-    implements the same :class:`ElabftwInterface` protocol.
+    Uses urllib from the standard library and exposes only operations used by
+    the direct-submit bridge and Run Builder.
     """
 
     def __init__(
@@ -121,11 +71,9 @@ class ElabftwClient:
         api_key: str,
         *,
         verify_tls: bool = True,
-        automation_job_category: int = 9,
     ) -> None:
         self.base = base_url.rstrip("/") + "/api/v2"
         self.api_key = api_key
-        self.category = automation_job_category
         if verify_tls:
             self._ssl_ctx = ssl.create_default_context()
         else:
@@ -164,30 +112,6 @@ class ElabftwClient:
                 detail = e.read().decode()[:200]
             logger.error("eLabFTW API %s %s -> %s: %s", method, path, e.code, detail)
             raise
-
-    # --- ElabftwInterface implementation ---
-
-    def list_automation_jobs(self) -> list[AutomationJob]:
-        items = self._request("GET", f"/items?cat={self.category}")
-        jobs: list[AutomationJob] = []
-        for item in items or []:
-            extra_fields = extract_extra_fields(item.get("metadata"))
-            state = get_field_value(extra_fields, "Automation state")
-            request_fields = RequestFields.from_extra_fields(extra_fields)
-            jobs.append(
-                AutomationJob(
-                    item_id=item["id"],
-                    title=item.get("title", ""),
-                    state=state,
-                    request_fields=request_fields,
-                    extra_fields=extra_fields,
-                )
-            )
-        return jobs
-
-    def list_uploads(self, item_id: int) -> list[dict[str, Any]]:
-        # Include archived uploads (state=2) so signature archives are visible.
-        return self._request("GET", f"/items/{item_id}/uploads?state=2") or []
 
     def download_upload(self, item_id: int, upload_id: int) -> bytes:
         """Download the raw bytes of an upload attachment.
@@ -266,14 +190,6 @@ class ElabftwClient:
                 detail = e.read().decode()[:200]
             logger.error("eLabFTW upload %s -> %s: %s", url, e.code, detail)
             raise
-
-    def post_comment(self, item_id: int, comment: str) -> None:
-        """Append a comment to an item."""
-        self._request(
-            "POST",
-            f"/items/{item_id}/comments",
-            body={"comment": comment},
-        )
 
     # --- Designer methods (Stage 3: protocol authoring) ---
 
@@ -374,10 +290,6 @@ class ElabftwClient:
                 return item_id
         raise RuntimeError(f"Could not parse new item ID from response: {result}")
 
-    def patch_item(self, item_id: int, fields: dict[str, Any]) -> None:
-        """Patch fields on an item (title, body, etc.)."""
-        self._request("PATCH", f"/items/{item_id}", body=fields)
-
     # --- Experiment methods (Stage 6: Assay summary write-back) ---
 
     def create_experiment(self, title: str, body: str = "") -> int:
@@ -448,15 +360,3 @@ class ElabftwClient:
                 detail = e.read().decode()[:200]
             logger.error("eLabFTW experiment upload %s -> %s: %s", url, e.code, detail)
             raise
-
-    def link_experiment_to_item(self, experiment_id: int, item_id: int) -> None:
-        """Create a link from an experiment to an item (eLabFTW link).
-
-        Uses the experiments/{id}/items_links/{item_id} endpoint.
-        The item_id goes in the URL path, not the body.
-        """
-        self._request(
-            "POST",
-            f"/experiments/{experiment_id}/items_links/{item_id}",
-            body={},
-        )

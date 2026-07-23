@@ -303,9 +303,8 @@ def create_designer_app(
             base_url=config.elabftw_url,
             api_key=config.elabftw_api_key,
             verify_tls=config.elabftw_verify_tls,
-            automation_job_category=config.elabftw_category,
         )
-        service = DesignerService(client)  # type: ignore[arg-type]
+        service = DesignerService(client)
 
     designer_token = os.environ.get("WALLAC_DESIGNER_TOKEN", "")
 

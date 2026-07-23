@@ -1,8 +1,8 @@
 """Tests for the BridgeExecutor — direct-submit execution with hash verification.
 
-C20 requires signed-spec hash verification in the executor path.
+C20 requires reference hash verification in the executor path.
 Tests cover:
-- Valid signed ref with correct hash passes verification
+- Valid hash-bound ref with the correct hash passes verification
 - Valid ref executes through existing generated_protocol path (dry-run)
 - Hash mismatch blocks execution (fails closed)
 - Missing hash in ref blocks execution (fails closed)
@@ -343,7 +343,7 @@ class TestGeneratedProtocolHashVerification:
         executor_wet: BridgeExecutor,
         elabftw: MockElabftwClient,
     ) -> None:
-        """A valid signed ref passes verification and proceeds to execution.
+        """A valid hash-bound ref passes verification and proceeds to execution.
 
         For generated_protocol mode, the executor validates method_ref hash
         before attempting any protocol matching. With dry_run=False but a

@@ -67,16 +67,11 @@ class DraftObject:
     extra_fields: dict[str, Any] = field(default_factory=dict)
 
 
-# --- eLabFTW client protocol (extends ElabftwInterface) ---------------------
+# --- eLabFTW client protocol ------------------------------------------------
 
 
 class DesignerElabftwClient(Protocol):
-    """Extended eLabFTW client protocol for designer operations.
-
-    Extends the existing :class:`bridge.elabftw.ElabftwInterface` with methods
-    for creating/listing/patching items in the Method, Layout, Analysis, and
-    Job categories.
-    """
+    """eLabFTW operations required by the Run Builder."""
 
     def list_items(self, category_id: int, expected_schema: str = "") -> list[dict[str, Any]]:
         """List all items in a resource category."""
@@ -90,10 +85,6 @@ class DesignerElabftwClient(Protocol):
         """Create a new item in a resource category. Returns the new item ID."""
         raise NotImplementedError
 
-    def patch_item(self, item_id: int, fields: dict[str, Any]) -> None:
-        """Patch fields on an item (title, body, etc.)."""
-        raise NotImplementedError
-
     def patch_metadata(self, item_id: int, extra_fields: dict[str, Any]) -> None:
         """Update extra_fields metadata on an item."""
         raise NotImplementedError
@@ -102,14 +93,6 @@ class DesignerElabftwClient(Protocol):
         self, item_id: int, filename: str, content: bytes, comment: str = ""
     ) -> dict[str, Any]:
         """Upload a file attachment to an item."""
-        raise NotImplementedError
-
-    def list_uploads(self, item_id: int) -> list[dict[str, Any]]:
-        """List uploads (attachments) for an item."""
-        raise NotImplementedError
-
-    def download_upload(self, item_id: int, upload_id: int) -> bytes:
-        """Download the raw bytes of an upload."""
         raise NotImplementedError
 
 

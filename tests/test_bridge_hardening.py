@@ -1,323 +1,63 @@
-"""Acceptance criteria tests for issue #6: auth/network hardening.
-
-AC: "Auth/secrets policy documented in the Wallac repo."
-AC: "Dashboard endpoints reject unauthorized public access."
-AC: "Tests or smoke checks verify no service secrets appear in rendered
-dashboard HTML/JS payloads."
-"""
+"""Configuration tests for bridge authentication and network hardening."""
 
 from __future__ import annotations
 
-import json
-import time
-import urllib.error
-import urllib.request
-
 import pytest
+from fastapi.testclient import TestClient
 
-from bridge.config import (
-    DEFAULT_DASHBOARD_PORT,
-    ENV_ELABFTW_API_KEY,
-    BridgeConfig,
-    ConfigError,
-)
-from bridge.dashboard import (
-    DashboardJobState,
-    DashboardServer,
-    DashboardStateStore,
-)
-from bridge.secrets_check import scan_for_secrets
-
-# --- AC 1: Config validates env-only secrets --------------------------------
+from bridge.bridge_app import create_bridge_app
+from bridge.config import ENV_ELABFTW_API_KEY, BridgeConfig, ConfigError
+from bridge.designer_app import create_designer_app
+from bridge.jobs import JobManager
 
 
-def test_config_requires_api_key():
-    """ConfigError is raised when ELABFTW_API_KEY is missing."""
-    with pytest.raises(ConfigError) as exc_info:
+def test_config_requires_api_key() -> None:
+    with pytest.raises(ConfigError, match=ENV_ELABFTW_API_KEY):
         BridgeConfig.from_env(env={})
-    assert ENV_ELABFTW_API_KEY in str(exc_info.value)
-    assert "do NOT use a human admin key" in str(exc_info.value)
 
 
-def test_config_requires_nonempty_api_key():
-    """Empty API key is rejected."""
+def test_config_rejects_empty_api_key() -> None:
     with pytest.raises(ConfigError):
         BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "   "})
 
 
-def test_config_from_env_with_secrets():
-    """Config loads secrets from env vars."""
+def test_config_loads_active_service_settings() -> None:
     config = BridgeConfig.from_env(
         env={
             ENV_ELABFTW_API_KEY: "5-testkey123",
-            "WALLAC_ELABFTW_URL": "https://elab.local:3148",
-            "WALLAC_DASHBOARD_TOKEN": "session-secret",
-            "WALLAC_DASHBOARD_PORT": "9999",
+            "WALLAC_ELABFTW_URL": "https://elab.local:3148/",
+            "WALLAC_VM_AGENT_URL": "http://vm-agent.local:8420/",
+            "WALLAC_VM_AGENT_TOKEN": "vm-token",
+            "WALLAC_DRY_RUN": "true",
         }
     )
+
     assert config.elabftw_api_key == "5-testkey123"
     assert config.elabftw_url == "https://elab.local:3148"
-    assert config.dashboard_token == "session-secret"
-    assert config.dashboard_port == 9999
-    assert config.dashboard_requires_auth is True
+    assert config.vm_agent_url == "http://vm-agent.local:8420"
+    assert config.vm_agent_token == "vm-token"
+    assert config.dry_run is True
 
 
-def test_config_redacted_hides_secrets():
-    """redacted() masks all secret values."""
-    config = BridgeConfig.from_env(
-        env={
-            ENV_ELABFTW_API_KEY: "5-secretkey123",
-            "WALLAC_VM_AGENT_TOKEN": "vm-secret",
-            "WALLAC_DASHBOARD_TOKEN": "dash-secret",
-        }
-    )
-    redacted = config.redacted()
-    assert redacted["elabftw_api_key"] == "***REDACTED***"
-    assert redacted["vm_agent_token"] == "***REDACTED***"
-    assert redacted["dashboard_token"] == "***REDACTED***"
-    # Non-secret values are visible
-    assert redacted["elabftw_url"] == config.elabftw_url
-    assert redacted["dashboard_port"] == str(config.dashboard_port)
-
-
-def test_config_redacted_shows_unset_as_unset():
-    """Unset optional secrets show as (unset), not REDACTED."""
-    config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key"})
-    redacted = config.redacted()
-    assert redacted["vm_agent_token"] == "(unset)"
-    assert redacted["dashboard_token"] == "(unset)"
-
-
-def test_config_no_auth_without_dashboard_token():
-    """Without a dashboard token, auth is not enforced."""
-    config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key"})
-    assert config.dashboard_requires_auth is False
-
-
-# --- AC 2: Dashboard rejects unauthorized access ---------------------------
-
-
-@pytest.fixture
-def secured_server():
-    """Dashboard server with a session token (auth enforced)."""
-    store = DashboardStateStore()
-    srv = DashboardServer(
-        state_store=store,
-        abort_handler=None,
-        host="127.0.0.1",
-        port=0,
-        session_token="test-session-token",
-    )
-    srv.start()
-    time.sleep(0.1)
-    yield srv, store
-    srv.stop()
-
-
-def _get(url: str, token: str | None = None) -> tuple[int, bytes]:
-    req = urllib.request.Request(url)
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status, resp.read()
-    except urllib.error.HTTPError as e:
-        return e.code, e.read()
-
-
-def test_dashboard_rejects_no_token(secured_server):
-    """Without a token, all endpoints return 401."""
-    srv, _store = secured_server
-    base = f"http://{srv.address[0]}:{srv.address[1]}"
-
-    code, _ = _get(f"{base}/")
-    assert code == 401
-
-    code, _ = _get(f"{base}/api/jobs/1")
-    assert code == 401
-
-
-def test_dashboard_rejects_wrong_token(secured_server):
-    """With a wrong token, endpoints return 401."""
-    srv, _store = secured_server
-    base = f"http://{srv.address[0]}:{srv.address[1]}"
-
-    code, _ = _get(f"{base}/", token="wrong-token")
-    assert code == 401
-
-
-def test_dashboard_accepts_correct_token(secured_server):
-    """With the correct token, endpoints return 200."""
-    srv, _store = secured_server
-    base = f"http://{srv.address[0]}:{srv.address[1]}"
-
-    code, body = _get(f"{base}/", token="test-session-token")
-    assert code == 200
-    assert b"Wallac Victor2" in body
-
-
-def test_dashboard_api_requires_token(secured_server):
-    """The JSON API also requires the session token."""
-    srv, _store = secured_server
-    base = f"http://{srv.address[0]}:{srv.address[1]}"
-
-    # Without token → 401
-    code, _ = _get(f"{base}/api/jobs/1")
-    assert code == 401
-
-    # With token → 200 (or 404 if job doesn't exist, but not 401)
-    code, _ = _get(f"{base}/api/jobs/1", token="test-session-token")
-    assert code == 404  # job not found, but auth passed
-
-
-# --- AC 3: No secrets in rendered dashboard HTML/JS ------------------------
-
-
-def test_dashboard_html_has_no_secrets():
-    """The dashboard HTML file contains no secret values or patterns."""
-    from pathlib import Path
-
-    html_path = Path(__file__).resolve().parent.parent / "bridge" / "dashboard.html"
-    html = html_path.read_text(encoding="utf-8")
-
-    result = scan_for_secrets(
-        html,
-        known_secrets=(
-            "5-testkey123",  # sample API key
-            "test-session-token",  # sample session token
-        ),
-    )
-    assert result.clean, f"Secret leakage found: {result.findings}"
-
-
-def test_dashboard_html_no_secret_keywords():
-    """The dashboard HTML has no secret keywords in value-assignment context."""
-    from pathlib import Path
-
-    html_path = Path(__file__).resolve().parent.parent / "bridge" / "dashboard.html"
-    html = html_path.read_text(encoding="utf-8")
-
-    result = scan_for_secrets(html)
-    # The HTML should be clean of secret patterns
-    # (keyword checks only flag keyword + value assignment, not CSS class names)
-    assert result.clean, f"Secret patterns found: {result.findings}"
-
-
-def test_job_state_json_has_no_secrets():
-    """DashboardJobState.to_dict() contains no secret fields."""
-    state = DashboardJobState(
-        item_id=1,
-        title="Test",
-        device_identity="victor2-123",
-    )
-    d = state.to_dict()
-    json_str = json.dumps(d)
-
-    result = scan_for_secrets(
-        json_str,
-        known_secrets=(
-            "5-testkey123",
-            "vm-secret",
-            "session-token",
-        ),
-    )
-    assert result.clean, f"Secret leakage in job state JSON: {result.findings}"
-
-
-# --- Bonus: secrets_check catches real leaks --------------------------------
-
-
-def test_secrets_check_detects_api_key():
-    """scan_for_secrets detects an API key in content."""
-    html = '<script>const apiKey = "5-secretkey123";</script>'
-    result = scan_for_secrets(html)
-    assert not result.clean
-    assert any(f["type"] == "secret_keyword" for f in result.findings)
-
-
-def test_secrets_check_detects_bearer_token():
-    """scan_for_secrets detects a Bearer token in content."""
-    html = "Authorization: Bearer abc123def456"
-    result = scan_for_secrets(html)
-    assert not result.clean
-
-
-def test_secrets_check_detects_known_secret():
-    """scan_for_secrets detects a known secret value."""
-    html = "<p>The key is 5-mysecretkey456</p>"
-    result = scan_for_secrets(html, known_secrets=("5-mysecretkey456",))
-    assert not result.clean
-    assert any(f["type"] == "known_secret" for f in result.findings)
-
-
-def test_secrets_check_clean_content():
-    """scan_for_secrets returns clean for safe content."""
-    html = "<div>Wallac Victor2 Live Monitor</div><p>State: running</p>"
-    result = scan_for_secrets(html)
-    assert result.clean
-
-
-def test_secrets_check_ignores_short_known_secrets():
-    """Known secrets shorter than 4 chars are not checked (false positives)."""
-    html = "<p>ab</p>"
-    result = scan_for_secrets(html, known_secrets=("ab",))
-    assert result.clean
-
-
-# --- Bonus: config defaults -------------------------------------------------
-
-
-def test_config_defaults():
-    """Config uses sensible defaults when optional vars are unset."""
-    config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key"})
-    assert config.dashboard_host == "0.0.0.0"
-    assert config.dashboard_port == DEFAULT_DASHBOARD_PORT
-    assert config.bridge_identity == "wallac-bridge"
-    assert config.elabftw_category == 21  # items_categories ID, not items_types
-
-
-def test_live_monitor_url_base():
-    """live_monitor_url_base produces the correct URL."""
-    config = BridgeConfig.from_env(
-        env={
-            ENV_ELABFTW_API_KEY: "5-key",
-            "WALLAC_DASHBOARD_HOST": "wallac.local",
-            "WALLAC_DASHBOARD_PORT": "8421",
-        }
-    )
-    assert config.live_monitor_url_base == "http://wallac.local:8421"
-
-
-# --- Defense-in-depth: TLS, CORS, strict-auth (2026-07 hardening) ---------
-
-
-def test_config_elabftw_verify_tls_default_true():
-    """eLabFTW TLS verification is on by default (secure default)."""
+def test_config_elabftw_verify_tls_defaults_true() -> None:
     config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key"})
     assert config.elabftw_verify_tls is True
 
 
-def test_config_elabftw_verify_tls_can_be_disabled():
-    """Operator can disable TLS verification for self-signed dev certs."""
+@pytest.mark.parametrize("value", ["0", "false", "no", "off"])
+def test_config_elabftw_verify_tls_can_be_disabled(value: str) -> None:
     config = BridgeConfig.from_env(
-        env={ENV_ELABFTW_API_KEY: "5-key", "WALLAC_ELABFTW_VERIFY_TLS": "0"}
-    )
-    assert config.elabftw_verify_tls is False
-
-    config = BridgeConfig.from_env(
-        env={ENV_ELABFTW_API_KEY: "5-key", "WALLAC_ELABFTW_VERIFY_TLS": "false"}
+        env={ENV_ELABFTW_API_KEY: "5-key", "WALLAC_ELABFTW_VERIFY_TLS": value}
     )
     assert config.elabftw_verify_tls is False
 
 
-def test_config_cors_origins_default_empty():
-    """No CORS allowlist by default (no Access-Control-Allow-Origin emitted)."""
+def test_config_cors_origins_defaults_empty() -> None:
     config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key"})
     assert config.cors_origins == []
 
 
-def test_config_cors_origins_parses_csv():
-    """CORS allowlist parses comma-separated values."""
+def test_config_cors_origins_parses_csv() -> None:
     config = BridgeConfig.from_env(
         env={
             ENV_ELABFTW_API_KEY: "5-key",
@@ -327,60 +67,52 @@ def test_config_cors_origins_parses_csv():
     assert config.cors_origins == ["http://localhost:8422", "https://run.example.com"]
 
 
-def test_config_require_auth_default_false():
-    """Strict-auth mode is off by default (preserves LAN behavior)."""
+def test_config_require_auth_defaults_false() -> None:
     config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key"})
     assert config.require_auth is False
 
 
-def test_config_require_auth_can_be_enabled():
-    """Strict-auth mode can be enabled via env var."""
+def test_config_require_auth_can_be_enabled() -> None:
     config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key", "WALLAC_REQUIRE_AUTH": "1"})
     assert config.require_auth is True
 
 
-def test_config_redacted_includes_new_fields():
-    """redacted() includes all new fields (verify_tls, cors_origins, require_auth)."""
-    config = BridgeConfig.from_env(
-        env={
-            ENV_ELABFTW_API_KEY: "5-key",
-            "WALLAC_CORS_ORIGINS": "http://localhost:8422",
-            "WALLAC_REQUIRE_AUTH": "true",
-        }
-    )
-    redacted = config.redacted()
-    assert "elabftw_verify_tls" in redacted
-    assert redacted["cors_origins"] == "['http://localhost:8422']"
-    assert redacted["require_auth"] == "True"
+def test_bridge_require_auth_rejects_empty_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("WALLAC_BRIDGE_TOKEN", raising=False)
+    config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key", "WALLAC_REQUIRE_AUTH": "1"})
+
+    with pytest.raises(RuntimeError, match="WALLAC_BRIDGE_TOKEN is empty"):
+        create_bridge_app(config=config)
 
 
-def test_dashboard_server_require_auth_rejects_empty_token():
-    """DashboardServer with require_auth=True and empty token refuses to start."""
-    store = DashboardStateStore()
-    with pytest.raises(RuntimeError, match="require_auth is set"):
-        DashboardServer(
-            state_store=store,
-            host="127.0.0.1",
-            port=0,
-            session_token=None,
-            require_auth=True,
-        )
+def test_designer_require_auth_rejects_empty_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("WALLAC_DESIGNER_TOKEN", raising=False)
+    config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key", "WALLAC_REQUIRE_AUTH": "1"})
+
+    with pytest.raises(RuntimeError, match="WALLAC_DESIGNER_TOKEN is empty"):
+        create_designer_app(config=config, service=object())
 
 
-def test_dashboard_server_require_auth_allows_set_token():
-    """DashboardServer with require_auth=True and a token starts normally."""
-    store = DashboardStateStore()
-    srv = DashboardServer(
-        state_store=store,
-        host="127.0.0.1",
-        port=0,
-        session_token="real-token",
-        require_auth=True,
-    )
-    srv.start()
+def test_bridge_default_cors_emits_no_allow_origin() -> None:
+    config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key"})
+    manager = JobManager()
+    app = create_bridge_app(config=config, job_manager=manager)
     try:
-        time.sleep(0.05)
-        # Just verify the server is alive (no exception on start).
-        assert srv._thread is not None and srv._thread.is_alive()
+        response = TestClient(app).get("/jobs", headers={"Origin": "https://run.example.com"})
+        assert "access-control-allow-origin" not in response.headers
     finally:
-        srv.stop()
+        manager.stop_worker()
+
+
+def test_bridge_cors_allows_configured_origin() -> None:
+    origin = "https://run.example.com"
+    config = BridgeConfig.from_env(
+        env={ENV_ELABFTW_API_KEY: "5-key", "WALLAC_CORS_ORIGINS": origin}
+    )
+    manager = JobManager()
+    app = create_bridge_app(config=config, job_manager=manager)
+    try:
+        response = TestClient(app).get("/jobs", headers={"Origin": origin})
+        assert response.headers["access-control-allow-origin"] == origin
+    finally:
+        manager.stop_worker()
