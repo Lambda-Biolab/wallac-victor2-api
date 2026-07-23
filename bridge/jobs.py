@@ -249,7 +249,16 @@ class JobManager:
             return list(self._jobs.values())
 
     def request_abort(self, job_id: str) -> bool:
-        """Request abort for a job. Returns True if the job exists and is abortable."""
+        """Request abort for a job.
+
+        Returns True when the abort remains actionable — the job is still
+        non-terminal after synchronizing with any in-flight ``start_run`` —
+        or when the request resulted in ABORTED (the accepted -> aborted
+        contract, docs/abort-recovery.md). Returns False if the job does not
+        exist, was already terminal when called, or became terminal for
+        another reason (e.g. start_run failed) while we waited for
+        ``_run_start_lock`` — the abort is inert in that case.
+        """
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None or job.status in TERMINAL_STATES:
@@ -261,8 +270,18 @@ class JobManager:
         # Then synchronize with BridgeExecutor._start_job_run. Do not hold the
         # manager lock while start_run performs network I/O.
         with job._run_start_lock:
-            pass
-        return True
+            # Re-read the authoritative status after any in-flight start_run
+            # has released this lock. Only ``_run_start_lock`` is held here;
+            # the manager lock is NOT reacquired, so no lock-ordering cycle is
+            # introduced (no other site nests the two locks).
+            status = job.status
+        # ABORTED means this request (or a concurrent one) won the race —
+        # report success. Any other terminal state means the job reached a
+        # non-abort outcome while we waited (start_run failed, completed,
+        # operator review): the abort is inert, so report False.
+        if status == ABORTED:
+            return True
+        return status not in TERMINAL_STATES
 
     def start_worker(self) -> None:
         """Start the background worker thread that executes jobs."""

@@ -78,6 +78,12 @@ class MockVmAgentClient:
         self.abort_permanent_error: VmAgentError | None = None
         self.abort_calls: list[str] = []
         self.deleted_protocols: list[int] = []
+        self.abort_responses: list[dict[str, Any]] | None = None
+        self.abort_default_response: dict[str, Any] = {
+            "ok": True,
+            "is_running": False,
+            "state_text": "aborted",
+        }
         self.fail_get_jobs = False
         self.jobs = [
             {
@@ -164,13 +170,16 @@ class MockVmAgentClient:
     def delete_protocol(self, protocol_id: int) -> None:
         self.deleted_protocols.append(protocol_id)
 
-    def abort_run(self, run_id: str) -> None:
+    def abort_run(self, run_id: str) -> dict[str, Any]:
         self.abort_calls.append(run_id)
         if self.abort_permanent_error is not None:
             raise self.abort_permanent_error
         if self.abort_425_remaining:
             self.abort_425_remaining -= 1
             raise VmAgentError("too early", status_code=425)
+        if self.abort_responses is not None:
+            return self.abort_responses.pop(0)
+        return dict(self.abort_default_response)
 
 
 # --- Fixtures ---
@@ -236,19 +245,71 @@ class TestGeneratedProtocolHashVerification:
         spec_bytes, spec_hash = canonicalize_and_hash(spec)
         return spec, spec_bytes, spec_hash
 
+    @staticmethod
+    def _make_layout_spec() -> dict[str, Any]:
+        return {
+            "schema_name": "wallac.layout",
+            "schema_version": 1,
+            "plate_type": "96-well",
+            "wells": [{"well_name": "A1", "role": "measured"}],
+        }
+
+    @staticmethod
+    def _make_analysis_spec() -> dict[str, Any]:
+        return {
+            "schema_name": "wallac.analysis",
+            "schema_version": 1,
+            "blank_subtraction": {"enabled": False, "blank_wells": []},
+            "replicate_aggregation": {"enabled": False, "group_by": "replicate_group"},
+            "normalization": {"enabled": False, "control_type": "", "target_value": 1.0},
+            "thresholds": [],
+            "exclusions": [],
+            "outputs": ["raw_results", "analyzed_wells"],
+        }
+
+    def _stage_full_refs(
+        self,
+        elabftw: MockElabftwClient,
+        method_spec: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Stage method/layout/analysis uploads and return (method_ref,
+        layout_ref, analysis_ref) for the ``generated_protocol`` schema
+        contract that now requires all three signed refs."""
+        if method_spec is None:
+            method_spec, _, _ = self._make_method_spec()
+        layout_spec = self._make_layout_spec()
+        analysis_spec = self._make_analysis_spec()
+        method_bytes, method_hash = canonicalize_and_hash(method_spec)
+        layout_bytes, layout_hash = canonicalize_and_hash(layout_spec)
+        analysis_bytes, analysis_hash = canonicalize_and_hash(analysis_spec)
+        elabftw.add_upload(42, 5001, method_bytes)
+        elabftw.add_upload(43, 5002, layout_bytes)
+        elabftw.add_upload(44, 5003, analysis_bytes)
+        return (
+            {"object_id": 42, "hash": method_hash, "json_attachment_id": 5001},
+            {"object_id": 43, "hash": layout_hash, "json_attachment_id": 5002},
+            {"object_id": 44, "hash": analysis_hash, "json_attachment_id": 5003},
+        )
+
     def _make_job(
         self,
         method_ref: dict[str, Any],
         dry_run: bool = True,
+        layout_ref: dict[str, Any] | None = None,
+        analysis_ref: dict[str, Any] | None = None,
     ) -> Job:
+        # Reason: generated_protocol contract requires all three signed refs
+        # (schemas.py ExecutionMode docstring + docs/plans/
+        # wallac-protocol-authoring.md). Tests covering only method_ref
+        # integrity pass empty layout/analysis refs explicitly to assert
+        # the strict-missing-ref handling; full-path tests pass real refs.
         return Job(
             job_id="test-job-001",
             title="Test Job",
             execution_mode="generated_protocol",
             method_ref=method_ref,
-            # To keep things simple in the test, we don't need layout/analysis
-            # for the hash verification test -- we just need method_ref to be
-            # checked.
+            layout_ref=layout_ref or {},
+            analysis_ref=analysis_ref or {},
             created_at="2025-01-01T00:00:00",
         )
 
@@ -258,11 +319,12 @@ class TestGeneratedProtocolHashVerification:
         elabftw: MockElabftwClient,
         spec: dict[str, Any],
     ) -> Job:
-        spec_bytes, spec_hash = canonicalize_and_hash(spec)
-        elabftw.add_upload(42, 5001, spec_bytes)
+        method_ref, layout_ref, analysis_ref = self._stage_full_refs(elabftw, spec)
         job = self._make_job(
-            {"object_id": 42, "hash": spec_hash, "json_attachment_id": 5001},
+            method_ref,
             dry_run=False,
+            layout_ref=layout_ref,
+            analysis_ref=analysis_ref,
         )
         executor(job)
         return job
@@ -277,10 +339,16 @@ class TestGeneratedProtocolHashVerification:
     def test_incomplete_ref_blocks_execution(
         self,
         executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
         ref: dict[str, Any],
         error_fragment: str,
     ) -> None:
-        job = self._make_job(ref, dry_run=False)
+        # Reason: a malformed method_ref must fail closed even when layout/
+        # analysis refs are present and valid. Stage a full valid set and
+        # override only the (malformed) method_ref so the test stays pinned
+        # to method_ref integrity rather than the strict missing-ref gate.
+        _method_ref, layout_ref, analysis_ref = self._stage_full_refs(elabftw)
+        job = self._make_job(ref, dry_run=False, layout_ref=layout_ref, analysis_ref=analysis_ref)
 
         executor_wet(job)
 
@@ -300,15 +368,10 @@ class TestGeneratedProtocolHashVerification:
         matching protocol available, it should proceed to protocol cloning
         and run start.
         """
-        _method_spec, method_bytes, method_hash = self._make_method_spec()
-        elabftw.add_upload(42, 5001, method_bytes)
-
-        ref = {
-            "object_id": 42,
-            "hash": method_hash,
-            "json_attachment_id": 5001,
-        }
-        job = self._make_job(ref, dry_run=False)
+        method_ref, layout_ref, analysis_ref = self._stage_full_refs(elabftw)
+        job = self._make_job(
+            method_ref, dry_run=False, layout_ref=layout_ref, analysis_ref=analysis_ref
+        )
 
         # Execute — the mock has a matching protocol so the full path runs.
         executor_wet(job)
@@ -330,15 +393,23 @@ class TestGeneratedProtocolHashVerification:
         elabftw: MockElabftwClient,
     ) -> None:
         """The documented legacy attachment_id alias remains supported."""
-        _method_spec, method_bytes, method_hash = self._make_method_spec()
+        method_spec, _, _ = self._make_method_spec()
+        method_bytes, method_hash = canonicalize_and_hash(method_spec)
         elabftw.add_upload(42, 5001, method_bytes)
+        # Stage the remaining signed layout/analysis refs alongside the
+        # legacy-named method_ref to satisfy the strict generated_protocol
+        # contract.
+        _m, layout_ref, analysis_ref = self._stage_full_refs(elabftw)
+        legacy_method_ref = {
+            "object_id": 42,
+            "hash": method_hash,
+            "attachment_id": 5001,
+        }
         job = self._make_job(
-            {
-                "object_id": 42,
-                "hash": method_hash,
-                "attachment_id": 5001,
-            },
+            legacy_method_ref,
             dry_run=False,
+            layout_ref=layout_ref,
+            analysis_ref=analysis_ref,
         )
 
         executor_wet(job)
@@ -352,16 +423,13 @@ class TestGeneratedProtocolHashVerification:
         elabftw: MockElabftwClient,
         vm_agent: MockVmAgentClient,
     ) -> None:
-        _method_spec, method_bytes, method_hash = self._make_method_spec()
-        elabftw.add_upload(42, 5001, method_bytes)
+        method_ref, layout_ref, analysis_ref = self._stage_full_refs(elabftw)
         vm_agent.fail_get_jobs = True
         job = self._make_job(
-            {
-                "object_id": 42,
-                "hash": method_hash,
-                "json_attachment_id": 5001,
-            },
+            method_ref,
             dry_run=False,
+            layout_ref=layout_ref,
+            analysis_ref=analysis_ref,
         )
 
         executor_wet(job)
@@ -379,6 +447,8 @@ class TestGeneratedProtocolHashVerification:
         """Hash mismatch blocks execution — job is failed with appropriate error."""
         _method_spec, method_bytes, _method_hash = self._make_method_spec()
         elabftw.add_upload(42, 5001, method_bytes)
+        # Stage valid layout/analysis so the failure is pinned to method download.
+        _m, layout_ref, analysis_ref = self._stage_full_refs(elabftw)
 
         # Use a wrong hash
         wrong_hash = "a" * 64
@@ -388,7 +458,12 @@ class TestGeneratedProtocolHashVerification:
             "hash": wrong_hash,
             "json_attachment_id": 5001,
         }
-        job = self._make_job(ref, dry_run=False)
+        job = self._make_job(
+            ref,
+            dry_run=False,
+            layout_ref=layout_ref,
+            analysis_ref=analysis_ref,
+        )
 
         executor_wet(job)
 
@@ -406,13 +481,19 @@ class TestGeneratedProtocolHashVerification:
         """Missing hash in ref blocks execution — job is failed."""
         _method_spec, method_bytes, _method_hash = self._make_method_spec()
         elabftw.add_upload(42, 5001, method_bytes)
+        _m, layout_ref, analysis_ref = self._stage_full_refs(elabftw)
 
         # Ref without hash (but with valid object_id and attachment_id)
         ref = {
             "object_id": 42,
             "json_attachment_id": 5001,
         }
-        job = self._make_job(ref, dry_run=False)
+        job = self._make_job(
+            ref,
+            dry_run=False,
+            layout_ref=layout_ref,
+            analysis_ref=analysis_ref,
+        )
 
         executor_wet(job)
 
@@ -427,15 +508,10 @@ class TestGeneratedProtocolHashVerification:
         elabftw: MockElabftwClient,
     ) -> None:
         """Dry-run with valid ref completes successfully (validation only)."""
-        _method_spec, method_bytes, method_hash = self._make_method_spec()
-        elabftw.add_upload(42, 5001, method_bytes)
-
-        ref = {
-            "object_id": 42,
-            "hash": method_hash,
-            "json_attachment_id": 5001,
-        }
-        job = self._make_job(ref, dry_run=True)
+        method_ref, layout_ref, analysis_ref = self._stage_full_refs(elabftw)
+        job = self._make_job(
+            method_ref, dry_run=True, layout_ref=layout_ref, analysis_ref=analysis_ref
+        )
 
         executor(job)
 
@@ -450,6 +526,7 @@ class TestGeneratedProtocolHashVerification:
         """Dry-run with hash mismatch still fails closed (pre-execution check)."""
         _method_spec, method_bytes, _method_hash = self._make_method_spec()
         elabftw.add_upload(42, 5001, method_bytes)
+        _m, layout_ref, analysis_ref = self._stage_full_refs(elabftw)
 
         wrong_hash = "b" * 64
         ref = {
@@ -457,7 +534,7 @@ class TestGeneratedProtocolHashVerification:
             "hash": wrong_hash,
             "json_attachment_id": 5001,
         }
-        job = self._make_job(ref, dry_run=True)
+        job = self._make_job(ref, dry_run=True, layout_ref=layout_ref, analysis_ref=analysis_ref)
 
         executor(job)
 
@@ -509,38 +586,80 @@ class TestGeneratedProtocolHashVerification:
         assert "0.000" in body
         assert "999.000" not in body
 
-    def test_clone_failure_falls_back_to_factory_protocol(
+    def test_clone_failure_fails_closed_no_factory_fallback(
         self,
         executor_wet: BridgeExecutor,
         elabftw: MockElabftwClient,
         vm_agent: MockVmAgentClient,
     ) -> None:
-        spec, _, _ = self._make_method_spec()
+        """Clone failure must NOT fall back to the factory protocol.
+
+        The generated-protocol run needs a per-plate clone so the MDB
+        PlateMap covers exactly the signed layout's measured/excluded wells.
+        Running against the factory preset instead would acquire the
+        wrong wells from live hardware. The job must fail closed from a
+        single point (:meth:`_execute_generated_protocol`), and no
+        physical run may be started — the no-physical-work guarantee
+        (docs/architecture-direct-submit.md validated workflow) applied.
+        """
+        method_ref, layout_ref, analysis_ref = self._stage_full_refs(elabftw)
         vm_agent.fail_clone = True
-        layout = {
-            "schema_name": "wallac.layout",
-            "schema_version": 1,
-            "plate_type": "96-well",
-            "wells": [{"well_name": "A1", "role": "measured"}],
-        }
-        layout_bytes, layout_hash = canonicalize_and_hash(layout)
-        elabftw.add_upload(43, 5002, layout_bytes)
-        method_bytes, method_hash = canonicalize_and_hash(spec)
-        elabftw.add_upload(42, 5001, method_bytes)
         job = self._make_job(
-            {"object_id": 42, "hash": method_hash, "json_attachment_id": 5001},
+            method_ref,
             dry_run=False,
+            layout_ref=layout_ref,
+            analysis_ref=analysis_ref,
         )
-        job.layout_ref = {
-            "object_id": 43,
-            "hash": layout_hash,
-            "json_attachment_id": 5002,
-        }
 
         executor_wet(job)
 
-        assert job.status == "completed"
-        assert any(event["event"] == "protocol_clone_failed" for event in job.events)
+        assert job.status == "failed", job.events
+        assert "Protocol clone or plate-map apply failed" in (job.error or "")
+        assert any(event["event"] == "protocol_clone_failed" for event in job.events), job.events
+        # No physical run was started against the factory protocol.
+        assert vm_agent._runs == {}, vm_agent._runs
+        assert vm_agent.requested_job_ids == [], vm_agent.requested_job_ids
+        # Clone failed before any partial copy existed on the instrument,
+        # so there is nothing to clean up.
+        assert vm_agent.deleted_protocols == [], vm_agent.deleted_protocols
+
+    def test_plate_map_failure_fails_closed_and_cleans_partial_clone(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """If clone succeeds but plate-map apply fails, the partial clone
+        must be cleaned up and the job failed — never run against the
+        factory preset.
+
+        Cloning creates a stub protocol on the instrument MDB; without
+        cleanup the orphan would shadow the factory preset on the next
+        assay lookup. The no-physical-work guarantee extends to clone
+        side-effects, not just run start.
+        """
+        method_ref, layout_ref, analysis_ref = self._stage_full_refs(elabftw)
+        # Capture the clone id the executor will mint so we can assert
+        # the partial clone was deleted exactly once.
+        vm_agent.fail_plate_map = True
+        job = self._make_job(
+            method_ref,
+            dry_run=False,
+            layout_ref=layout_ref,
+            analysis_ref=analysis_ref,
+        )
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert "Protocol clone or plate-map apply failed" in (job.error or "")
+        assert any(event["event"] == "plate_map_apply_failed" for event in job.events), job.events
+        # No physical run was started.
+        assert vm_agent._runs == {}, vm_agent._runs
+        assert vm_agent.requested_job_ids == [], vm_agent.requested_job_ids
+        # The partial clone created by clone_protocol was best-effort
+        # cleaned up by the executor before failing the job.
+        assert len(vm_agent.deleted_protocols) == 1, vm_agent.deleted_protocols
 
     def test_abort_request_stops_writeback(
         self,
@@ -552,12 +671,12 @@ class TestGeneratedProtocolHashVerification:
         and writeback entirely. This is the accepted→aborted contract from
         docs/abort-recovery.md — the run is never started, so there is no
         run to abort on the instrument and no results to write back."""
-        spec, _, _ = self._make_method_spec()
-        method_bytes, method_hash = canonicalize_and_hash(spec)
-        elabftw.add_upload(42, 5001, method_bytes)
+        method_ref, layout_ref, analysis_ref = self._stage_full_refs(elabftw)
         job = self._make_job(
-            {"object_id": 42, "hash": method_hash, "json_attachment_id": 5001},
+            method_ref,
             dry_run=False,
+            layout_ref=layout_ref,
+            analysis_ref=analysis_ref,
         )
         job.abort_requested = True
 
@@ -589,6 +708,207 @@ def test_executor_rejects_incomplete_or_unknown_jobs(
     assert job.status == "failed"
     assert job.error
     assert any(event["event"] == "execution_failed" for event in job.events)
+
+
+class TestGeneratedProtocolStrictRefs:
+    """Regression tests for the PREPR blocker: ``generated_protocol``
+    execution must require ``method_ref``, ``layout_ref``, *and*
+    ``analysis_ref`` before dry-run success or any wet hardware start.
+    The ``generated_protocol`` schema contract (``ExecutionMode`` docstring
+    in schemas.py + docs/plans/wallac-protocol-authoring.md "Validated
+    workflow") requires signed method.json, layout.json, and analysis.json;
+    an absent ref means the submission cannot be interpreted and must fail
+    closed *before* downloads/hash-checks/validation/dry-run/run start.
+
+    Previous behavior short-circuited absent layout/analysis refs to an
+    empty dict, passed them through the schema validator (which silently
+    skipped empty structs), and proceeded to ``dry_run_complete`` or a
+    hardware run — violating the no-physical-work guarantee for an
+    incomplete submission. These tests pin the deterministic failure.
+    """
+
+    @staticmethod
+    def _make_method_spec() -> dict[str, Any]:
+        return {
+            "schema_name": "wallac.method",
+            "schema_version": 1,
+            "mode": "photometry",
+            "name": "OD600",
+            "plate_type": "96-well",
+            "photometry": {
+                "filter_id": "P610",
+                "filter_name": "610nm",
+                "read_time_seconds": 1.0,
+            },
+        }
+
+    def _stage_full(
+        self,
+        elabftw: MockElabftwClient,
+        *,
+        skip_method: bool = False,
+        skip_layout: bool = False,
+        skip_analysis: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Stage every signed spec upload; return ``(method_ref, layout_ref,
+        analysis_ref)``. Skipped refs come back as ``{}`` to mirror the
+        shipped-but-incomplete submission that would have the strict gate."""
+        method = self._make_method_spec()
+        layout = {
+            "schema_name": "wallac.layout",
+            "schema_version": 1,
+            "plate_type": "96-well",
+            "wells": [{"well_name": "A1", "role": "measured"}],
+        }
+        analysis = {
+            "schema_name": "wallac.analysis",
+            "schema_version": 1,
+            "blank_subtraction": {"enabled": False, "blank_wells": []},
+            "replicate_aggregation": {"enabled": False, "group_by": "replicate_group"},
+            "normalization": {"enabled": False, "control_type": "", "target_value": 1.0},
+            "thresholds": [],
+            "exclusions": [],
+            "outputs": ["raw_results", "analyzed_wells"],
+        }
+        method_ref: dict[str, Any] = {}
+        layout_ref: dict[str, Any] = {}
+        analysis_ref: dict[str, Any] = {}
+
+        if not skip_method:
+            mb, mh = canonicalize_and_hash(method)
+            elabftw.add_upload(42, 5001, mb)
+            method_ref = {"object_id": 42, "hash": mh, "json_attachment_id": 5001}
+        if not skip_layout:
+            lb, lh = canonicalize_and_hash(layout)
+            elabftw.add_upload(43, 5002, lb)
+            layout_ref = {"object_id": 43, "hash": lh, "json_attachment_id": 5002}
+        if not skip_analysis:
+            ab, ah = canonicalize_and_hash(analysis)
+            elabftw.add_upload(44, 5003, ab)
+            analysis_ref = {"object_id": 44, "hash": ah, "json_attachment_id": 5003}
+        return method_ref, layout_ref, analysis_ref
+
+    def _make_job(
+        self,
+        method_ref: dict[str, Any],
+        layout_ref: dict[str, Any],
+        analysis_ref: dict[str, Any],
+    ) -> Job:
+        return Job(
+            job_id="test-strict-refs",
+            title="Strict Refs",
+            execution_mode="generated_protocol",
+            method_ref=method_ref,
+            layout_ref=layout_ref,
+            analysis_ref=analysis_ref,
+            created_at="2025-01-01T00:00:00",
+        )
+
+    @staticmethod
+    def _assert_missing_ref_blocks(job: Job, vm_agent: MockVmAgentClient) -> None:
+        """The strict-missing-ref gate fires *before* any download attempt,
+        validation, dry-run success, or instrument work."""
+        # Reason: pytest rewrites `assert (... , ...)` as a tuple literal,
+        # which is always truthy. Split into a dedicated assertion so the
+        # behavioral gate is actually exercised.
+        assert any(event["event"] == "missing_required_ref" for event in job.events), job.events
+        assert not any(e["event"] == "specs_downloaded" for e in job.events), job.events
+        assert not any(e["event"] == "specs_validated" for e in job.events), job.events
+        assert not any(e["event"] == "dry_run_complete" for e in job.events), job.events
+        # No instrument work, ever, for a missing ref.
+        assert vm_agent.requested_job_ids == [], vm_agent.requested_job_ids
+        assert vm_agent.deleted_protocols == [], vm_agent.deleted_protocols
+        assert vm_agent.deleted_protocols == [], vm_agent.deleted_protocols
+
+    @pytest.mark.parametrize(
+        ("skip_method", "skip_layout", "skip_analysis", "expected_missing"),
+        [
+            (True, False, False, "method_ref"),
+            (False, True, False, "layout_ref"),
+            (False, False, True, "analysis_ref"),
+        ],
+    )
+    def test_missing_ref_blocks_dry_run(
+        self,
+        executor: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+        skip_method: bool,
+        skip_layout: bool,
+        skip_analysis: bool,
+        expected_missing: str,
+    ) -> None:
+        """A missing ref must fail the job deterministically before dry-run
+        success. The failure names the missing ref and never downloads,
+        validates, or reaches ``dry_run_complete``."""
+        method_ref, layout_ref, analysis_ref = self._stage_full(
+            elabftw,
+            skip_method=skip_method,
+            skip_layout=skip_layout,
+            skip_analysis=skip_analysis,
+        )
+        job = self._make_job(method_ref, layout_ref, analysis_ref)
+
+        executor(job)
+
+        assert job.status == "failed", job.events
+        assert "Missing required ref(s) for generated_protocol mode" in (job.error or "")
+        assert expected_missing in job.error, job.error
+        self._assert_missing_ref_blocks(job, vm_agent)
+
+    @pytest.mark.parametrize(
+        ("skip_layout", "skip_analysis", "expected_missing"),
+        [
+            (True, False, "layout_ref"),
+            (False, True, "analysis_ref"),
+        ],
+    )
+    def test_missing_ref_blocks_wet_hardware_start(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+        skip_layout: bool,
+        skip_analysis: bool,
+        expected_missing: str,
+    ) -> None:
+        """A missing ref must fail the job deterministically before any wet
+        hardware start — the same gate as dry-run, never bypassed by
+        ``dry_run=False``."""
+        method_ref, layout_ref, analysis_ref = self._stage_full(
+            elabftw,
+            skip_layout=skip_layout,
+            skip_analysis=skip_analysis,
+        )
+        job = self._make_job(method_ref, layout_ref, analysis_ref)
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert "Missing required ref(s) for generated_protocol mode" in (job.error or "")
+        assert expected_missing in job.error, job.error
+        self._assert_missing_ref_blocks(job, vm_agent)
+        # No run on the instrument, ever.
+        assert vm_agent._runs == {}, vm_agent._runs
+
+    def test_all_refs_present_passes_strict_gate_in_dry_run(
+        self,
+        executor: BridgeExecutor,
+        elabftw: MockElabftwClient,
+    ) -> None:
+        """Sanity: a complete ref set must still proceed beyond the strict
+        gate to download, validate, and reach ``dry_run_complete`` —
+        confirming the guard only fires on actually-missing refs."""
+        method_ref, layout_ref, analysis_ref = self._stage_full(elabftw)
+        job = self._make_job(method_ref, layout_ref, analysis_ref)
+
+        executor(job)
+
+        assert job.status == "completed", job.events
+        assert not any(e["event"] == "missing_required_ref" for e in job.events), job.events
+        assert any(e["event"] == "specs_downloaded" for e in job.events), job.events
+        assert any(e["event"] == "specs_validated" for e in job.events), job.events
+        assert any(e["event"] == "dry_run_complete" for e in job.events), job.events
 
 
 class TestRunStartAbortOrdering:
@@ -694,6 +1014,30 @@ class TestAbortFailureSemantics:
         }
         spec_bytes, spec_hash = canonicalize_and_hash(spec)
         elabftw.add_upload(42, 5001, spec_bytes)
+        # Reason: generated_protocol contract requires all three signed refs
+        # (schemas.py ExecutionMode docstring). Stage valid layout/analysis
+        # uploads so the strict-missing-ref gate does not short-circuit the
+        # abort-failure path under test.
+        layout = {
+            "schema_name": "wallac.layout",
+            "schema_version": 1,
+            "plate_type": "96-well",
+            "wells": [{"well_name": "A1", "role": "measured"}],
+        }
+        layout_bytes, layout_hash = canonicalize_and_hash(layout)
+        elabftw.add_upload(43, 5002, layout_bytes)
+        analysis = {
+            "schema_name": "wallac.analysis",
+            "schema_version": 1,
+            "blank_subtraction": {"enabled": False, "blank_wells": []},
+            "replicate_aggregation": {"enabled": False, "group_by": "replicate_group"},
+            "normalization": {"enabled": False, "control_type": "", "target_value": 1.0},
+            "thresholds": [],
+            "exclusions": [],
+            "outputs": ["raw_results", "analyzed_wells"],
+        }
+        analysis_bytes, analysis_hash = canonicalize_and_hash(analysis)
+        elabftw.add_upload(44, 5003, analysis_bytes)
         ref = {
             "object_id": 42,
             "hash": spec_hash,
@@ -704,6 +1048,16 @@ class TestAbortFailureSemantics:
             title="Abort Fail",
             execution_mode="generated_protocol",
             method_ref=ref,
+            layout_ref={
+                "object_id": 43,
+                "hash": layout_hash,
+                "json_attachment_id": 5002,
+            },
+            analysis_ref={
+                "object_id": 44,
+                "hash": analysis_hash,
+                "json_attachment_id": 5003,
+            },
             created_at="2025-01-01T00:00:00",
         )
         # Reason: _start_job_run serializes against abort_requested and
@@ -823,6 +1177,44 @@ class TestAbortFailureSemantics:
         assert job.status == "aborted", job.events
         assert len(vm_agent.abort_calls) == 2
         assert elabftw.uploaded_files == []
+
+    def test_abort_response_ok_false_keeps_polling_for_measured(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An HTTP-200 abort response with ``ok=false`` and ``is_running=true``
+        means the vm-agent accepted the request but the instrument is still
+        running. The bridge must keep polling and let a subsequent measured
+        run complete with results — not mislabel the run aborted or skip
+        writeback (regression for the 200-ok=false vm-agent contract)."""
+        job, _spec, _hash, _ = self._make_aborted_job(elabftw)
+
+        vm_agent.abort_responses = [
+            {"ok": False, "is_running": True, "state_text": "still running"},
+        ]
+        vm_agent.run_states = ["measured"]
+
+        # Reason: _start_job_run serializes against abort_requested. Raise
+        # the flag after the run is started so _poll_run triggers _try_abort.
+        original_start = executor_wet._start_job_run
+
+        def start_then_flag(job_: Job, protocol: str | int) -> str:
+            run_id = original_start(job_, protocol)
+            if run_id:
+                job_.abort_requested = True
+            return run_id
+
+        monkeypatch.setattr(executor_wet, "_start_job_run", start_then_flag)
+
+        executor_wet(job)
+
+        assert job.status == "completed", job.events
+        assert vm_agent.abort_calls == [job.run_id]
+        assert any(e["event"] == "abort_in_progress" for e in job.events), job.events
+        assert any(name.endswith("_raw_results.json") for name in elabftw.uploaded_files)
 
 
 class TestResultsContractForOperatorReview:
@@ -984,24 +1376,12 @@ class TestResultsContractForOperatorReview:
         """A well record with a zero reading (``0.0``) is a real measurement
         and must complete the job — distinct from "no wells returned".
 
-        Generated_protocol mode without an analysis_ref keeps the analysis
-        step unrequested, so the contract at the executor level pins here
-        alongside ``test_zero_reading_is_preserved_in_results_html``.
+        Uses the full ``_make_full_job`` helper so the strict-missing-ref
+        gate does not short-circuit. The operator-review contract at the
+        executor level pins here alongside
+        ``test_zero_reading_is_preserved_in_results_html``.
         """
-        method_spec = self._make_method_spec()
-        method_bytes, method_hash = canonicalize_and_hash(method_spec)
-        elabftw.add_upload(42, 5001, method_bytes)
-        job = Job(
-            job_id="test-job-zero",
-            title="Zero Reading",
-            execution_mode="generated_protocol",
-            method_ref={
-                "object_id": 42,
-                "hash": method_hash,
-                "json_attachment_id": 5001,
-            },
-            created_at="2025-01-01T00:00:00",
-        )
+        job = self._make_full_job(elabftw)
         executor_wet.vm_agent.job_wells = [
             {"well": "A01", "primary_value": "", "od": 0.0, "counts": 999}
         ]
@@ -1043,6 +1423,980 @@ class TestResultsContractForOperatorReview:
         # ...but the terminal completion event must NOT be emitted.
         assert not any(e["event"] == "execution_completed" for e in job.events), job.events
         assert any(e["event"] == "operator_review_required" for e in job.events)
+
+
+class TestGeneratedProtocolSpecValidation:
+    """Regression tests for the PREPR blocker: the executor downloaded
+    hash-valid method/layout/analysis dicts but did not fail them closed
+    through MethodSpec/LayoutSpec/AnalysisSpec schema/version validation
+    before dry-run success or hardware start (docs/plans/
+    wallac-protocol-authoring.md "Validated workflow").
+
+    The download path only verifies the SHA-256 of the attachment bytes. It
+    does not check that the parsed JSON conforms to a supported schema
+    version, has valid well roles, or uses in-range well names. An
+    unsupported schema version or a malformed layout must fail the job
+    *before* any instrument work or dry-run success, surface the
+    ``spec_validation_failed`` event, and preserve the canonical dict (no
+    clone, no run, no protocol delete) so a retry can re-submit a corrected
+    signed object.
+    """
+
+    @staticmethod
+    def _make_method_spec() -> dict[str, Any]:
+        return {
+            "schema_name": "wallac.method",
+            "schema_version": 1,
+            "mode": "photometry",
+            "name": "OD600",
+            "plate_type": "96-well",
+            "photometry": {
+                "filter_id": "P610",
+                "filter_name": "610nm",
+                "read_time_seconds": 1.0,
+            },
+        }
+
+    @staticmethod
+    def _make_layout_spec(
+        wells: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        if wells is None:
+            wells = [{"well_name": "A1", "role": "measured"}]
+        return {
+            "schema_name": "wallac.layout",
+            "schema_version": 1,
+            "plate_type": "96-well",
+            "wells": wells,
+        }
+
+    @staticmethod
+    def _make_analysis_spec() -> dict[str, Any]:
+        return {
+            "schema_name": "wallac.analysis",
+            "schema_version": 1,
+            "blank_subtraction": {"enabled": False, "blank_wells": []},
+            "replicate_aggregation": {"enabled": False, "group_by": "replicate_group"},
+            "normalization": {"enabled": False, "control_type": "", "target_value": 1.0},
+            "thresholds": [],
+            "exclusions": [],
+            "outputs": ["raw_results", "analyzed_wells"],
+        }
+
+    def _stage_specs(
+        self,
+        elabftw: MockElabftwClient,
+        method: dict[str, Any],
+        layout: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Stage method + layout + analysis uploads and return refs dict.
+
+        Reason: the ``generated_protocol`` schema contract requires all
+        three signed refs before dry-run success or any hardware start — a
+        missing ref now fails the job upstream in :meth:`_load_generated_specs`
+        and never reaches this validator's failure mode.
+        Default-staging a valid layout and a valid analysis keeps every spec-
+        validation test pinned to the schema/version/role parsing path it
+        claims to exercise. Tests that need an invalid layout override the
+        ``layout`` kwarg; tests that need an invalid analysis override the
+        analysis_ref entry via :meth:`_stage_analysis` (which re-stages at
+        the same upload slot, shadowing this default).
+        """
+        method_bytes, method_hash = canonicalize_and_hash(method)
+        elabftw.add_upload(42, 5001, method_bytes)
+        if layout is None:
+            layout = self._make_layout_spec()
+        layout_bytes, layout_hash = canonicalize_and_hash(layout)
+        elabftw.add_upload(43, 5002, layout_bytes)
+        analysis = self._make_analysis_spec()
+        analysis_bytes, analysis_hash = canonicalize_and_hash(analysis)
+        elabftw.add_upload(44, 5003, analysis_bytes)
+        refs: dict[str, Any] = {
+            "method_ref": {
+                "object_id": 42,
+                "hash": method_hash,
+                "json_attachment_id": 5001,
+            },
+            "layout_ref": {
+                "object_id": 43,
+                "hash": layout_hash,
+                "json_attachment_id": 5002,
+            },
+            "analysis_ref": {
+                "object_id": 44,
+                "hash": analysis_hash,
+                "json_attachment_id": 5003,
+            },
+        }
+        return refs
+
+    def _make_job(
+        self,
+        refs: dict[str, Any],
+    ) -> Job:
+        return Job(
+            job_id="test-job-spec-validation",
+            title="Spec Validation",
+            execution_mode="generated_protocol",
+            method_ref=refs["method_ref"],
+            layout_ref=refs.get("layout_ref", {}),
+            analysis_ref=refs.get("analysis_ref", {}),
+            created_at="2025-01-01T00:00:00",
+        )
+
+    def _assert_no_physical_work(
+        self,
+        job: Job,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """The failed validation must not start a run, clone a protocol,
+        or request any MDB results."""
+        assert job.run_id == ""
+        assert vm_agent._runs == {}, vm_agent._runs
+        assert vm_agent.deleted_protocols == [], vm_agent.deleted_protocols
+        assert vm_agent.requested_job_ids == [], vm_agent.requested_job_ids
+
+    def test_unsupported_method_schema_version_fails_in_dry_run(
+        self,
+        executor: BridgeExecutor,
+        elabftw: MockElabftwClient,
+    ) -> None:
+        """A method spec with an unsupported schema version (e.g. v2) must
+        fail closed in the dry-run path before ``dry_run_complete`` is
+        emitted. The hash is valid; only the schema version is not."""
+        method = self._make_method_spec()
+        method["schema_version"] = 2
+
+        refs = self._stage_specs(elabftw, method)
+        job = self._make_job(refs)
+
+        executor(job)
+
+        assert job.status == "failed", job.events
+        assert "Spec validation failed for method spec" in job.error
+        assert any(e["event"] == "spec_validation_failed" for e in job.events), job.events
+        assert not any(e["event"] == "dry_run_complete" for e in job.events), job.events
+        assert not any(e["event"] == "specs_validated" for e in job.events), job.events
+
+    def test_unsupported_method_schema_version_fails_in_wet_path(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """In the wet path, an unsupported method schema version must fail
+        before any instrument work is started, even when a matching
+        protocol is available on the vm-agent."""
+        method = self._make_method_spec()
+        method["schema_version"] = 2
+
+        refs = self._stage_specs(elabftw, method)
+        job = self._make_job(refs)
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert "Spec validation failed for method spec" in job.error
+        assert any(e["event"] == "spec_validation_failed" for e in job.events)
+        self._assert_no_physical_work(job, vm_agent)
+
+    def test_invalid_layout_role_fails_in_dry_run(
+        self,
+        executor: BridgeExecutor,
+        elabftw: MockElabftwClient,
+    ) -> None:
+        """A layout spec with an unknown ``role`` must fail closed in the
+        dry-run path. ``WellSpec.from_dict`` raises ``ValueError`` for
+        invalid roles; the executor must convert that into a fail-closed
+        job rather than silently dropping the well."""
+        method = self._make_method_spec()
+        layout = self._make_layout_spec([{"well_name": "A1", "role": "totally_bogus"}])
+
+        refs = self._stage_specs(elabftw, method, layout)
+        job = self._make_job(refs)
+
+        executor(job)
+
+        assert job.status == "failed", job.events
+        assert "Spec validation failed for layout spec" in job.error
+        assert "Invalid well role" in job.error
+        assert any(e["event"] == "spec_validation_failed" for e in job.events)
+        assert not any(e["event"] == "dry_run_complete" for e in job.events)
+
+    def test_invalid_layout_role_fails_in_wet_path_before_run_start(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """In the wet path, an invalid layout role must fail closed before
+        ``_match_protocol_from_method`` runs or any clone/start is issued,
+        even when a matching factory protocol exists on the instrument."""
+        method = self._make_method_spec()
+        layout = self._make_layout_spec([{"well_name": "A1", "role": "magic"}])
+
+        refs = self._stage_specs(elabftw, method, layout)
+        job = self._make_job(refs)
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert "Spec validation failed for layout spec" in job.error
+        assert "Invalid well role" in job.error
+        assert any(e["event"] == "spec_validation_failed" for e in job.events)
+        # No protocol matching/clone/run since validation precedes them.
+        assert not any(e["event"] == "protocol_matched" for e in job.events), job.events
+        self._assert_no_physical_work(job, vm_agent)
+
+    def test_invalid_well_name_fails_before_run(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """An out-of-range well name must fail closed before any instrument
+        work — the layout cannot be applied to the instrument's plate map."""
+        method = self._make_method_spec()
+        layout = self._make_layout_spec([{"well_name": "Z9", "role": "measured"}])
+
+        refs = self._stage_specs(elabftw, method, layout)
+        job = self._make_job(refs)
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert "Spec validation failed for layout spec" in job.error
+        assert "Invalid well name" in job.error
+        assert any(e["event"] == "spec_validation_failed" for e in job.events)
+        self._assert_no_physical_work(job, vm_agent)
+
+    def test_unsupported_analysis_schema_version_fails_before_run(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """An analysis spec with an unsupported schema version must fail
+        closed before any instrument work, even though analysis is only
+        applied at write-back time. The signed version could not be
+        interpreted, so the run must not start."""
+        method = self._make_method_spec()
+        analysis = {
+            "schema_name": "wallac.analysis",
+            "schema_version": 2,  # unsupported
+            "blank_subtraction": {"enabled": False, "blank_wells": []},
+            "replicate_aggregation": {"enabled": False, "group_by": "replicate_group"},
+            "normalization": {"enabled": False, "control_type": "", "target_value": 1.0},
+            "thresholds": [],
+            "exclusions": [],
+            "outputs": [],
+        }
+        refs = self._stage_specs(elabftw, method)
+        analysis_bytes, analysis_hash = canonicalize_and_hash(analysis)
+        elabftw.add_upload(44, 5003, analysis_bytes)
+        refs["analysis_ref"] = {
+            "object_id": 44,
+            "hash": analysis_hash,
+            "json_attachment_id": 5003,
+        }
+        job = self._make_job(refs)
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert "Spec validation failed for analysis spec" in job.error
+        assert any(e["event"] == "spec_validation_failed" for e in job.events)
+        self._assert_no_physical_work(job, vm_agent)
+
+    def test_valid_specs_emit_validated_event_before_dry_run_complete(
+        self,
+        executor: BridgeExecutor,
+        elabftw: MockElabftwClient,
+    ) -> None:
+        """A complete, schema-valid spec set must emit ``specs_validated``
+        before ``dry_run_complete`` — proving the gate is exercised on the
+        success path too, not just the failure path."""
+        method = self._make_method_spec()
+        layout = self._make_layout_spec()
+        refs = self._stage_specs(elabftw, method, layout)
+        job = self._make_job(refs)
+
+        executor(job)
+
+        assert job.status == "completed", job.events
+        validated_idx = next(
+            (i for i, e in enumerate(job.events) if e["event"] == "specs_validated"),
+            None,
+        )
+        dry_run_idx = next(
+            (i for i, e in enumerate(job.events) if e["event"] == "dry_run_complete"),
+            None,
+        )
+        assert validated_idx is not None, job.events
+        assert dry_run_idx is not None, job.events
+        assert validated_idx < dry_run_idx, job.events
+
+    def _stage_analysis(
+        self,
+        elabftw: MockElabftwClient,
+        refs: dict[str, Any],
+        analysis: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Stage an analysis spec alongside refs produced by _stage_specs."""
+        analysis_bytes, analysis_hash = canonicalize_and_hash(analysis)
+        elabftw.add_upload(44, 5003, analysis_bytes)
+        refs["analysis_ref"] = {
+            "object_id": 44,
+            "hash": analysis_hash,
+            "json_attachment_id": 5003,
+        }
+        return refs
+
+    def test_method_missing_required_mode_field_fails_before_run(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """A hash-valid method spec missing the required ``mode`` field
+        surfaces a ``KeyError`` from ``MethodSpec.from_dict`` direct-key
+        access (``d["mode"]``). The executor must normalize that into the
+        existing fail-closed path (``spec_validation_failed`` + ``failed``)
+        rather than letting it propagate out of the worker thread.
+        """
+        method = self._make_method_spec()
+        del method["mode"]
+        refs = self._stage_specs(elabftw, method)
+        job = self._make_job(refs)
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert "Spec validation failed for method spec" in job.error
+        assert any(e["event"] == "spec_validation_failed" for e in job.events), job.events
+        self._assert_no_physical_work(job, vm_agent)
+
+    def test_method_missing_required_name_field_fails_before_run(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """A hash-valid method spec missing the required ``name`` field
+        surfaces a ``KeyError`` from ``d["name"]`` and must fail closed
+        before dry-run success or any hardware start, identically to the
+        schema-version guard.
+        """
+        method = self._make_method_spec()
+        del method["name"]
+        refs = self._stage_specs(elabftw, method)
+        job = self._make_job(refs)
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert "Spec validation failed for method spec" in job.error
+        assert any(e["event"] == "spec_validation_failed" for e in job.events), job.events
+        self._assert_no_physical_work(job, vm_agent)
+
+    def test_method_missing_photometry_settings_fails_before_run(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """A photometry method spec without the ``photometry`` block
+        surfaces a ``KeyError`` (the parser uses ``d["photometry"]`` rather
+        than ``.get``), which the executor must route to the fail-closed
+        path instead of crashing the worker thread.
+        """
+        method = self._make_method_spec()
+        del method["photometry"]
+        refs = self._stage_specs(elabftw, method)
+        job = self._make_job(refs)
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert "Spec validation failed for method spec" in job.error
+        assert any(e["event"] == "spec_validation_failed" for e in job.events), job.events
+        self._assert_no_physical_work(job, vm_agent)
+
+    def test_method_wrong_typed_read_time_fails_before_run(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """A hash-valid method whose ``photometry.read_time_seconds`` is a
+        list (not a number) raises ``TypeError`` on ``float(...)`` coercion
+        inside ``PhotometrySettings.from_dict``. The executor must normalize
+        that into the fail-closed path rather than letting it propagate.
+        """
+        method = self._make_method_spec()
+        method["photometry"]["read_time_seconds"] = []
+        refs = self._stage_specs(elabftw, method)
+        job = self._make_job(refs)
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert "Spec validation failed for method spec" in job.error
+        assert any(e["event"] == "spec_validation_failed" for e in job.events), job.events
+        self._assert_no_physical_work(job, vm_agent)
+
+    def test_layout_missing_wells_fails_before_run(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """A layout spec missing the required ``wells`` field surfaces a
+        ``KeyError`` from ``LayoutSpec.from_dict`` (``d["wells"]``) and
+        must fail closed before dry-run or run start.
+        """
+        method = self._make_method_spec()
+        layout = {
+            "schema_name": "wallac.layout",
+            "schema_version": 1,
+            "plate_type": "96-well",
+        }  # no 'wells'
+        refs = self._stage_specs(elabftw, method, layout)
+        job = self._make_job(refs)
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert "Spec validation failed for layout spec" in job.error
+        assert any(e["event"] == "spec_validation_failed" for e in job.events), job.events
+        self._assert_no_physical_work(job, vm_agent)
+
+    def test_layout_well_missing_required_name_fails_before_run(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """A layout well dict missing ``well_name`` surfaces a ``KeyError``
+        from ``WellSpec.from_dict`` (``d["well_name"]``) and must fail
+        closed rather than silently dropping the well.
+        """
+        method = self._make_method_spec()
+        layout = self._make_layout_spec([{"role": "measured"}])  # no 'well_name'
+        refs = self._stage_specs(elabftw, method, layout)
+        job = self._make_job(refs)
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert "Spec validation failed for layout spec" in job.error
+        assert any(e["event"] == "spec_validation_failed" for e in job.events), job.events
+        self._assert_no_physical_work(job, vm_agent)
+
+    def test_layout_wells_wrong_type_fails_before_run(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """A layout whose ``wells`` is a string (not a list of dicts) raises
+        ``TypeError`` when ``WellSpec.from_dict`` indexes into each entry.
+        The executor must route this malformed-but-hash-valid layout into the
+        fail-closed path instead of crashing the worker.
+        """
+        method = self._make_method_spec()
+        layout = self._make_layout_spec()
+        layout["wells"] = "not-a-list"
+        refs = self._stage_specs(elabftw, method, layout)
+        job = self._make_job(refs)
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert "Spec validation failed for layout spec" in job.error
+        assert any(e["event"] == "spec_validation_failed" for e in job.events), job.events
+        self._assert_no_physical_work(job, vm_agent)
+
+    def test_threshold_missing_required_value_fails_before_run(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """An analysis threshold rule missing the required ``value`` field
+        surfaces a ``KeyError`` from ``ThresholdRule.from_dict`` and must
+        fail closed before any instrument work, even though analysis is
+        only applied at write-back time.
+        """
+        method = self._make_method_spec()
+        analysis = {
+            "schema_name": "wallac.analysis",
+            "schema_version": 1,
+            "blank_subtraction": {"enabled": False, "blank_wells": []},
+            "replicate_aggregation": {"enabled": False, "group_by": "replicate_group"},
+            "normalization": {"enabled": False, "control_type": "", "target_value": 1.0},
+            "thresholds": [
+                {"name": "t", "metric": "primary_value", "operator": ">="},  # no 'value'
+            ],
+            "exclusions": [],
+            "outputs": [],
+        }
+        refs = self._stage_specs(elabftw, method)
+        refs = self._stage_analysis(elabftw, refs, analysis)
+        job = self._make_job(refs)
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert "Spec validation failed for analysis spec" in job.error
+        assert any(e["event"] == "spec_validation_failed" for e in job.events), job.events
+        self._assert_no_physical_work(job, vm_agent)
+
+    def test_threshold_wrong_typed_value_fails_before_run(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """An analysis threshold whose ``value`` is a dict (not a number)
+        raises ``TypeError`` on ``float(...)`` coercion. The executor must
+        normalize that into the fail-closed path before run start.
+        """
+        method = self._make_method_spec()
+        analysis = {
+            "schema_name": "wallac.analysis",
+            "schema_version": 1,
+            "blank_subtraction": {"enabled": False, "blank_wells": []},
+            "replicate_aggregation": {"enabled": False, "group_by": "replicate_group"},
+            "normalization": {"enabled": False, "control_type": "", "target_value": 1.0},
+            "thresholds": [
+                {"name": "t", "metric": "primary_value", "operator": ">=", "value": {}},
+            ],
+            "exclusions": [],
+            "outputs": [],
+        }
+        refs = self._stage_specs(elabftw, method)
+        refs = self._stage_analysis(elabftw, refs, analysis)
+        job = self._make_job(refs)
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert "Spec validation failed for analysis spec" in job.error
+        assert any(e["event"] == "spec_validation_failed" for e in job.events), job.events
+        self._assert_no_physical_work(job, vm_agent)
+
+    @pytest.mark.parametrize(
+        ("kind", "make_invalid_spec", "expected_message_fragment"),
+        [
+            (
+                "method",
+                lambda: {},
+                "Spec validation failed for method spec",
+            ),
+            (
+                "layout",
+                lambda: {},
+                "Spec validation failed for layout spec",
+            ),
+            (
+                "analysis",
+                lambda: {},
+                "Spec validation failed for analysis spec",
+            ),
+        ],
+    )
+    def test_empty_hash_valid_spec_dict_fails_closed(
+        self,
+        executor: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        kind: str,
+        make_invalid_spec,
+        expected_message_fragment: str,
+    ) -> None:
+        """A hash-valid attachment that decodes to an empty JSON object
+        ``{}`` must fail closed through the schema validator before
+        ``dry_run_complete`` — removing the previous defensive skip that
+        silently treated an empty spec as valid.
+
+        The empty dict feeds ``validate_schema_identity("", 0)`` which
+        raises ``BridgeError(SCHEMA_UNSUPPORTED)``; the executor must
+        route that into the existing ``spec_validation_failed`` event +
+        ``failed`` status, never reaching dry-run success.
+        """
+        method = self._make_method_spec()
+        refs = self._stage_specs(elabftw, method)
+        empty_spec = make_invalid_spec()
+        empty_bytes, empty_hash = canonicalize_and_hash(empty_spec)
+        slot = {"method": 42, "layout": 43, "analysis": 44}[kind]
+        upload = {"method": 5001, "layout": 5002, "analysis": 5003}[kind]
+        elabftw.add_upload(slot, upload, empty_bytes)
+        refs[f"{kind}_ref"] = {
+            "object_id": slot,
+            "hash": empty_hash,
+            "json_attachment_id": upload,
+        }
+        job = self._make_job(refs)
+
+        executor(job)
+
+        assert job.status == "failed", job.events
+        assert expected_message_fragment in (job.error or "")
+        assert any(e["event"] == "spec_validation_failed" for e in job.events), job.events
+        # Empty spec must never bypass validation into a no-op dry run.
+        assert not any(e["event"] == "dry_run_complete" for e in job.events), job.events
+        assert not any(e["event"] == "specs_validated" for e in job.events), job.events
+
+    def test_empty_method_spec_dict_fails_closed_in_wet_path(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """In the wet path, an empty (hash-valid) method spec must fail
+        before any protocol matching, cloning, or run start."""
+        method = self._make_method_spec()
+        refs = self._stage_specs(elabftw, method)
+        empty_bytes, empty_hash = canonicalize_and_hash({})
+        elabftw.add_upload(42, 5001, empty_bytes)
+        refs["method_ref"] = {
+            "object_id": 42,
+            "hash": empty_hash,
+            "json_attachment_id": 5001,
+        }
+        job = self._make_job(refs)
+
+        executor_wet(job)
+
+        assert job.status == "failed", job.events
+        assert "Spec validation failed for method spec" in (job.error or "")
+        assert any(e["event"] == "spec_validation_failed" for e in job.events), job.events
+        self._assert_no_physical_work(job, vm_agent)
+
+    @pytest.mark.parametrize(
+        "slot,upload,kind,expected",
+        [
+            (45, 5001, "method", "wallac.method"),
+            (45, 5002, "layout", "wallac.layout"),
+            (45, 5003, "analysis", "wallac.analysis"),
+        ],
+    )
+    def test_wrong_kind_ref_fails_closed(
+        self,
+        executor: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+        slot: int,
+        upload: int,
+        kind: str,
+        expected: str,
+    ) -> None:
+        """A hash-valid ref pointing at the wrong schema kind must fail
+        closed before dry-run/hardware, even though ``validate_schema_identity``
+        would otherwise accept the schema globally.
+
+        The executor must check the expected ``schema_name`` for the ref
+        slot *before* running the parser, so a ``method_ref`` whose bytes
+        describe a ``wallac.layout`` object (or vice versa) cannot silently
+        flow into the matching/layout/analysis path.
+
+        For each slot, the test overrides the ref with bytes encoding the
+        *opposite* kind of spec. The method slot receives a layout-shaped
+        spec, the layout slot receives an analysis-shaped spec, and the
+        analysis slot receives a method-shaped spec — three concrete
+        permutations of the same wrong-kind class of bug.
+        """
+        method = self._make_method_spec()
+        refs = self._stage_specs(elabftw, method)
+        opposite = {
+            "method": self._make_layout_spec,
+            "layout": self._make_analysis_spec,
+            "analysis": self._make_method_spec,
+        }[kind]
+        wrong_bytes, wrong_hash = canonicalize_and_hash(opposite())
+        elabftw.add_upload(slot, upload, wrong_bytes)
+        refs[f"{kind}_ref"] = {
+            "object_id": slot,
+            "hash": wrong_hash,
+            "json_attachment_id": upload,
+        }
+        job = self._make_job(refs)
+
+        executor(job)
+
+        assert job.status == "failed", job.events
+        assert "expected schema_name" in (job.error or ""), job.error
+        assert any(
+            f"expected={expected}" in e["detail"] and e["event"] == "spec_validation_failed"
+            for e in job.events
+        ), job.events
+        self._assert_no_physical_work(job, vm_agent)
+
+
+class TestGeneratedProtocolZeroAcquisitionLayout:
+    """Regression tests for the PREPR blocker: a generated layout whose
+    wells are empty (``wells: []``) or entirely ``skipped`` produces a
+    zero-acquisition MDB PlateMap. The executor must fail the job
+    deterministically *before* ``dry_run_complete``, protocol matching/
+    clone, or any hardware start — never report success for a no-op run,
+    and never reach :meth:`_clone_for_layout` with an empty well set (which
+    previously fell back to the factory protocol and acquired all 96 wells).
+
+    These tests reuse the existing ``spec_validation_failed`` / ``failed`` /
+    ``execution_failed`` failure vocabulary plus the dedicated
+    ``layout_no_acquired_wells`` event so consumers can distinguish a zero-
+    acquisition layout failure from a syntax-level spec failure.
+    """
+
+    @staticmethod
+    def _make_method_spec() -> dict[str, Any]:
+        return {
+            "schema_name": "wallac.method",
+            "schema_version": 1,
+            "mode": "photometry",
+            "name": "OD600",
+            "plate_type": "96-well",
+            "photometry": {
+                "filter_id": "P610",
+                "filter_name": "610nm",
+                "read_time_seconds": 1.0,
+            },
+        }
+
+    @staticmethod
+    def _make_analysis_spec() -> dict[str, Any]:
+        return {
+            "schema_name": "wallac.analysis",
+            "schema_version": 1,
+            "blank_subtraction": {"enabled": False, "blank_wells": []},
+            "replicate_aggregation": {"enabled": False, "group_by": "replicate_group"},
+            "normalization": {"enabled": False, "control_type": "", "target_value": 1.0},
+            "thresholds": [],
+            "exclusions": [],
+            "outputs": ["raw_results", "analyzed_wells"],
+        }
+
+    @staticmethod
+    def _make_layout_spec(wells: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "schema_name": "wallac.layout",
+            "schema_version": 1,
+            "plate_type": "96-well",
+            "wells": wells,
+        }
+
+    def _stage_full(
+        self,
+        elabftw: MockElabftwClient,
+        layout_wells: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        method = self._make_method_spec()
+        layout = self._make_layout_spec(layout_wells)
+        analysis = self._make_analysis_spec()
+        method_bytes, method_hash = canonicalize_and_hash(method)
+        layout_bytes, layout_hash = canonicalize_and_hash(layout)
+        analysis_bytes, analysis_hash = canonicalize_and_hash(analysis)
+        elabftw.add_upload(42, 5001, method_bytes)
+        elabftw.add_upload(43, 5002, layout_bytes)
+        elabftw.add_upload(44, 5003, analysis_bytes)
+        return (
+            {"object_id": 42, "hash": method_hash, "json_attachment_id": 5001},
+            {"object_id": 43, "hash": layout_hash, "json_attachment_id": 5002},
+            {"object_id": 44, "hash": analysis_hash, "json_attachment_id": 5003},
+        )
+
+    def _make_job(
+        self,
+        method_ref: dict[str, Any],
+        layout_ref: dict[str, Any],
+        analysis_ref: dict[str, Any],
+    ) -> Job:
+        return Job(
+            job_id="test-zero-acq",
+            title="Zero Acq",
+            execution_mode="generated_protocol",
+            method_ref=method_ref,
+            layout_ref=layout_ref,
+            analysis_ref=analysis_ref,
+            created_at="2025-01-01T00:00:00",
+        )
+
+    @staticmethod
+    def _assert_no_physical_work_or_dry_run(
+        job: Job,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        # Reason: the zero-acquisition gate fires before dry-run success
+        # and any hardware work, so neither signal may have surfaced.
+        assert job.status == "failed", job.events
+        assert any(e["event"] == "layout_no_acquired_wells" for e in job.events), job.events
+        assert any(e["event"] == "execution_failed" for e in job.events), job.events
+        assert not any(e["event"] == "dry_run_complete" for e in job.events), job.events
+        assert not any(e["event"] == "protocol_matched" for e in job.events), job.events
+        assert job.run_id == ""
+        assert vm_agent._runs == {}, vm_agent._runs
+        assert vm_agent.deleted_protocols == [], vm_agent.deleted_protocols
+        assert vm_agent.requested_job_ids == [], vm_agent.requested_job_ids
+
+    @pytest.mark.parametrize(
+        ("layout_wells", "label"),
+        [
+            ([], "empty wells list"),
+            ([{"well_name": "A1", "role": "skipped"}], "single skipped well"),
+            (
+                [
+                    {"well_name": "A1", "role": "skipped"},
+                    {"well_name": "A2", "role": "skipped"},
+                    {"well_name": "H12", "role": "skipped"},
+                ],
+                "all wells skipped",
+            ),
+        ],
+    )
+    def test_zero_acquisition_layout_fails_in_dry_run(
+        self,
+        executor: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+        layout_wells: list[dict[str, Any]],
+        label: str,
+    ) -> None:
+        """A zero-acquisition layout (empty wells or every well skipped)
+        must fail the job before ``dry_run_complete``."""
+        method_ref, layout_ref, analysis_ref = self._stage_full(elabftw, layout_wells)
+        job = self._make_job(method_ref, layout_ref, analysis_ref)
+
+        executor(job)
+
+        self._assert_no_physical_work_or_dry_run(job, vm_agent)
+        assert "zero acquired wells" in (job.error or "")
+
+    @pytest.mark.parametrize(
+        ("layout_wells", "label"),
+        [
+            ([], "empty wells list"),
+            ([{"well_name": "A1", "role": "skipped"}], "single skipped well"),
+            (
+                [
+                    {"well_name": "A1", "role": "skipped"},
+                    {"well_name": "H12", "role": "skipped"},
+                ],
+                "all wells skipped",
+            ),
+        ],
+    )
+    def test_zero_acquisition_layout_fails_in_wet_path_before_run(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+        layout_wells: list[dict[str, Any]],
+        label: str,
+    ) -> None:
+        """In the wet path, a zero-acquisition layout must fail before any
+        protocol matching, cloning, run start, or MDB result fetch — even
+        when a matching factory protocol exists on the instrument."""
+        method_ref, layout_ref, analysis_ref = self._stage_full(elabftw, layout_wells)
+        job = self._make_job(method_ref, layout_ref, analysis_ref)
+
+        executor_wet(job)
+
+        self._assert_no_physical_work_or_dry_run(job, vm_agent)
+        # No clone was attempted, so no clone event was emitted and no
+        # cleanup fired.
+        assert not any(e["event"] == "protocol_clone_refused" for e in job.events), job.events
+        assert not any(e["event"] == "protocol_clone_failed" for e in job.events), job.events
+        assert not any(e["event"] == "protocol_cloned" for e in job.events), job.events
+
+    def test_clone_for_layout_refuses_empty_wells_directly(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """Direct contract test: :meth:`_clone_for_layout` itself must
+        never return the factory ``protocol_id`` for a missing
+        ``protocol_id`` or an empty ``wells`` set. It raises
+        ``ValueError`` and emits ``protocol_clone_refused`` instead, so
+        a future caller or an upstream-gate regression cannot reach a
+        factory-protocol run through this method.
+        """
+        import pytest as _pytest
+
+        job = Job(
+            job_id="test-clone-refuse",
+            title="Clone Refuse",
+            execution_mode="generated_protocol",
+            created_at="2025-01-01T00:00:00",
+        )
+
+        # Empty wells — must raise, never return the factory id.
+        with _pytest.raises(ValueError, match="no acquired wells"):
+            executor_wet._clone_for_layout(
+                job, protocol_name="Absorbance @ 600 (1.0s)", protocol_id=1001, wells=[]
+            )
+        assert any(e["event"] == "protocol_clone_refused" for e in job.events), job.events
+        assert "no acquired wells" in next(
+            e["detail"] for e in job.events if e["event"] == "protocol_clone_refused"
+        ), job.events
+        # No clone was issued to the instrument.
+        assert vm_agent.deleted_protocols == []
+
+        # Missing protocol_id — must also raise, never return the (zero)
+        # factory id that would resolve to nothing useful downstream.
+        job.events.clear()
+        with _pytest.raises(ValueError, match="no matched protocol_id"):
+            executor_wet._clone_for_layout(
+                job,
+                protocol_name="Absorbance @ 600 (1.0s)",
+                protocol_id=0,
+                wells=["A1"],
+            )
+        assert any(e["event"] == "protocol_clone_refused" for e in job.events), job.events
+
+    def test_nonzero_acquisition_layout_still_reaches_dry_run_complete(
+        self,
+        executor: BridgeExecutor,
+        elabftw: MockElabftwClient,
+    ) -> None:
+        """Sanity: a layout with at least one acquired well (measured or
+        excluded) must still proceed beyond the zero-acquisition gate to
+        ``dry_run_complete`` — confirming the guard only fires on
+        actually-empty acquisition."""
+        method_ref, layout_ref, analysis_ref = self._stage_full(
+            elabftw,
+            [
+                {"well_name": "A1", "role": "measured"},
+                {"well_name": "A2", "role": "excluded"},
+                {"well_name": "A3", "role": "skipped"},
+            ],
+        )
+        job = self._make_job(method_ref, layout_ref, analysis_ref)
+
+        executor(job)
+
+        assert job.status == "completed", job.events
+        assert not any(e["event"] == "layout_no_acquired_wells" for e in job.events), job.events
+        assert any(e["event"] == "dry_run_complete" for e in job.events), job.events
+
+    def test_excluded_wells_counted_as_acquired_for_zero_gate(
+        self,
+        executor: BridgeExecutor,
+        elabftw: MockElabftwClient,
+    ) -> None:
+        """An ``excluded`` well is still physically acquired (its raw value
+        is collected, only analysis skips it), so a layout whose only wells
+        are ``excluded`` must NOT trip the zero-acquisition gate."""
+        method_ref, layout_ref, analysis_ref = self._stage_full(
+            elabftw, [{"well_name": "A1", "role": "excluded"}]
+        )
+        job = self._make_job(method_ref, layout_ref, analysis_ref)
+
+        executor(job)
+
+        assert job.status == "completed", job.events
+        assert any(e["event"] == "dry_run_complete" for e in job.events), job.events
+        assert not any(e["event"] == "layout_no_acquired_wells" for e in job.events), job.events
 
 
 class TestLayoutAcquisitionRoles:

@@ -29,7 +29,7 @@ from .canonical import verify_hash
 from .elabftw import ElabftwClient
 from .errors import SIGNATURE_MISSING, BridgeError, Severity
 from .jobs import UNKNOWN, Job
-from .schemas import AnalysisSpec
+from .schemas import AnalysisSpec, LayoutSpec, MethodSpec
 from .vm_agent_client import VmAgentClient, VmAgentError
 from .well_utils import normalize_well_name as _normalize_well_name
 
@@ -453,9 +453,36 @@ class BridgeExecutor:
     def _load_generated_specs(
         self, job: Job
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
-        """Download and hash-check the canonical refs for a generated run."""
-        if not job.method_ref:
-            self._fail_job(job, "No method_ref for generated_protocol mode")
+        """Download and hash-check the canonical refs for a generated run.
+
+        The ``generated_protocol`` schema contract (ExecutionMode.GENERATED_PROTOCOL
+        in schemas.py + docs/plans/wallac-protocol-authoring.md "Validated
+        workflow") requires a signed method.json, layout.json, *and*
+        analysis.json. A missing ref means the submission does not carry the
+        three signed objects the executor needs to interpret the run, so the
+        job fails deterministically *before* any download attempt, dry-run
+        success, or hardware start — preserving the no-physical-work
+        guarantee for an incomplete submission.
+        """
+        missing = [
+            name
+            for name, ref in (
+                ("method_ref", job.method_ref),
+                ("layout_ref", job.layout_ref),
+                ("analysis_ref", job.analysis_ref),
+            )
+            if not ref
+        ]
+        if missing:
+            # Reason: short-circuit layout_ref/analysis_ref when unset (as the
+            # old code did) silently produced an "empty spec" that passed
+            # validation only because the validator skipped empty dicts,
+            # then proceeded to dry_run_complete / hardware start without
+            # the signed layout or analysis the schema contract mandates.
+            detail = ", ".join(missing)
+            message = f"Missing required ref(s) for generated_protocol mode: {detail}"
+            self._fail_job(job, message)
+            job.add_event("missing_required_ref", detail)
             return None
         job.add_event("downloading_specs", "")
         try:
@@ -471,8 +498,8 @@ class BridgeExecutor:
                     job.add_event(
                         "method_ref_incomplete", "method ref has no object_id or attachment_id"
                     )
-            layout_spec = self._download_ref(job.layout_ref) if job.layout_ref else {}
-            analysis_spec = self._download_ref(job.analysis_ref) if job.analysis_ref else {}
+            layout_spec = self._download_ref(job.layout_ref)
+            analysis_spec = self._download_ref(job.analysis_ref)
         except Exception as error:
             self._fail_job(job, f"Failed to download specs: {error}")
             return None
@@ -481,6 +508,111 @@ class BridgeExecutor:
             f"method={bool(method_spec)} layout={bool(layout_spec)} analysis={bool(analysis_spec)}",
         )
         return method_spec, layout_spec, analysis_spec
+
+    @staticmethod
+    def _validate_generated_specs(
+        job: Job,
+        method_spec: dict[str, Any],
+        layout_spec: dict[str, Any],
+        analysis_spec: dict[str, Any],
+    ) -> bool:
+        """Fail closed through schema/version/role/well validation.
+
+        :meth:`_download_ref` only verifies the attachment hash matches the
+        submitted reference. It does not enforce that the parsed JSON conforms
+        to a supported :class:`MethodSpec`/``LayoutSpec``/``AnalysisSpec``
+        schema. A referenced object can hash-match its bytes and still carry
+        an unsupported schema version (e.g. a future ``wallac.method.v2``),
+        an invalid well ``role``, or an out-of-range well name. Without this
+        gate the executor would either silently drop layout wells with
+        unknown roles or, in dry-run, report success for a spec it cannot
+        interpret.
+
+        Run before dry-run success and any hardware start so the executor
+        never launches a run from an unintelligible spec. Reuses the
+        :class:`BridgeError` (``SCHEMA_UNSUPPORTED``) raised by
+        :func:`validate_schema_identity`, the ``ValueError`` raised by
+        :class:`WellSpec.from_dict`, and the ``KeyError``/``TypeError``
+        raised by dataclass ``from_dict`` direct-key indexing / ``float``
+        coercion of malformed-but-hash-valid JSON, propagating them through
+        the existing fail-closed (:meth:`_fail_job` + event log) pattern.
+
+        The canonical dicts are preserved for the downstream matching/layout
+        /analysis path, which reads them directly; this step is purely a
+        fail-closed guard.
+        """
+        validators: tuple[tuple[str, str, dict[str, Any], Callable[[dict[str, Any]], Any]], ...] = (
+            ("method", "wallac.method", method_spec, MethodSpec.from_dict),
+            ("layout", "wallac.layout", layout_spec, LayoutSpec.from_dict),
+            ("analysis", "wallac.analysis", analysis_spec, AnalysisSpec.from_dict),
+        )
+        for kind, expected_schema, spec, validator in validators:
+            # Reason: an empty dict here must fail closed, not be skipped.
+            # :meth:`_load_generated_specs` fails upstream when a ref is
+            # missing, but the downloaded attachment can still decode to
+            # an empty JSON object (``{}``) whose hash matches the signed
+            # reference. Skipping it would mask an empty-but-signed spec
+            # and let the executor proceed to dry_run_complete / hardware
+            # start on a spec it cannot interpret (no schema_name, no
+            # mode, no wells). The validator raises BridgeError for an
+            # empty ``schema_name`` (``validate_schema_identity("", 0)``),
+            # which the existing fail-closed path converts into the
+            # ``spec_validation_failed`` event + ``failed`` status.
+            # Reason: a hash-valid but wrong-kind ref (e.g. analysis_ref
+            # pointing at a wallac.method object) still satisfies
+            # ``validate_schema_identity`` for *some* supported schema, so
+            # without this guard the parser would silently default
+            # missing/optional fields and the wrong ref could flow into
+            # the matching/layout/analysis path. Each generated ref must
+            # carry its own schema kind exactly.
+            if str(spec.get("schema_name", "")) != expected_schema:
+                message = (
+                    f"Spec validation failed for {kind} spec: expected "
+                    f"schema_name '{expected_schema}', got "
+                    f"{spec.get('schema_name', '')!r}"
+                )
+                BridgeExecutor._fail_job(job, message)
+                job.add_event(
+                    "spec_validation_failed",
+                    f"kind={kind} code=schema_mismatch "
+                    f"expected={expected_schema} "
+                    f"actual={spec.get('schema_name', '')!r}",
+                )
+                return False
+            try:
+                validator(spec)
+            except BridgeError as error:
+                BridgeExecutor._fail_job(
+                    job,
+                    f"Spec validation failed for {kind} spec: {error.human_message}",
+                )
+                job.add_event(
+                    "spec_validation_failed",
+                    f"kind={kind} code={error.code} {error.human_message}",
+                )
+                return False
+            except (ValueError, KeyError, TypeError) as error:
+                # Reason: ``validate_schema_identity`` raises ``BridgeError``
+                # (handled above) for unknown schema names/versions, but the
+                # dataclass ``from_dict`` parsers use direct key indexing
+                # (``d["mode"]``, ``d["wells"]``, ``d["photometry"]``) and
+                # ``float(...)`` coercion. A hash-valid attachment can still
+                # be missing a required field (``KeyError``) or carry a
+                # wrong-typed value (``TypeError`` on ``float([])`` or
+                # ``int(None)``). Normalize those parse failures into the
+                # existing fail-closed + ``spec_validation_failed`` path so
+                # they never reach dry-run success or a hardware start.
+                BridgeExecutor._fail_job(
+                    job,
+                    f"Spec validation failed for {kind} spec: {error}",
+                )
+                job.add_event(
+                    "spec_validation_failed",
+                    f"kind={kind} {type(error).__name__}: {error}",
+                )
+                return False
+        job.add_event("specs_validated", "method/layout/analysis schemas validated")
+        return True
 
     @staticmethod
     def _measured_layout_wells(job: Job, layout_spec: dict[str, Any]) -> tuple[list[str], set[str]]:
@@ -509,21 +641,72 @@ class BridgeExecutor:
         protocol_id: int,
         wells: list[str],
     ) -> tuple[int, int]:
-        """Clone a protocol for a plate map, returning run and cleanup IDs."""
+        """Clone a protocol for a plate map, returning run and cleanup IDs.
+
+        Fail closed — never fall back to the factory ``protocol_id``. A
+        generated run needs the per-plate clone so the instrument's MDB
+        PlateMap covers exactly the measured/excluded wells from the signed
+        layout. Running against the factory preset instead would acquire
+        the wrong wells (or all 96), reading from physical hardware the
+        operator did not authorize for that layout. So a clone failure or a
+        plate-map apply failure must abort the job, not silently execute
+        against the factory protocol.
+
+        On clone failure no partial clone exists on the instrument, so the
+        caller only needs to mark the job failed. On plate-map apply failure
+        a partial clone *does* exist (the clone succeeded but its plate map
+        was never written); this method best-effort cleans that up before
+        re-raising so the instrument is not left with a stub protocol.
+
+        Raises:
+            Exception: re-raises the underlying vm-agent error after logging
+                the public event, so the caller can fail the job from a
+                single place (:meth:`_execute_generated_protocol`).
+        """
+        # Reason: never return the factory ``protocol_id`` for a missing
+        # ``protocol_id`` or an empty ``wells`` set. Returning the factory
+        # id (the previous behavior) would have the caller start a run
+        # against the factory preset, acquiring the wrong wells (or all
+        # 96) from live hardware the operator did not authorize for that
+        # layout. The zero-acquisition case is normally caught upstream in
+        # :meth:`_execute_generated_protocol` before clone is reached, but
+        # this method must fail closed on its own contract so any future
+        # caller — or a regression in the upstream guard — cannot reach a
+        # factory-protocol run via this path. Raise so the caller's
+        # try/except converts it into a fail-closed job (``cloned_proto_id``
+        # stays 0 on raise so no clone cleanup fires).
         if not protocol_id or not wells:
-            return protocol_id, 0
+            reason = "no matched protocol_id" if not protocol_id else "no acquired wells in layout"
+            message = f"Refusing protocol clone for {protocol_name}: {reason}"
+            job.add_event("protocol_clone_refused", reason)
+            logger.warning("%s", message)
+            raise ValueError(message)
         new_id = int(time.time()) % 100000 + 2001000
-        cloned_id = 0
         try:
             self.vm_agent.clone_protocol(protocol_id, new_id, f"ELAB-Run-{new_id}")
-            cloned_id = new_id
-            self.vm_agent.update_plate_map(new_id, wells)
-            job.add_event("protocol_cloned", f"id={new_id} wells={len(wells)}")
-            return new_id, cloned_id
         except Exception as error:
             job.add_event("protocol_clone_failed", str(error))
             logger.warning("Protocol clone failed for %s: %s", protocol_name, error)
-            return protocol_id, cloned_id
+            raise
+        # Reason: clone succeeded → partial protocol exists on the instrument.
+        # If the plate-map apply then fails we must clean up that partial
+        # clone before re-raising, otherwise the instrument is left with a
+        # stub protocol that will float in the MDB until manual cleanup and
+        # may shadow the factory protocol on the next assay lookup.
+        try:
+            self.vm_agent.update_plate_map(new_id, wells)
+        except Exception as error:
+            job.add_event("plate_map_apply_failed", str(error))
+            logger.warning(
+                "Plate map apply failed for clone %s of %s: %s",
+                new_id,
+                protocol_name,
+                error,
+            )
+            self._cleanup_cloned_protocol(new_id)
+            raise
+        job.add_event("protocol_cloned", f"id={new_id} wells={len(wells)}")
+        return new_id, new_id
 
     def _execute_generated_protocol(self, job: Job) -> None:
         """Run a generated protocol from hash-verified method/layout/analysis refs."""
@@ -531,6 +714,31 @@ class BridgeExecutor:
         if specs is None:
             return
         method_spec, layout_spec, analysis_spec = specs
+
+        # Reason: hash verification only proves the bytes match the signed
+        # reference. The spec must still conform to a supported schema
+        # version with valid well roles/names, or the executor cannot
+        # interpret it. Validate before dry-run success and any hardware
+        # start (docs/plans/wallac-protocol-authoring.md "Validated workflow").
+        if not self._validate_generated_specs(job, method_spec, layout_spec, analysis_spec):
+            return
+
+        wells, measured_well_names = self._measured_layout_wells(job, layout_spec)
+        # Reason: a zero-acquisition layout (no wells at all, or every well
+        # ``skipped``) produces an empty MDB PlateMap. Letting it through
+        # would report ``dry_run_complete`` for a no-op run, and in wet
+        # mode ask :meth:`_clone_for_layout` to clone with no wells (the
+        # factory fallback). Fail closed *before* dry-run success, protocol
+        # matching/clone, or any hardware start, mirroring the no-physical-
+        # work guarantee for an unintelligible spec.
+        if not wells:
+            self._fail_job(
+                job,
+                "Layout has zero acquired wells (empty or all-skipped); "
+                "cannot run a protocol with no measurements.",
+            )
+            job.add_event("layout_no_acquired_wells", "")
+            return
 
         if self.dry_run:
             job.status = "completed"
@@ -543,10 +751,25 @@ class BridgeExecutor:
             return
         job.add_event("protocol_matched", f"{protocol_name} (id={protocol_id})")
 
-        wells, measured_well_names = self._measured_layout_wells(job, layout_spec)
-        run_protocol, cloned_proto_id = self._clone_for_layout(
-            job, protocol_name, protocol_id, wells
-        )
+        # Reason: _clone_for_layout no longer silently falls back to the
+        # factory protocol_id when clone or plate-map apply fails (that
+        # fallback ran the instrument against the wrong plate map,
+        # breaking the no-physical-work guarantee for an incomplete
+        # per-plate setup). It re-raises after best-effort cleanup; the
+        # job must fail here rather than run from an orphaned factory
+        # clone. cloned_proto_id stays 0 on raise so the caller's finally
+        # does not double-delete a clone _clone_for_layout already
+        # cleaned up.
+        try:
+            run_protocol, cloned_proto_id = self._clone_for_layout(
+                job, protocol_name, protocol_id, wells
+            )
+        except Exception as error:
+            self._fail_job(
+                job,
+                f"Protocol clone or plate-map apply failed: {error}",
+            )
+            return
         # Persist the effective instrument identity used by result lookup. A
         # generated run may use a temporary clone rather than the matched
         # factory protocol, so the clone ID is authoritative for MDB results.
@@ -584,15 +807,16 @@ class BridgeExecutor:
         """Send an abort request; return whether further retries should stop.
 
         Returns True once no further abort retry should be attempted — either
-        because the vm-agent accepted the abort, or because the abort failed
-        permanently (non-425 error). On permanent failure the job is marked
-        ``failed`` per ``docs/abort-recovery.md`` (the instrument did not
-        respond), so it is never reported as a successful abort.
+        because the vm-agent accepted the abort (``ok`` true, ``is_running``
+        false, or a stopped state), or because the abort failed permanently
+        (non-425 error or an HTTP-200 ``ok=false/is_running=true`` that
+        indicates the instrument is still running). A non-accepted
+        ``ok=false/is_running=true`` reply is treated as "still in progress"
+        so the poll loop keeps trying and a measured/completed run is not
+        mislabeled aborted or skipped for writeback.
         """
         try:
-            self.vm_agent.abort_run(run_id)
-            job.add_event("abort_sent", run_id)
-            return True
+            response = self.vm_agent.abort_run(run_id)
         except VmAgentError as error:
             if error.status_code == 425:
                 # Too early: retry on the next poll cycle.
@@ -604,6 +828,18 @@ class BridgeExecutor:
             self._fail_job(job, f"Abort failed permanently: {error}")
             job.add_event("abort_failed", str(error))
             return True
+
+        accepted = bool((response or {}).get("ok", True)) and not bool(
+            (response or {}).get("is_running", False)
+        )
+        if accepted:
+            job.add_event("abort_sent", run_id)
+            return True
+        # Instrument is still running per vm-agent — keep polling so a
+        # measured/completed run is not mislabeled aborted. Emit a debug
+        # event so the operator can see the controller is still trying.
+        job.add_event("abort_in_progress", str((response or {}).get("state_text", "")))
+        return False
 
     def _get_run_state(self, job: Job, run_id: str) -> str | None:
         """Fetch normalized run state, failing the job when polling fails."""

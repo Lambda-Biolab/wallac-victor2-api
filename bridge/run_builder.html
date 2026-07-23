@@ -409,6 +409,30 @@ for (const r of ROWS) {
   }
 }
 
+// --- HTML escape helper ---
+// Reason: Central escape for interpolating untrusted strings into
+// innerHTML template strings and double-quoted attribute contexts. The
+// five characters below are the only ones that break out of text content
+// or a "..."/'...' attribute; escaping them neutralizes stored/DOM XSS
+// from eLabFTW booking data, saved spec fields, and bridge job events.
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function safeHttpUrl(value) {
+  try {
+    const url = new URL(String(value));
+    return ['http:', 'https:'].includes(url.protocol) ? url.toString() : '';
+  } catch {
+    return '';
+  }
+}
+
 // --- Auth ---
 document.getElementById('authToken').value = token;
 document.getElementById('elabftwUrl').value = elabftwUrl;
@@ -421,8 +445,12 @@ function saveSettings() {
   localStorage.setItem('wallacElabftwUrl', elabftwUrl);
   localStorage.setItem('wallacBridgeUrl', bridgeUrl);
   showStatus('Settings saved', 'success');
-  checkBookingStatus();
-  startInstrumentPolling();
+  // Reason: a fresh token makes the previously-401 /config fetch succeed,
+  // so retry autoConfig(). Its guards (`if (!elabftwUrl && ...`,
+  // `if (!bridgeUrl && ...)`) leave explicit user values untouched, and it
+  // calls checkBookingStatus()/startInstrumentPolling() itself — no
+  // recursion (autoConfig never calls saveSettings) and no double-poll.
+  autoConfig();
 }
 
 // --- Instrument status polling ---
@@ -504,6 +532,11 @@ async function checkBookingStatus() {
     if (!resp.ok) throw new Error(`${resp.status}`);
     const events = await resp.json();
 
+    const calUrl = safeHttpUrl(`${elabftwUrl}/database.php?mode=view&id=${INSTRUMENT_ITEM_ID}`);
+    const calendarLink = color => calUrl
+      ? `<a href="${escHtml(calUrl)}" target="_blank" rel="noopener noreferrer" style="color:${color};">View calendar →</a>`
+      : '';
+
     // Find any booking that overlaps with "now"
     const active = events.find(e => {
       const s = new Date(e.start);
@@ -513,13 +546,15 @@ async function checkBookingStatus() {
 
     if (active) {
       const endTime = new Date(active.end).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-      const booker = active.fullname || active.title_only || 'unknown';
+      // Reason: fullname/title_only come from eLabFTW booking records
+      // (untrusted user input) — escape before placing in innerHTML.
+      const booker = escHtml(active.fullname || active.title_only || 'unknown');
       banner.className = 'booking-busy';
       banner.classList.remove('hidden');
       document.getElementById('bookingIcon').textContent = '⏳';
       document.getElementById('bookingText').innerHTML =
         `Instrument is booked by <strong>${booker}</strong> until ${endTime}. ` +
-        `<a href="${elabftwUrl}/database.php?mode=view&id=${INSTRUMENT_ITEM_ID}" target="_blank" style="color:var(--yellow);">View calendar →</a>`;
+        calendarLink('var(--yellow)');
     } else {
       // Check for upcoming bookings today
       const upcoming = events.find(e => new Date(e.start) > now);
@@ -527,16 +562,16 @@ async function checkBookingStatus() {
       banner.classList.remove('hidden');
       if (upcoming) {
         const startTime = new Date(upcoming.start).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-        const booker = upcoming.fullname || upcoming.title_only || 'unknown';
+        const booker = escHtml(upcoming.fullname || upcoming.title_only || 'unknown');
         document.getElementById('bookingIcon').textContent = '✓';
         document.getElementById('bookingText').innerHTML =
           `Instrument is available now. Next booking: <strong>${booker}</strong> at ${startTime}. ` +
-          `<a href="${elabftwUrl}/database.php?mode=view&id=${INSTRUMENT_ITEM_ID}" target="_blank" style="color:var(--green);">View calendar →</a>`;
+          calendarLink('var(--green)');
       } else {
         document.getElementById('bookingIcon').textContent = '✓';
         document.getElementById('bookingText').innerHTML =
           `Instrument is available. ` +
-          `<a href="${elabftwUrl}/database.php?mode=view&id=${INSTRUMENT_ITEM_ID}" target="_blank" style="color:var(--green);">View calendar →</a>`;
+          calendarLink('var(--green)');
       }
     }
   } catch (e) {
@@ -567,7 +602,10 @@ async function api(method, path, body) {
 // --- Status messages ---
 function showStatus(msg, type) {
   const area = document.getElementById('statusArea');
-  area.innerHTML = `<div class="status-msg ${type}">${msg}</div>`;
+  // Reason: msg frequently carries server error text (e.message) which an
+  // attacker can influence; type is a CSS class. Escape both before
+  // interpolating into innerHTML.
+  area.innerHTML = `<div class="status-msg ${escHtml(type)}">${escHtml(msg)}</div>`;
   setTimeout(() => area.innerHTML = '', 5000);
 }
 
@@ -703,8 +741,11 @@ async function loadMethods() {
   try {
     const methods = await api('GET', '/api/methods');
     const list = document.getElementById('methodList');
+    // Reason: method title/lifecycle/spec.mode are saved user/server
+    // strings interpolated into innerHTML; item_id is passed into an
+    // inline onclick JS arg so coerce to Number to block JS injection.
     list.innerHTML = '<h2 style="margin-top:16px;">Saved Methods</h2><ul class="resource-list">' +
-      methods.map(m => `<li><div><span class="resource-title">${m.title}</span><br><span class="resource-meta">id=${m.item_id}, lifecycle=${m.lifecycle}, mode=${m.spec.mode||'?'}</span></div><button class="btn btn-secondary" onclick="selectMethod(${m.item_id})">Select</button></li>`).join('') +
+      methods.map(m => `<li><div><span class="resource-title">${escHtml(m.title)}</span><br><span class="resource-meta">id=${Number(m.item_id)}, lifecycle=${escHtml(m.lifecycle)}, mode=${escHtml(m.spec.mode||'?')}</span></div><button class="btn btn-secondary" onclick="selectMethod(${Number(m.item_id)})">Select</button></li>`).join('') +
       '</ul>';
   } catch {}
 }
@@ -808,14 +849,16 @@ function updateSampleLegend() {
   if (samples.size > 0) {
     html += '<div style="font-weight:600; margin-bottom:4px;">Samples</div>';
     for (const [name, color] of samples) {
-      html += `<div style="display:flex; align-items:center; gap:6px; margin-bottom:2px;"><div style="width:12px; height:12px; border-radius:2px; background:${color};"></div>${name}</div>`;
+      // Reason: sample_name is user input saved on the layout; escape it.
+      html += `<div style="display:flex; align-items:center; gap:6px; margin-bottom:2px;"><div style="width:12px; height:12px; border-radius:2px; background:${color};"></div>${escHtml(name)}</div>`;
     }
   }
   if (groups.size > 0) {
     if (samples.size > 0) html += '<div style="margin-top:8px;"></div>';
     html += '<div style="font-weight:600; margin-bottom:4px;">Replicate Groups</div>';
     for (const [name, color] of groups) {
-      html += `<div style="display:flex; align-items:center; gap:6px; margin-bottom:2px;"><div style="width:12px; height:12px; border-radius:2px; background:${color};"></div>${name}</div>`;
+      // Reason: replicate_group is user input saved on the layout; escape it.
+      html += `<div style="display:flex; align-items:center; gap:6px; margin-bottom:2px;"><div style="width:12px; height:12px; border-radius:2px; background:${color};"></div>${escHtml(name)}</div>`;
     }
   }
   if (html === '') {
@@ -964,6 +1007,10 @@ function selectWell(name) {
     w.classList.toggle('selected', w.dataset.well === name);
   });
   const w = plateWells[name];
+  // Reason: sample_name and replicate_group are user-input text
+  // interpolated into double-quoted value="" attributes — escape to
+  // prevent attribute breakout / stored XSS. Well name and roles are
+  // internal constants (A-H × 1-12 / fixed enums).
   document.getElementById('wellDetail').innerHTML = `
     <label>Well: ${name}</label>
     <label style="margin-top:8px;">Role</label>
@@ -980,9 +1027,9 @@ function selectWell(name) {
       <option value="negative_control" ${w.control_type==='negative_control'?'selected':''}>Negative control</option>
     </select>
     <label style="margin-top:8px;">Sample name</label>
-    <input type="text" value="${w.sample_name||''}" onchange="updateWell('${name}', 'sample_name', this.value)" />
+    <input type="text" value="${escHtml(w.sample_name||'')}" onchange="updateWell('${name}', 'sample_name', this.value)" />
     <label style="margin-top:8px;">Replicate group</label>
-    <input type="text" value="${w.replicate_group||''}" onchange="updateWell('${name}', 'replicate_group', this.value)" />
+    <input type="text" value="${escHtml(w.replicate_group||'')}" onchange="updateWell('${name}', 'replicate_group', this.value)" />
   `;
 }
 
@@ -1260,7 +1307,9 @@ async function pollJobStatus() {
 
     // Update events log
     const eventsDiv = document.getElementById('statusEvents');
-    eventsDiv.innerHTML = job.events.map(e => `<div>[${e.ts.slice(0,19)}] ${e.event}: ${e.detail}</div>`).join('');
+    // Reason: bridge job event ts/event/detail (incl. error strings) are
+    // untrusted — escape each field before interpolating into innerHTML.
+    eventsDiv.innerHTML = job.events.map(e => `<div>[${escHtml(e.ts.slice(0,19))}] ${escHtml(e.event)}: ${escHtml(e.detail)}</div>`).join('');
     eventsDiv.scrollTop = eventsDiv.scrollHeight;
 
     // Update live heatmap during run
@@ -1278,7 +1327,8 @@ async function pollJobStatus() {
 
       // Show link to eLabFTW experiment if results were written back
       if (job.elabftw_experiment_id && job.elabftw_experiment_id > 0 && elabftwUrl) {
-        const expUrl = `${elabftwUrl}/experiments.php?mode=view&id=${job.elabftw_experiment_id}`;
+        const expUrl = safeHttpUrl(`${elabftwUrl}/experiments.php?mode=view&id=${job.elabftw_experiment_id}`);
+        if (!expUrl) return;
         let linkDiv = document.getElementById('resultLink');
         if (!linkDiv) {
           linkDiv = document.createElement('div');
@@ -1286,7 +1336,7 @@ async function pollJobStatus() {
           linkDiv.style.cssText = 'margin-top:12px; padding:12px; background:var(--bg); border:1px solid var(--green); border-radius:6px; text-align:center;';
           document.getElementById('jobStatus').appendChild(linkDiv);
         }
-        linkDiv.innerHTML = `<a href="${expUrl}" target="_blank" style="color:var(--green); font-size:1.1rem; font-weight:600; text-decoration:none;">Open results in eLabFTW →</a>`;
+        linkDiv.innerHTML = `<a href="${escHtml(expUrl)}" target="_blank" rel="noopener noreferrer" style="color:var(--green); font-size:1.1rem; font-weight:600; text-decoration:none;">Open results in eLabFTW →</a>`;
       }
     }
   } catch {}
@@ -1379,9 +1429,12 @@ loadMethods();
 autoConfig();
 
 async function autoConfig() {
-  // Try to fetch config from the designer backend
+  // Try to fetch config from the designer backend. /config is behind the
+  // same bearer-token check as the rest of the designer API, so we must
+  // send the saved token — otherwise auto-configure silently 401s whenever
+  // WALLAC_DESIGNER_TOKEN is set.
   try {
-    const resp = await fetch('/config');
+    const resp = await fetch('/config', { headers: authHeaders() });
     if (resp.ok) {
       const cfg = await resp.json();
       // Auto-fill fields that aren't already set in localStorage

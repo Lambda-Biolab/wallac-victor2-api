@@ -136,7 +136,10 @@ On boot the agent listens on the guest's libvirt NAT address, port **8420**.
 
 1. Copy `deploy/bridge.env.example` to `/etc/wallac-bridge/bridge.env` and
    fill in the eLabFTW URL + API key, vm-agent URL + token, and optional
-   designer/bridge tokens.
+   designer/bridge tokens. For browser/Run Builder deployments, set
+   `WALLAC_CORS_ORIGINS` to the exact Run Builder origin (default
+   `http://localhost:8422`) — the designer at `:8422` makes cross-origin
+   requests to the bridge at `:8423` and the browser enforces CORS.
 2. Install the systemd services:
 
    ```bash

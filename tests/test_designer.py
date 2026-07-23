@@ -522,6 +522,204 @@ class TestDesignerConfigEndpoint:
         assert "bridge_url" in body
 
 
+class TestRunBuilderConfigAuth:
+    """The Run Builder SPA fetches /config at load time to auto-fill URLs.
+
+    /config is behind the same bearer-token check as the rest of the
+    designer API, so the SPA's autoConfig() fetch must send the saved
+    token via authHeaders(). Without it, token-enabled deployments
+    silently 401 on /config and the Run Builder cannot auto-configure.
+
+    These are source-level checks against the served HTML, so they
+    run without a browser, matching the existing route-behavioral
+    test patterns in this file.
+    """
+
+    def test_run_builder_served(self, client: TestClient) -> None:
+        r = client.get("/run-builder")
+        assert r.status_code == 200
+        assert "autoConfig" in r.text
+
+    def test_autoconfig_sends_auth_headers(self, client: TestClient) -> None:
+        """autoConfig() must call fetch('/config', { headers: authHeaders() })."""
+        html = client.get("/run-builder").text
+        # Reason: a literal ``fetch('/config')`` (no headers) is the original
+        # regression — the SPA 401s whenever WALLAC_DESIGNER_TOKEN is set and
+        # auto-configure silently fails. Assert both a positive engagement
+        # with authHeaders and the absence of a bare /config fetch.
+        assert "fetch('/config', { headers: authHeaders() })" in html, (
+            "autoConfig() must send saved bearer auth on /config"
+        )
+        assert "fetch('/config')" not in html, (
+            "bare /config fetch without authHeaders() must not be present"
+        )
+
+    def test_save_settings_retries_autoconfig(self, client: TestClient) -> None:
+        """saveSettings() must call autoConfig() after persisting the token.
+
+        Reason: the first page load fetches authenticated /config before a
+        token exists and silently 401s, so URLs are never auto-filled. If
+        saveSettings only stores the token without retrying autoConfig, the
+        operator is forced to reload or type the eLabFTW/bridge URLs by
+        hand. autoConfig's empty-value guards (`if (!elabftwUrl && ...)`)
+        ensure explicit user values just typed into the form are not
+        overwritten, and autoConfig never calls saveSettings, so there is
+        no recursion.
+        """
+        html = client.get("/run-builder").text
+        save_idx = html.find("function saveSettings()")
+        cfg_idx = html.find("function autoConfig()")
+        assert save_idx != -1 and cfg_idx != -1, "saveSettings/autoConfig missing"
+        next_fn = html.find("function ", save_idx + 1)
+        save_body = html[save_idx : next_fn if next_fn != -1 else save_idx + 1024]
+        # saveSettings body must invoke autoConfig (retry after token saved).
+        assert "autoConfig()" in save_body, (
+            "saveSettings() must call autoConfig() so a freshly-saved token "
+            "retries the /config auto-fill instead of forcing a reload"
+        )
+        # And it must not re-declare the function (avoid swallow the retry).
+        assert "function autoConfig" not in save_body, (
+            "saveSettings() must call autoConfig(), not shadow it"
+        )
+
+
+class TestRunBuilderXSSSinks:
+    """Stored/DOM-XSS regression checks for bridge/run_builder.html.
+
+    The Run Builder SPA interpolates untrusted data (eLabFTW booking
+    user/title, saved method/layout spec fields, bridge job event
+    details/errors, server error messages) into ``innerHTML`` template
+    strings and double-quoted attributes. Each sink must route through a
+    central ``escHtml()`` helper (or use ``textContent``) so an attacker
+    controlling those values cannot inject HTML/JS in the browser.
+
+    These are source-level checks against the served HTML, so they run
+    without a browser, matching the existing source/served-HTML test
+    patterns in this file (see ``TestRunBuilderConfigAuth``).
+    """
+
+    HTML = ""  # populated per-test via the client fixture
+
+    @staticmethod
+    def _html(client: TestClient) -> str:
+        return client.get("/run-builder").text
+
+    def test_esc_html_helper_defined(self, client: TestClient) -> None:
+        """A single central escape helper exists and escapes all 5 chars."""
+        html = self._html(client)
+        assert "function escHtml(s)" in html, "central escHtml() helper missing"
+        body_start = html.find("function escHtml(s)")
+        body_end = html.find("}", html.find(".replace(/'/g,", body_start) + 1)
+        body = html[body_start:body_end]
+        # Reason: every character that breaks out of text content or a
+        # "..."/'...' attribute must be encoded; missing one re-opens XSS.
+        for needle in (
+            ".replace(/&/g",
+            ".replace(/</g",
+            ".replace(/>/g",
+            '.replace(/"/g',
+            ".replace(/'/g",
+        ):
+            assert needle in body, f"escHtml() does not escape {needle!r}"
+
+    def test_show_status_escapes_msg_and_type(self, client: TestClient) -> None:
+        """showStatus() interpolates msg (carries server e.message) and a
+        CSS type into innerHTML — both must be escaped."""
+        html = self._html(client)
+        assert 'status-msg ${escHtml(type)}">${escHtml(msg)}' in html
+        assert 'status-msg ${type}">${msg}' not in html
+
+    def test_booking_banner_escapes_booker(self, client: TestClient) -> None:
+        """eLabFTW booking fullname/title_only (booker) must be escaped
+        before interpolation into bookingText.innerHTML, in both the
+        active-booking and upcoming-booking branches."""
+        html = self._html(client)
+        assert "escHtml(active.fullname" in html
+        assert "escHtml(upcoming.fullname" in html
+        # Rendered copy must be preserved (not stripped to fix the bug).
+        assert "Instrument is available." in html
+        # booker must be the *already-escaped* string when assigned so the
+        # raw ${booker} interpolation in the template is safe.
+        assert "escHtml(active.fullname || active.title_only" in html
+        assert "escHtml(upcoming.fullname || upcoming.title_only" in html
+        # And the raw fullname must no longer flow straight into innerHTML.
+        assert "${active.fullname || active.title_only}</strong>" not in html
+        assert "${upcoming.fullname || upcoming.title_only}</strong>" not in html
+
+    def test_booking_banner_escapes_calendar_href(self, client: TestClient) -> None:
+        """Calendar links require an escaped, http(s)-validated URL."""
+        html = self._html(client)
+        assert "const calUrl = safeHttpUrl" in html
+        assert 'href="${escHtml(calUrl)}"' in html
+        assert 'rel="noopener noreferrer"' in html
+        assert 'href="${elabftwUrl}/database.php' not in html
+
+    def test_load_methods_escapes_titles_and_spec_fields(self, client: TestClient) -> None:
+        """Saved method title/lifecycle/spec.mode are server/user strings
+        interpolated into methodList.innerHTML — must be escaped. The
+        inline onclick JS arg must be coerced to Number to block JS-arg
+        injection from a crafted item_id."""
+        html = self._html(client)
+        assert 'resource-title">${escHtml(m.title)}' in html
+        assert 'resource-title">${m.title}' not in html
+        assert "lifecycle=${escHtml(m.lifecycle)}" in html
+        assert "mode=${escHtml(m.spec.mode||'?')}" in html
+        assert "selectMethod(${Number(m.item_id)})" in html
+        assert "selectMethod(${m.item_id})" not in html
+
+    def test_sample_legend_escapes_user_names(self, client: TestClient) -> None:
+        """sample_name / replicate_group are user-input text saved on the
+        layout spec; both legends must escape them before innerHTML."""
+        html = self._html(client)
+        assert "></div>${escHtml(name)}</div>" in html
+        assert "></div>${name}</div>" not in html
+
+    def test_select_well_escapes_input_attributes(self, client: TestClient) -> None:
+        """selectWell() interpolates sample_name / replicate_group into
+        double-quoted value="" attributes — must be escaped to prevent
+        attribute breakout (stored XSS via saved layout)."""
+        html = self._html(client)
+        assert "value=\"${escHtml(w.sample_name||'')}\"" in html
+        assert "value=\"${escHtml(w.replicate_group||'')}\"" in html
+        assert "value=\"${w.sample_name||''}\"" not in html
+        assert "value=\"${w.replicate_group||''}\"" not in html
+
+    def test_job_events_log_escapes_bridge_fields(self, client: TestClient) -> None:
+        """Bridge job events (ts/event/detail, incl. error strings) flow
+        into statusEvents.innerHTML — each field must be escaped."""
+        html = self._html(client)
+        assert "${escHtml(e.ts.slice(0,19))}] ${escHtml(e.event)}: ${escHtml(e.detail)}" in html
+        assert "${e.ts.slice(0,19)}] ${e.event}: ${e.detail}" not in html
+
+    def test_result_link_escapes_href(self, client: TestClient) -> None:
+        """Result links require an escaped, http(s)-validated URL."""
+        html = self._html(client)
+        assert "const expUrl = safeHttpUrl" in html
+        assert 'href="${escHtml(expUrl)}"' in html
+        assert 'href="${expUrl}"' not in html
+
+    def test_external_links_allow_only_http_schemes(self, client: TestClient) -> None:
+        html = self._html(client)
+        assert "function safeHttpUrl(value)" in html
+        assert "new URL(String(value))" in html
+        assert "['http:', 'https:'].includes(url.protocol)" in html
+        assert "javascript:" not in html
+        assert "data:" not in html
+
+    def test_textcontent_sinks_left_intact(self, client: TestClient) -> None:
+        """Sinks that already use textContent (instrument detail, status
+        error, progress label, booking error branch) must remain
+        textContent — they were never XSS sinks and must not regress."""
+        html = self._html(client)
+        # instrumentDetail uses textContent for currentJob; statusError for
+        # job.error; progressFill.textContent for the progress label.
+        assert "detailEl.textContent =" in html
+        assert "document.getElementById('statusError').textContent" in html
+        assert "progressFill.textContent = prog.label" in html
+        # booking error branch already used textContent for the error msg.
+        assert "bookingText').textContent = `Could not check booking status" in html
+
+
 class TestDesignerElabftwEventsSSRF:
     """The /elabftw/events proxy must percent-encode user-supplied
     query parameters so they cannot inject additional parameters or

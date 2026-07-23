@@ -13,6 +13,7 @@ This is the unattended autostart mechanism for the instrument microservice.
 """
 
 import ctypes
+import ctypes.wintypes
 import datetime
 import sys
 

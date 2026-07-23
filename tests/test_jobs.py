@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,6 +15,7 @@ from bridge.jobs import (
     ACCEPTED,
     COMPLETED,
     FAILED,
+    RUNNING,
     UNKNOWN,
     DuplicateJobError,
     Job,
@@ -333,6 +334,117 @@ class TestAbortRaceAtomicity:
         assert not any(event["event"] == "execution_started" for event in job.events)
 
 
+# --- MEDIUM: request_abort race-safe return semantics ---
+
+
+class TestAbortReturnSemantics:
+    """Race-safe return value of ``JobManager.request_abort``.
+
+    Regression for the PREPR race: ``request_abort`` set the abort intent,
+    then blocked on ``_run_start_lock`` waiting for any in-flight
+    ``_start_job_run`` to finish, but returned ``True`` unconditionally —
+    even if ``start_run`` had failed and the job already reached a terminal
+    state while we waited. The fix re-reads the status under the run-start
+    lock and reports False for any non-abort terminal outcome.
+    """
+
+    def test_abort_returns_false_when_job_fails_while_waiting_for_run_start_lock(
+        self,
+    ) -> None:
+        """start_run fails while request_abort is waiting on
+        ``_run_start_lock``: the job becomes terminal-failed and the abort
+        is inert, so ``request_abort`` must return False.
+
+        Deterministic: the test holds the run-start lock (as an in-flight
+        start_run would), triggers the abort (it blocks), marks the job
+        failed exactly as ``_fail_job`` does inside the lock, then releases
+        — pinning the exact race window the unconditional ``return True``
+        missed.
+        """
+        mgr = JobManager()
+        job = mgr.submit_job({"title": "Race"})
+        job.status = RUNNING  # _execute_job committed to running; start_run
+        # is about to be invoked.
+
+        abort_returned = threading.Event()
+        abort_result: dict[str, object] = {}
+
+        def call_abort() -> None:
+            abort_result["value"] = mgr.request_abort(job.job_id)
+            abort_returned.set()
+
+        with job._run_start_lock:
+            abort_thread = threading.Thread(target=call_abort, daemon=True)
+            abort_thread.start()
+            # The abort intent must be recorded before we simulate the
+            # failing start_run, mirroring the production ordering.
+            for _ in range(100):
+                if job.abort_requested:
+                    break
+                time.sleep(0.001)
+            assert job.abort_requested is True
+            assert abort_returned.is_set() is False, "abort must block on the run-start lock"
+
+            # Simulate _fail_job inside _start_job_run while we still hold
+            # the lock: the run failed to start and the job is now terminal.
+            job.status = FAILED
+            job.error = "start_run blew up"
+            job.add_event("execution_failed", "start_run blew up")
+
+        abort_thread.join(timeout=5.0)
+
+        assert abort_returned.is_set()
+        assert abort_result["value"] is False, (
+            "abort must report False when the job reached a non-abort "
+            "terminal state while waiting for _run_start_lock"
+        )
+        assert job.abort_requested is True, "abort intent must be recorded regardless of outcome"
+        assert job.status == FAILED
+
+    def test_abort_returns_true_when_job_still_actionable_after_run_start_lock(
+        self,
+    ) -> None:
+        """The run starts successfully (status stays RUNNING) while
+        ``request_abort`` waits on ``_run_start_lock``: the abort remains
+        actionable because polling can abort the concrete run, so
+        ``request_abort`` must return True.
+
+        Deterministic: the test holds the lock (in-flight start_run), runs
+        the abort (it blocks), then releases without changing status — the
+        successful-start outcome — and asserts True.
+        """
+        mgr = JobManager()
+        job = mgr.submit_job({"title": "Still actionable"})
+        job.status = RUNNING
+
+        abort_returned = threading.Event()
+        abort_result: dict[str, object] = {}
+
+        def call_abort() -> None:
+            abort_result["value"] = mgr.request_abort(job.job_id)
+            abort_returned.set()
+
+        with job._run_start_lock:
+            abort_thread = threading.Thread(target=call_abort, daemon=True)
+            abort_thread.start()
+            for _ in range(100):
+                if job.abort_requested:
+                    break
+                time.sleep(0.001)
+            assert job.abort_requested is True
+            assert abort_returned.is_set() is False
+            # start_run succeeds: status stays RUNNING (no transition here).
+
+        abort_thread.join(timeout=5.0)
+
+        assert abort_returned.is_set()
+        assert abort_result["value"] is True, (
+            "abort must report True when the job is still actionable after "
+            "synchronizing with a successful in-flight start_run"
+        )
+        assert job.abort_requested is True
+
+
 # --- MEDIUM: no-executor terminal exit cleanup ---
 
 
@@ -486,6 +598,74 @@ class TestBridgeApp:
         assert r1.status_code == 201
         assert r2.status_code == 201
         assert r1.json()["job_id"] != r2.json()["job_id"]
+
+
+class TestWellsSpecContract:
+    """Behavioral contract for the ``wells_spec`` field on POST /jobs.
+
+    The ``existing_protocol`` execution path does not honor ``wells_spec``
+    (the executor runs the protocol's factory plate map — see
+    ``BridgeExecutor._execute_existing_protocol``). Until plate-map override
+    is implemented, the HTTP boundary rejects a non-empty ``wells_spec`` in
+    that mode with 422 so clients see an explicit failure instead of a
+    silently-ignored override. Empty/omitted values and ``generated_protocol``
+    behavior are preserved.
+    """
+
+    _EXISTING: ClassVar[dict[str, Any]] = {
+        "title": "OD600 Test",
+        "execution_mode": "existing_protocol",
+        "protocol_name": "Absorbance @ 600 (1.0s)",
+    }
+
+    @pytest.mark.parametrize(
+        "spec",
+        [
+            {"all": True},
+            {"rows": ["A", "B"]},
+            {"wells": ["A1", "A2"]},
+        ],
+    )
+    def test_existing_protocol_rejects_nonempty_wells_spec(
+        self, client: TestClient, spec: dict[str, Any]
+    ) -> None:
+        """Non-empty wells_spec in existing_protocol mode fails closed (422)."""
+        r = client.post("/jobs", json={**self._EXISTING, "wells_spec": spec})
+        assert r.status_code == 422
+        body = r.json()
+        # FastAPI surfaces model_validator failures in the standard error array.
+        assert "detail" in body
+        messages = " ".join(entry.get("msg", "") for entry in body["detail"])
+        assert "wells_spec" in messages
+        assert "existing_protocol" in messages
+
+    def test_existing_protocol_accepts_empty_wells_spec(self, client: TestClient) -> None:
+        """Empty wells_spec preserves the pre-existing default behavior."""
+        r = client.post("/jobs", json={**self._EXISTING, "wells_spec": {}})
+        assert r.status_code == 201
+        assert r.json()["wells_spec"] == {}
+
+    def test_existing_protocol_accepts_omitted_wells_spec(self, client: TestClient) -> None:
+        """Omitted wells_spec defaults to {} and is accepted."""
+        r = client.post("/jobs", json=self._EXISTING)
+        assert r.status_code == 201
+        assert r.json()["wells_spec"] == {}
+
+    def test_generated_protocol_preserves_nonempty_wells_spec(self, client: TestClient) -> None:
+        """generated_protocol behavior is unchanged: a non-empty wells_spec
+        is still accepted at the boundary (its use, or lack of use, by the
+        executor is out of scope for this contract gate)."""
+        r = client.post(
+            "/jobs",
+            json={
+                "title": "Generated",
+                "execution_mode": "generated_protocol",
+                "method_ref": {"object_id": 1},
+                "wells_spec": {"rows": ["A"]},
+            },
+        )
+        assert r.status_code == 201
+        assert r.json()["wells_spec"] == {"rows": ["A"]}
 
 
 # --- JobManager-level duplicate detection tests ---

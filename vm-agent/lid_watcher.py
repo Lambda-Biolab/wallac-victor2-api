@@ -15,6 +15,7 @@ IInstrumentEvents.OnError's Action out-param; see doc 100.)
 
 import contextlib
 import ctypes
+import ctypes.wintypes
 import logging
 import os
 import time

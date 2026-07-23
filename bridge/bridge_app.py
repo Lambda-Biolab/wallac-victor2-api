@@ -22,7 +22,7 @@ from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .config import BridgeConfig
 from .elabftw import ElabftwClient
@@ -46,7 +46,15 @@ class JobSubmitRequest(BaseModel):
     elabftw_experiment_id: int = Field(0, description="eLabFTW experiment ID for result write-back")
     wells_spec: dict[str, Any] = Field(
         default_factory=dict,
-        description="Well specification for plate map override: {all: true}, {rows: [A,B]}, or {wells: [A1,A2]}",
+        description=(
+            "Well specification for plate map override: {all: true}, "
+            "{rows: [A,B]}, or {wells: [A1,A2]}. "
+            "Not yet honored by the existing_protocol execution path — a "
+            "non-empty value is rejected with 422 in that mode to fail closed "
+            "rather than silently run the protocol's factory plate map. "
+            "Left accepted (but currently unused) for generated_protocol, "
+            "whose plate map is derived from the signed Layout spec."
+        ),
     )
     expected_outputs: str = Field("", description="Expected measurement outputs")
     spec_dict: dict[str, Any] = Field(
@@ -57,6 +65,32 @@ class JobSubmitRequest(BaseModel):
     analysis_ref: dict[str, Any] = Field(
         default_factory=dict, description="Signed Analysis reference"
     )
+
+    @model_validator(mode="after")
+    def _reject_wells_spec_for_existing_protocol(self) -> JobSubmitRequest:
+        """Fail closed when ``wells_spec`` is honored by no execution path.
+
+        The ``existing_protocol`` executor runs the resolved protocol with its
+        factory plate map — :meth:`BridgeExecutor._execute_existing_protocol`
+        never reads :attr:`wells_spec`. Accepting a non-empty spec there would
+        return ``201`` and silently drop the requested override, violating the
+        public API contract. Until plate-map override is implemented for
+        ``existing_protocol`` (the path that clones a protocol and patches the
+        plate map, as :meth:`BridgeExecutor._clone_for_layout` does for
+        ``generated_protocol``), reject the combination at the HTTP boundary
+        with ``422`` so clients see an explicit, machine-readable failure
+        instead of a run that ignored their input. Empty / omitted
+        :attr:`wells_spec` keeps the pre-existing behavior; generated_protocol
+        is left untouched.
+        """
+        if self.execution_mode == "existing_protocol" and self.wells_spec:
+            raise ValueError(
+                "wells_spec is not yet honored in existing_protocol mode; "
+                "the run would silently use the protocol's factory plate map. "
+                "Omit wells_spec (or pass {}) to run the protocol unchanged, "
+                "or switch to generated_protocol for a plate-map override."
+            )
+        return self
 
 
 class JobResponse(BaseModel):

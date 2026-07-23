@@ -29,7 +29,7 @@ See [`auth-secrets-policy.md`](auth-secrets-policy.md) for the full policy.
 | Method & path | Purpose |
 |---|---|
 | `GET /health` | bridge liveness + worker status + current job |
-| `POST /jobs` | submit a job for execution (idempotent: duplicate spec → `409`) |
+| `POST /jobs` | submit a job for execution (idempotent: duplicate spec → `409`; `422` when `wells_spec` is non-empty in `existing_protocol` mode — see below) |
 | `GET /jobs` | list all jobs |
 | `GET /jobs/{job_id}` | job status, events, artifacts, live wells |
 | `POST /jobs/{job_id}/abort` | abort a running job |
@@ -49,3 +49,23 @@ See [`auth-secrets-policy.md`](auth-secrets-policy.md) for the full policy.
 
 For the draft/signed lifecycle and canonical JSON schemas, see
 [`elabftw-object-model.md`](elabftw-object-model.md).
+
+### `POST /jobs` — `wells_spec` contract
+
+The request body carries an optional `wells_spec` field intended as a plate-map
+override (`{"all": true}`, `{"rows": ["A","B"]}`, or `{"wells": ["A1","A2"]}`).
+
+- **`existing_protocol`** — plate-map override is **not yet implemented**. The
+  executor runs the resolved protocol with its factory plate map and ignores
+  `wells_spec`. To fail closed rather than silently drop the request, a
+  **non-empty** `wells_spec` is rejected at the HTTP boundary with **`422`**
+  and a message naming the field and the mode. Omit `wells_spec` (or pass `{}`)
+  to run the protocol unchanged.
+- **`generated_protocol`** — plate map is derived from the signed
+  `layout_ref` spec; `wells_spec` is accepted (currently unused) to preserve
+  forward compatibility.
+
+The boundary gate lives in `bridge/bridge_app.py::JobSubmitRequest`; the
+executor-level behavior latch (cloning + `update_plate_map`) is implemented
+for `generated_protocol` only, in
+`bridge/executor.py::BridgeExecutor._clone_for_layout`.
