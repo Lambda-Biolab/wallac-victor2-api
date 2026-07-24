@@ -22,6 +22,7 @@ import html
 import json
 import logging
 import time
+import urllib.error
 from typing import Any, Callable
 
 from .analysis import AnalysisPipeline
@@ -338,6 +339,41 @@ class BridgeExecutor:
         job.error = message
         job.add_event("operator_review_required", detail or message)
 
+    def _check_elabftw_preflight(self, job: Job) -> bool:
+        """Fail the wet run before mutation when eLabFTW is unavailable."""
+        try:
+            self.elabftw.check_connection()
+        except urllib.error.HTTPError as error:
+            classification = "auth" if error.code in (401, 403) else "http"
+            message = (
+                "eLabFTW preflight authentication failed"
+                if classification == "auth"
+                else f"eLabFTW preflight failed with HTTP {error.code}"
+            )
+            self._fail_job(job, message)
+            job.add_event(
+                "elabftw_preflight_failed",
+                f"classification={classification} status={error.code}",
+            )
+            return False
+        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as error:
+            self._fail_job(job, "eLabFTW preflight failed: service unreachable")
+            job.add_event(
+                "elabftw_preflight_failed",
+                f"classification=unreachable error={type(error).__name__}",
+            )
+            return False
+        except Exception as error:
+            logger.exception("Unexpected eLabFTW preflight error for job %s", job.job_id)
+            self._fail_job(job, "eLabFTW preflight failed unexpectedly")
+            job.add_event(
+                "elabftw_preflight_failed",
+                f"classification=unexpected error={type(error).__name__}",
+            )
+            return False
+        job.add_event("elabftw_preflight_ok", "")
+        return True
+
     def _find_protocol_by_name(self, protocol_name: str) -> dict[str, Any] | None:
         """Find a protocol by exact name in the vm-agent listing."""
         response = self.vm_agent.get_protocols()
@@ -453,6 +489,11 @@ class BridgeExecutor:
                 "dry_run_complete",
                 f"Would run protocol {job.protocol_name}{wells_summary}",
             )
+            return
+
+        # Reason: no clone, plate-map update, assay snapshot, or physical run
+        # may occur until eLabFTW authentication and TLS have succeeded.
+        if not self._check_elabftw_preflight(job):
             return
 
         # Plate-map override path: clone the factory preset, PATCH the plate
@@ -897,6 +938,11 @@ class BridgeExecutor:
             job.add_event("dry_run_complete", "Specs validated, would run on instrument")
             return
 
+        # Reason: protocol matching leads to clone/MDB mutation, so wet jobs
+        # must prove eLabFTW authentication and TLS first.
+        if not self._check_elabftw_preflight(job):
+            return
+
         protocol_name, protocol_id = self._match_protocol_from_method(method_spec)
         if not protocol_name:
             self._fail_job(job, "Could not match method spec to an instrument protocol")
@@ -1254,8 +1300,8 @@ class BridgeExecutor:
 
         # Requested analysis raised: raw results were written back so the
         # operator can inspect them, but the job is not cleanly completed.
-        # A write-back failure keeps the job ``failed`` — that stronger
-        # terminal state wins.
+        # A write-back failure already promotes the measured run to operator
+        # review, so either ambiguity remains terminal.
         if analysis_failed and job.status == "completed":
             self._mark_operator_review(
                 job,
@@ -1268,7 +1314,7 @@ class BridgeExecutor:
         # promotion decision above is final, so event consumers never see
         # execution_completed for a job that ends in
         # unknown_requires_operator_review. A failed write-back already
-        # recorded writeback_failed and stays failed.
+        # recorded elabftw_writeback_failed and remains operator-review.
         if job.status == "completed":
             job.add_event("execution_completed", "")
 
@@ -1331,9 +1377,16 @@ class BridgeExecutor:
             job.add_event("writeback_completed", f"experiment={exp_id}")
 
         except Exception as e:
-            job.status = "failed"
-            job.error = f"Write-back failed: {e}"
-            job.add_event("writeback_failed", str(e))
+            detail = (
+                f"run_id={job.run_id or 'unknown'}; eLabFTW write-back failed after measurement; "
+                "do not automatically rerun the assay"
+            )
+            self._mark_operator_review(
+                job,
+                f"Write-back failed after measurement: {e}",
+                detail=detail,
+            )
+            job.add_event("elabftw_writeback_failed", str(e))
             logger.exception("Write-back failed for job %s", job.job_id)
 
     def _build_results_html(self, job: Job, raw_wells: list[dict[str, Any]]) -> str:

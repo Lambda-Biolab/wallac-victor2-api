@@ -12,6 +12,7 @@ Tests cover:
 from __future__ import annotations
 
 import threading
+import urllib.error
 from typing import Any
 
 import pytest
@@ -32,7 +33,15 @@ class MockElabftwClient:
         self._experiments: dict[int, dict[str, Any]] = {}
         self._next_exp_id = 1
         self.fail_upload = False
+        self.preflight_error: Exception | None = None
+        self.preflight_calls = 0
         self.uploaded_files: list[str] = []
+
+    def check_connection(self) -> list[Any]:
+        self.preflight_calls += 1
+        if self.preflight_error is not None:
+            raise self.preflight_error
+        return []
 
     def add_upload(self, item_id: int, upload_id: int, content: bytes) -> None:
         self._uploads[(item_id, upload_id)] = content
@@ -233,6 +242,59 @@ def executor_wet(elabftw: MockElabftwClient, vm_agent: MockVmAgentClient) -> Bri
         elabftw=elabftw,
         dry_run=False,
     )
+
+
+class TestElabftwPreflight:
+    @pytest.mark.parametrize(
+        ("protocol_id", "protocol_name"),
+        [(1001, ""), (0, "Absorbance @ 600 (1.0s)")],
+    )
+    def test_failure_blocks_all_existing_protocol_side_effects(
+        self,
+        protocol_id: int,
+        protocol_name: str,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        elabftw.preflight_error = urllib.error.URLError("unreachable")
+        job = Job(
+            job_id="preflight-failure",
+            title="Preflight failure",
+            execution_mode="existing_protocol",
+            protocol_id=protocol_id,
+            protocol_name=protocol_name,
+            wells_spec={"wells": ["A01"]},
+            created_at="2026-01-01T00:00:00",
+        )
+
+        executor_wet(job)
+
+        assert job.status == "failed"
+        assert elabftw.preflight_calls == 1
+        assert vm_agent.cloned_protocols == []
+        assert vm_agent.plate_map_writes == []
+        assert vm_agent._runs == {}
+        assert any(event["event"] == "elabftw_preflight_failed" for event in job.events)
+
+    def test_dry_run_skips_remote_preflight(
+        self,
+        executor: BridgeExecutor,
+        elabftw: MockElabftwClient,
+    ) -> None:
+        elabftw.preflight_error = urllib.error.URLError("unreachable")
+        job = Job(
+            job_id="preflight-dry-run",
+            title="Preflight dry run",
+            execution_mode="existing_protocol",
+            protocol_id=1001,
+            created_at="2026-01-01T00:00:00",
+        )
+
+        executor(job)
+
+        assert job.status == "completed"
+        assert elabftw.preflight_calls == 0
 
 
 # --- Test: Full generated_protocol execution with hash verification ---
@@ -567,7 +629,7 @@ class TestGeneratedProtocolHashVerification:
         assert job.status == "failed"
         assert "Could not match method spec" in job.error
 
-    def test_writeback_failure_marks_job_failed(
+    def test_writeback_failure_requires_operator_review(
         self,
         executor_wet: BridgeExecutor,
         elabftw: MockElabftwClient,
@@ -577,9 +639,14 @@ class TestGeneratedProtocolHashVerification:
 
         job = self._execute_method_spec(executor_wet, elabftw, spec)
 
-        assert job.status == "failed"
-        assert "Write-back failed" in job.error
-        assert any(event["event"] == "writeback_failed" for event in job.events)
+        assert job.status == "unknown_requires_operator_review"
+        assert "Write-back failed after measurement" in job.error
+        assert any(event["event"] == "elabftw_writeback_failed" for event in job.events)
+        review_event = next(
+            event for event in job.events if event["event"] == "operator_review_required"
+        )
+        assert f"run_id={job.run_id}" in review_event["detail"]
+        assert "do not automatically rerun" in review_event["detail"]
 
     def test_zero_reading_is_preserved_in_results_html(
         self,

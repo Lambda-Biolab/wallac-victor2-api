@@ -5,7 +5,9 @@ eLabFTW for jobs. Instead, it accepts job submissions via HTTP POST and
 executes them on a background worker thread.
 
 Endpoints:
-  GET  /health           — bridge health check
+  GET  /health           — backwards-compatible health summary
+  GET  /health/live      — process liveness check
+  GET  /health/ready     — worker and dependency readiness check
   POST /jobs             — submit a job for execution
   GET  /jobs             — list all jobs
   GET  /jobs/{job_id}    — get job status
@@ -21,7 +23,7 @@ import hmac
 import os
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, status
+from fastapi import FastAPI, Header, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -153,8 +155,8 @@ def _bridge_token(config: BridgeConfig | None) -> str:
     return token
 
 
-def _wire_executor(config: BridgeConfig, job_manager: JobManager) -> None:
-    """Connect the job manager to the configured external adapters."""
+def _wire_executor(config: BridgeConfig, job_manager: JobManager) -> BridgeExecutor:
+    """Connect the job manager to configured adapters and return the executor."""
     vm_agent = VmAgentClient(base_url=config.vm_agent_url, token=config.vm_agent_token)
     elabftw = ElabftwClient(
         base_url=config.elabftw_url,
@@ -162,10 +164,10 @@ def _wire_executor(config: BridgeConfig, job_manager: JobManager) -> None:
         verify_tls=config.elabftw_verify_tls,
         ca_bundle=config.elabftw_ca_bundle,
     )
-    job_manager.set_executor(
-        BridgeExecutor(vm_agent=vm_agent, elabftw=elabftw, dry_run=config.dry_run)
-    )
+    executor = BridgeExecutor(vm_agent=vm_agent, elabftw=elabftw, dry_run=config.dry_run)
+    job_manager.set_executor(executor)
     job_manager.start_worker()
+    return executor
 
 
 def _configure_cors(app: FastAPI, config: BridgeConfig | None) -> None:
@@ -188,19 +190,72 @@ def _configure_cors(app: FastAPI, config: BridgeConfig | None) -> None:
     )
 
 
-def _register_routes(app: FastAPI, manager: JobManager, token: str) -> None:
-    """Register the bridge HTTP contract against one job manager."""
+def _health_ready_response(
+    manager: JobManager, executor: BridgeExecutor | None
+) -> tuple[dict[str, Any], bool]:
+    """Build the /health/ready response dict and ready flag."""
+    issues: list[str] = []
+    worker_running = manager.worker_running
+    if not worker_running:
+        issues.append("worker_not_running")
+    if executor is None:
+        issues.append("dependencies_not_configured")
+    else:
+        try:
+            executor.elabftw.check_connection(timeout=1.5)
+
+        except Exception:
+            issues.append("elabftw_unavailable")
+        try:
+            executor.vm_agent.get_health()
+        except Exception:
+            issues.append("vm_agent_unavailable")
+    ready = not issues
+    return {
+        "status": "ready" if ready else "not_ready",
+        "ready": ready,
+        "worker_running": worker_running,
+        "issues": issues,
+    }, ready
+
+
+def _register_health_routes(
+    app: FastAPI,
+    manager: JobManager,
+    executor: BridgeExecutor | None,
+) -> None:
+    """Register liveness/readiness endpoints on the app."""
 
     @app.get("/health")
     def health() -> dict[str, Any]:
         current = manager.current_job
         return {
             "status": "ok",
-            "worker_running": (
-                manager._worker_thread is not None and manager._worker_thread.is_alive()
-            ),
+            "worker_running": manager.worker_running,
             "current_job": current.job_id if current else "",
         }
+
+    @app.get("/health/live")
+    def health_live() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/health/ready")
+    def health_ready(response: Response) -> dict[str, Any]:
+        body, ready = _health_ready_response(manager, executor)
+        if not ready:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return body
+
+
+def _register_routes(
+    app: FastAPI,
+    manager: JobManager,
+    token: str,
+    executor: BridgeExecutor | None,
+) -> None:
+    """Register the bridge HTTP contract against one job manager."""
+
+    _register_health_routes(app, manager, executor)
 
     @app.post("/jobs", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
     def submit_job(
@@ -261,8 +316,7 @@ def create_bridge_app(
         config = BridgeConfig.from_env()
     manager = job_manager or JobManager()
     token = _bridge_token(config)
-    if config is not None:
-        _wire_executor(config, manager)
+    executor = _wire_executor(config, manager) if config is not None else None
 
     app = FastAPI(
         title="Wallac Victor2 Bridge",
@@ -272,5 +326,5 @@ def create_bridge_app(
 
     install_security_headers(app)
     _configure_cors(app, config)
-    _register_routes(app, manager, token)
+    _register_routes(app, manager, token, executor)
     return app

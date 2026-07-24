@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import pytest
 from fastapi.testclient import TestClient
 
-from bridge.bridge_app import create_bridge_app
+from bridge.bridge_app import _health_ready_response, create_bridge_app
 from bridge.jobs import (
     ABORTED,
     ACCEPTED,
@@ -486,12 +487,61 @@ def client(app: Any) -> TestClient:
     return TestClient(app)
 
 
+class TestReadinessResponse:
+    @staticmethod
+    def _manager() -> Any:
+        return SimpleNamespace(worker_running=True)
+
+    def test_ready_when_worker_and_dependencies_are_available(self) -> None:
+        executor = SimpleNamespace(
+            elabftw=SimpleNamespace(check_connection=lambda **_: []),
+            vm_agent=SimpleNamespace(get_health=lambda: {"status": "ok"}),
+        )
+        body, ready = _health_ready_response(self._manager(), executor)
+        assert ready is True
+        assert body["issues"] == []
+        assert body["status"] == "ready"
+
+    @pytest.mark.parametrize(
+        ("dependency", "expected_issue"),
+        [("elabftw", "elabftw_unavailable"), ("vm_agent", "vm_agent_unavailable")],
+    )
+    def test_dependency_failure_degrades_readiness(
+        self, dependency: str, expected_issue: str
+    ) -> None:
+        def fail(**_: Any) -> None:
+            raise RuntimeError("unavailable")
+
+        executor = SimpleNamespace(
+            elabftw=SimpleNamespace(
+                check_connection=fail if dependency == "elabftw" else lambda **_: []
+            ),
+            vm_agent=SimpleNamespace(
+                get_health=fail if dependency == "vm_agent" else lambda: {"status": "ok"}
+            ),
+        )
+        body, ready = _health_ready_response(self._manager(), executor)
+        assert ready is False
+        assert expected_issue in body["issues"]
+
+
 class TestBridgeApp:
     def test_health(self, client: TestClient) -> None:
         r = client.get("/health")
         assert r.status_code == 200
         data = r.json()
         assert data["status"] == "ok"
+
+    def test_health_live(self, client: TestClient) -> None:
+        response = client.get("/health/live")
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+
+    def test_health_ready_reports_unconfigured_dependencies(self, client: TestClient) -> None:
+        response = client.get("/health/ready")
+        assert response.status_code == 503
+        assert response.json()["ready"] is False
+        assert "dependencies_not_configured" in response.json()["issues"]
 
     def test_submit_job(self, client: TestClient) -> None:
         r = client.post(

@@ -106,9 +106,11 @@ class ElabftwClient:
         *,
         verify_tls: bool = True,
         ca_bundle: str | None = None,
+        timeout: float = 30.0,
     ) -> None:
         self.base = base_url.rstrip("/") + "/api/v2"
         self.api_key = api_key
+        self.timeout = timeout
         self._ssl_ctx = build_ssl_context(
             verify_tls=verify_tls,
             ca_bundle=ca_bundle,
@@ -119,6 +121,7 @@ class ElabftwClient:
         method: str,
         path: str,
         body: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> Any:
         url = f"{self.base}{path}"
         data = json.dumps(body).encode() if body is not None else None
@@ -129,7 +132,9 @@ class ElabftwClient:
         if body is not None:
             req.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(req, context=self._ssl_ctx) as resp:  # noqa: S310
+            with urllib.request.urlopen(  # noqa: S310  # Base URL is operator config.
+                req, context=self._ssl_ctx, timeout=timeout or self.timeout
+            ) as resp:
                 content = resp.read()
                 if not content:
                     # POST may return 201 with Location header but empty body.
@@ -146,6 +151,10 @@ class ElabftwClient:
             logger.error("eLabFTW API %s %s -> %s: %s", method, path, e.code, detail)
             raise
 
+    def check_connection(self, timeout: float | None = None) -> Any:
+        """Verify that eLabFTW is reachable and the API key is authorized."""
+        return self._request("GET", "/experiments?limit=1&scope=1", timeout=timeout)
+
     def download_upload(self, item_id: int, upload_id: int) -> bytes:
         """Download the raw bytes of an upload attachment.
 
@@ -154,7 +163,7 @@ class ElabftwClient:
         url = f"{self.base}/items/{item_id}/uploads/{upload_id}?format=binary"
         req = urllib.request.Request(url)  # noqa: S310  # Base URL is operator config.
         req.add_header("Authorization", self.api_key)
-        with urllib.request.urlopen(req, context=self._ssl_ctx) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=self.timeout) as resp:  # noqa: S310
             return resp.read()
 
     def patch_metadata(self, item_id: int, extra_fields: dict[str, Any]) -> None:
@@ -204,7 +213,7 @@ class ElabftwClient:
         req.add_header("Authorization", self.api_key)
         req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
         try:
-            with urllib.request.urlopen(req, context=self._ssl_ctx) as resp:  # noqa: S310
+            with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=self.timeout) as resp:  # noqa: S310
                 content_resp = resp.read()
                 if content_resp:
                     return json.loads(content_resp)
@@ -375,7 +384,7 @@ class ElabftwClient:
         req.add_header("Authorization", self.api_key)
         req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
         try:
-            with urllib.request.urlopen(req, context=self._ssl_ctx) as resp:  # noqa: S310
+            with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=self.timeout) as resp:  # noqa: S310
                 content_resp = resp.read()
                 if content_resp:
                     return json.loads(content_resp)
