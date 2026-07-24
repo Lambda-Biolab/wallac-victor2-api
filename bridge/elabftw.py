@@ -15,7 +15,41 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from bridge.config import ConfigError
+
 logger = logging.getLogger(__name__)
+
+
+def build_ssl_context(*, verify_tls: bool, ca_bundle: str | None = None) -> ssl.SSLContext:
+    """Build the eLabFTW trust context without weakening normal verification."""
+    # Reason: direct callers still receive the CA-bundle invariant even when
+    # they bypass BridgeConfig.from_env; environment gating remains there.
+    if ca_bundle and not verify_tls:
+        raise ConfigError("CA bundle cannot be used when TLS verification is disabled")
+    if not verify_tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    ctx = ssl.create_default_context()
+    if ca_bundle:
+        # Reason: validate in an empty store so a CA already present in system
+        # trust is not deduplicated and falsely rejected as a non-CA bundle.
+        validation_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        invalid_bundle_error = f"Invalid eLabFTW CA bundle: {ca_bundle}"
+        try:
+            validation_ctx.load_verify_locations(cafile=ca_bundle)
+        except (OSError, ssl.SSLError) as exc:
+            raise ConfigError(invalid_bundle_error) from exc
+        if validation_ctx.cert_store_stats()["x509_ca"] == 0:
+            raise ConfigError(f"eLabFTW CA bundle contains no CA:TRUE trust anchor: {ca_bundle}")
+        try:
+            # Defensive second read catches replacement/removal between validation and use.
+            ctx.load_verify_locations(cafile=ca_bundle)
+        except (OSError, ssl.SSLError) as exc:
+            raise ConfigError(invalid_bundle_error) from exc
+    return ctx
 
 
 # --- Metadata helpers (shared by real and mock clients) --------------------
@@ -71,15 +105,14 @@ class ElabftwClient:
         api_key: str,
         *,
         verify_tls: bool = True,
+        ca_bundle: str | None = None,
     ) -> None:
         self.base = base_url.rstrip("/") + "/api/v2"
         self.api_key = api_key
-        if verify_tls:
-            self._ssl_ctx = ssl.create_default_context()
-        else:
-            self._ssl_ctx = ssl.create_default_context()
-            self._ssl_ctx.check_hostname = False
-            self._ssl_ctx.verify_mode = ssl.CERT_NONE
+        self._ssl_ctx = build_ssl_context(
+            verify_tls=verify_tls,
+            ca_bundle=ca_bundle,
+        )
 
     def _request(
         self,

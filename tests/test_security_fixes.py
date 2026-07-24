@@ -289,6 +289,8 @@ class TestSecurityHeadersMiddleware:
             elabftw_url="https://elabftw.example:3148",
             elabftw_api_key="test-key",
             elabftw_verify_tls=True,
+            elabftw_ca_bundle=None,
+            wallac_env="test",
             vm_agent_url="http://vm-agent:8420",
             vm_agent_token="vm-token",
         )

@@ -160,6 +160,7 @@ def _wire_executor(config: BridgeConfig, job_manager: JobManager) -> None:
         base_url=config.elabftw_url,
         api_key=config.elabftw_api_key,
         verify_tls=config.elabftw_verify_tls,
+        ca_bundle=config.elabftw_ca_bundle,
     )
     job_manager.set_executor(
         BridgeExecutor(vm_agent=vm_agent, elabftw=elabftw, dry_run=config.dry_run)
