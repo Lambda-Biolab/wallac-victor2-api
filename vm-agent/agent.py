@@ -13,8 +13,11 @@ in a different user context cannot attach (0x80080005).
 COM is apartment-threaded: all COM access happens on one dedicated STA worker
 thread; HTTP handler threads submit calls to it and block for the result.
 
-Auth: optional bearer token read from TOKEN_FILE (no secret in code). If the
-file is absent, auth is disabled (the NAT is host-only) and a warning logs.
+Auth: optional bearer token read from ``TOKEN_FILE`` (no secret in code).
+If the file is absent, auth is disabled (the NAT is host-only) and a warning
+logs. The default path lives under ``C:\\ProgramData\\Wallac\\`` so the ACL
+on the containing directory can be restricted; ``validate_token_file_path()``
+rejects any path outside the allowlist (issue #31).
 """
 
 import contextlib
@@ -22,6 +25,7 @@ import hmac
 import json
 import logging
 import math
+import ntpath
 import os
 import queue
 import re
@@ -46,7 +50,20 @@ ABORT_FLAG = r"C:\Users\Public\abort.flag"
 MIN_ABORT_AGE = 60.0
 BIND_HOST = "0.0.0.0"  # noqa: S104  # VM has only the host-only libvirt NAT NIC.
 BIND_PORT = 8420
-TOKEN_FILE = r"C:\Users\Public\agent_token.txt"  # noqa: S105  # File path, not a token.
+# Where the bearer token lives. ``C:\Users\Public\`` is world-readable on a
+# default Windows install, so the token MUST live under ``C:\ProgramData\Wallac\``
+# (or a subdirectory thereof) and the directory's ACL must be restricted to
+# SYSTEM / Administrators / the agent's service account. See issue #31 and
+# ``validate_token_file_path()`` below.
+TOKEN_FILE = r"C:\ProgramData\Wallac\agent_token.txt"  # noqa: S105  # File path, not a token.
+# Operator override (useful for tests, ephemeral VMs, or rotated token files).
+ENV_TOKEN_FILE = "WALLAC_VM_AGENT_TOKEN_FILE"  # noqa: S105  # env var name, not a secret.
+# Legacy world-readable path that we explicitly REJECT (audit #3, issue #31).
+# If a token is still present here, ``load_token()`` will warn but not read
+# it -- the agent refuses to start with auth loaded from a world-readable
+# location. This constant exists so the warning message can name the path
+# without scattering the literal.
+LEGACY_TOKEN_FILE = r"C:\Users\Public\agent_token.txt"  # noqa: S105  # File path, not a token.
 CALL_TIMEOUT = 20.0
 
 # Protocols are not in the COM API -- read from the Jet DB (doc 95).
@@ -68,12 +85,160 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+# --------------------------------------------------------------------------
+# Token-file path validation (audit #3, issue #31).
+# --------------------------------------------------------------------------
+# Reason: the previous default ``C:\Users\Public\agent_token.txt`` is
+# world-readable on a default Windows install. The path allowlist below
+# ensures the agent refuses to load a token from a publicly-discoverable
+# location, even if an operator points ``WALLAC_VM_AGENT_TOKEN_FILE`` at one.
+#
+# The allowlist accepts:
+#   - Windows production: anything under ``C:\ProgramData\Wallac\``
+#   - Linux/CI tests:     anything under ``/run/wallac/`` or ``/tmp/wallac/``
+#                         (test fixtures only)
+# On Windows the ACL of the containing directory must ALSO be restricted
+# to SYSTEM / Administrators / the agent's service account -- this function
+# only validates the path string, not the ACL. Run ``icacls`` after moving
+# the file to confirm.
+
+# Path fragments. Built with ``os.sep`` and ``ntpath`` joins to stay
+# portable between Windows and Linux test runs.
+#
+# - The Windows allowlist entry MUST use ``ntpath`` so ``C:`` is treated
+#   as a drive letter on every platform. ``os.path.join`` on Linux drops
+#   the ``C:`` and yields ``/ProgramData/Wallac`` -- not what we want.
+# - The Linux allowlist entries use ``os.sep`` (forward slash) because
+#   they are only used by the test runner and must be reachable on Linux.
+_ALLOWED_TOKEN_DIRS = (
+    ntpath.join("C:", ntpath.sep, "ProgramData", "Wallac"),
+    os.path.join(os.sep, "run", "wallac"),
+    os.path.join(os.sep, "tmp", "wallac"),
+)
+
+
+def _is_windows_path(raw):
+    """Return True if ``raw`` looks like a Windows path (drive letter or UNC).
+
+    Used to pick the right normalizer: ``ntpath`` for Windows-style inputs
+    (so ``C:/Foo`` and ``C:\\Foo`` collapse to the same form) and ``os.path``
+    for Linux-style inputs (so ``/tmp/foo`` is not mangled into ``\\tmp\\foo``).
+    """
+    s = str(raw).lstrip()
+    if not s:
+        return False
+    # Drive letter: 'C:\\' or 'C:/' or just 'C:'
+    if len(s) >= 2 and s[1] == ":" and s[0].isalpha():
+        return True
+    # UNC: '\\\\server\\share'
+    return bool(s.startswith("\\\\") or s.startswith("//"))
+
+
+def _normalize_token_path(raw):
+    """Normalize a token-file path to an absolute, separator-clean form.
+
+    Picks ``ntpath`` for Windows-style inputs and ``os.path`` for Linux-style.
+    Returns the absolute form (no symlink resolution -- that's the OS's job
+    when we actually ``open()`` the file).
+    """
+    if _is_windows_path(raw):
+        return ntpath.abspath(ntpath.normpath(raw))
+    return os.path.abspath(os.path.normpath(raw))
+
+
+def _resolve_token_path():
+    """Return the raw path the agent will use to load the token.
+
+    Order of precedence (matches typical 12-factor env-override pattern):
+      1. ``WALLAC_VM_AGENT_TOKEN_FILE`` env var (operator override)
+      2. ``TOKEN_FILE`` module constant (the safe default)
+
+    Returns the raw (un-normalized) path string. The caller is expected to
+    pass the result to ``validate_token_file_path()`` before any ``open()``.
+    """
+    raw = os.environ.get(ENV_TOKEN_FILE, "").strip() or TOKEN_FILE
+    raw = str(raw).strip()
+    if not raw:
+        raise ValueError("empty token file path")
+    return raw
+
+
+def validate_token_file_path(raw_path):
+    """Return the normalized absolute path if it is in the allowlist, else raise.
+
+    Accepts a raw path string (from the env var or the default ``TOKEN_FILE``).
+    Returns the normalized absolute form on success. Raises ``ValueError`` with
+    a human-readable reason on failure.
+
+    The function is pure-Python and unit-testable on Linux: the comparison
+    uses ``ntpath`` for Windows-style inputs and ``os.path`` for Linux-style
+    inputs, so an operator's mixed-separator Windows path
+    (``C:/ProgramData/Wallac``) is accepted on either platform.
+    """
+    if not raw_path or not str(raw_path).strip():
+        raise ValueError("empty token file path")
+
+    abs_path = _normalize_token_path(str(raw_path).strip())
+
+    if _is_windows_path(abs_path):
+        # Use ntpath for the comparison set: matches the Windows production
+        # allowlist exactly regardless of which OS runs the comparison.
+        # Windows filesystems are case-insensitive, so compare the entire
+        # path lowercased. ``ntpath.normpath`` has already resolved ``..``,
+        # so case-folding does not introduce new traversal vectors.
+        norm = ntpath.normpath
+        sep = ntpath.sep
+        cmp_path = abs_path.lower()
+    else:
+        norm = os.path.normpath
+        sep = os.sep
+        cmp_path = abs_path
+
+    allowed = tuple(norm(p).lower() for p in _ALLOWED_TOKEN_DIRS)
+    if not any(cmp_path == a or cmp_path.startswith(a + sep) for a in allowed):
+        allowed_str = ", ".join(allowed)
+        raise ValueError(
+            f"token file path {abs_path!r} is not under an allowed directory "
+            f"(allowed: {allowed_str})"
+        )
+    return abs_path
+
+
 def load_token():
+    """Load the bearer token from a path in the allowlist.
+
+    Returns the token string, or ``None`` if the file is missing / empty /
+    unreadable. Refuses to read from a path outside the allowlist and logs
+    a warning naming the rejected path. If a token is still present at the
+    legacy ``C:\\Users\\Public\\agent_token.txt`` path, this function ALSO
+    logs a warning so an operator notices the stale file during the cutover.
+    """
+    # Surface the legacy file so an operator notices the cutover. The
+    # warning fires every start until the operator removes the old file.
+    if os.path.isfile(LEGACY_TOKEN_FILE):
+        sys.stderr.write(
+            f"WARNING: legacy token file still present at {LEGACY_TOKEN_FILE}; "
+            f"remove it after deploying the new token at {TOKEN_FILE} (issue #31)\n"
+        )
+
     try:
-        with open(TOKEN_FILE, encoding="utf-8") as fh:
+        path = _resolve_token_path()
+    except ValueError as exc:
+        sys.stderr.write(f"WARNING: {exc} -> auth DISABLED\n")
+        return None
+
+    try:
+        path = validate_token_file_path(path)
+    except ValueError as exc:
+        sys.stderr.write(f"WARNING: refusing to load token from disallowed path: {exc}\n")
+        return None
+
+    try:
+        with open(path, encoding="utf-8") as fh:
             tok = fh.read().strip()
             return tok or None
-    except OSError:
+    except OSError as exc:
+        sys.stderr.write(f"WARNING: cannot read {path}: {exc} -> auth DISABLED\n")
         return None
 
 
@@ -1594,7 +1759,10 @@ def op_mdb_ensure_group(group_name, group_id):
 _DOCS = {
     "service": "Wallac 1420 agent",
     "version": "0.2",
-    "auth": "Authorization: Bearer <token>  (token file: C:\\Users\\Public\\agent_token.txt)",
+    "auth": (
+        "Authorization: Bearer <token>  (token file: C:\\ProgramData\\Wallac\\agent_token.txt; "
+        "override path with env WALLAC_VM_AGENT_TOKEN_FILE; world-readable paths are rejected)"
+    ),
     "quickstart": 'POST /measure {"protocol":"Absorbance @ 600"} -> waits, returns the OD table',
     "well_object": {"well": "A01", "od": 0.07, "counts": 360671},
     "endpoints": [
