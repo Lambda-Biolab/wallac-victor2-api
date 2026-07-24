@@ -34,10 +34,13 @@ def build_ssl_context(*, verify_tls: bool, ca_bundle: str | None = None) -> ssl.
 
     ctx = ssl.create_default_context()
     if ca_bundle:
+        ca_count_before = ctx.cert_store_stats()["x509_ca"]
         try:
             ctx.load_verify_locations(cafile=ca_bundle)
         except (OSError, ssl.SSLError) as exc:
             raise ConfigError(f"Invalid eLabFTW CA bundle: {ca_bundle}") from exc
+        if ctx.cert_store_stats()["x509_ca"] <= ca_count_before:
+            raise ConfigError(f"eLabFTW CA bundle contains no CA:TRUE trust anchor: {ca_bundle}")
     return ctx
 
 

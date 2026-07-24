@@ -10,8 +10,11 @@ Source contract: eLabFTW-lambdabiolab/docs/wallac-plate-reader-integration.md
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 # --- Environment variable names --------------------------------------------
 
@@ -119,6 +122,11 @@ class BridgeConfig:
         if not verify_tls and wallac_env in _SECURE_ENVIRONMENTS:
             raise ConfigError(
                 f"{ENV_ELABFTW_VERIFY_TLS}=0 is only allowed in local/dev/test environments"
+            )
+        if not verify_tls:
+            logger.warning(
+                "eLabFTW TLS verification is disabled for emergency diagnostics; "
+                "do not use this mode for regular operation"
             )
 
         return cls(

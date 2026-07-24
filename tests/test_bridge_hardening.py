@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+import ssl
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -15,6 +19,8 @@ from bridge.config import (
 from bridge.designer_app import create_designer_app
 from bridge.elabftw import build_ssl_context
 from bridge.jobs import JobManager
+
+CERT_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "certs"
 
 
 def test_config_requires_api_key() -> None:
@@ -60,6 +66,20 @@ def test_config_elabftw_verify_tls_can_be_disabled(value: str) -> None:
         }
     )
     assert config.elabftw_verify_tls is False
+
+
+def test_config_warns_when_tls_verification_is_disabled(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="bridge.config"):
+        BridgeConfig.from_env(
+            env={
+                ENV_ELABFTW_API_KEY: "5-key",
+                "WALLAC_ENV": "dev",
+                "WALLAC_ELABFTW_VERIFY_TLS": "0",
+            }
+        )
+
+    assert "emergency diagnostics" in caplog.text
+    assert "regular operation" in caplog.text
 
 
 def test_config_rejects_invalid_boolean() -> None:
@@ -129,6 +149,35 @@ def test_ssl_context_rejects_invalid_pem_bundle(tmp_path) -> None:
     )
     with pytest.raises(ConfigError, match="Invalid"):
         build_ssl_context(verify_tls=True, ca_bundle=str(bundle))
+
+
+def test_ssl_context_accepts_ca_true_bundle() -> None:
+    ca_count_before = ssl.create_default_context().cert_store_stats()["x509_ca"]
+    context = build_ssl_context(
+        verify_tls=True,
+        ca_bundle=str(CERT_FIXTURES / "ca-true.crt"),
+    )
+    assert context.cert_store_stats()["x509_ca"] >= ca_count_before + 1
+
+
+def test_ssl_context_accepts_multi_ca_bundle(tmp_path) -> None:
+    ca_count_before = ssl.create_default_context().cert_store_stats()["x509_ca"]
+    bundle = tmp_path / "ca-bundle.pem"
+    bundle.write_text(
+        (CERT_FIXTURES / "ca-true.crt").read_text(encoding="utf-8")
+        + (CERT_FIXTURES / "ca-true-2.crt").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    context = build_ssl_context(verify_tls=True, ca_bundle=str(bundle))
+    assert context.cert_store_stats()["x509_ca"] >= ca_count_before + 2
+
+
+def test_ssl_context_rejects_ca_false_bundle() -> None:
+    with pytest.raises(ConfigError, match="no CA:TRUE trust anchor"):
+        build_ssl_context(
+            verify_tls=True,
+            ca_bundle=str(CERT_FIXTURES / "ca-false.crt"),
+        )
 
 
 def test_designer_rejects_invalid_ca_bundle_at_startup(tmp_path) -> None:
