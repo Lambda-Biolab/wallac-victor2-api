@@ -17,6 +17,7 @@ If unset, auth is disabled (dev mode only).
 
 from __future__ import annotations
 
+import hmac
 import os
 from typing import Any
 
@@ -28,6 +29,7 @@ from .config import BridgeConfig
 from .elabftw import ElabftwClient
 from .executor import BridgeExecutor
 from .jobs import DuplicateJobError, Job, JobManager
+from .security_headers import install_security_headers
 from .vm_agent_client import VmAgentClient
 
 # --- Pydantic models ---
@@ -121,7 +123,12 @@ def _job_to_response(job: Job) -> JobResponse:
 
 
 def _check_auth(token: str, authorization: str | None) -> None:
-    """Check bearer token. No-op if token is empty (dev mode)."""
+    """Check bearer token. No-op if token is empty (dev mode).
+
+    Uses ``hmac.compare_digest`` for constant-time comparison. The check is
+    deliberately tolerant of length differences — ``compare_digest`` returns
+    False (without raising) when lengths differ, so we don't need a guard.
+    """
     if not token:
         return
     if not authorization or not authorization.startswith("Bearer "):
@@ -129,7 +136,8 @@ def _check_auth(token: str, authorization: str | None) -> None:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or invalid Authorization header",
         )
-    if authorization.removeprefix("Bearer ") != token:
+    presented = authorization.removeprefix("Bearer ")
+    if not hmac.compare_digest(presented.encode("utf-8"), token.encode("utf-8")):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 
@@ -261,6 +269,7 @@ def create_bridge_app(
         version="2.0.0",
     )
 
+    install_security_headers(app)
     _configure_cors(app, config)
     _register_routes(app, manager, token)
     return app

@@ -1007,29 +1007,32 @@ function selectWell(name) {
     w.classList.toggle('selected', w.dataset.well === name);
   });
   const w = plateWells[name];
-  // Reason: sample_name and replicate_group are user-input text
-  // interpolated into double-quoted value="" attributes — escape to
-  // prevent attribute breakout / stored XSS. Well name and roles are
-  // internal constants (A-H × 1-12 / fixed enums).
+  // Reason: sample_name and replicate_group are user-input text interpolated
+  // into double-quoted value="" attributes — escape to prevent attribute
+  // breakout / stored XSS. Well name is also escaped here as defense in
+  // depth — it's currently constrained to A-H × 1-12, but treating it as
+  // untrusted prevents a class of regressions if the construction site
+  // ever loosens.
+  const safeName = escHtml(name);
   document.getElementById('wellDetail').innerHTML = `
-    <label>Well: ${name}</label>
+    <label>Well: ${safeName}</label>
     <label style="margin-top:8px;">Role</label>
-    <select onchange="updateWell('${name}', 'role', this.value)">
+    <select onchange="updateWell('${safeName}', 'role', this.value)">
       <option value="measured" ${w.role==='measured'?'selected':''}>Measured</option>
       <option value="skipped" ${w.role==='skipped'?'selected':''}>Skipped</option>
       <option value="excluded" ${w.role==='excluded'?'selected':''}>Excluded</option>
     </select>
     <label style="margin-top:8px;">Control type</label>
-    <select onchange="updateWell('${name}', 'control_type', this.value)">
+    <select onchange="updateWell('${safeName}', 'control_type', this.value)">
       <option value="" ${!w.control_type?'selected':''}>None</option>
       <option value="blank" ${w.control_type==='blank'?'selected':''}>Blank</option>
       <option value="positive_control" ${w.control_type==='positive_control'?'selected':''}>Positive control</option>
       <option value="negative_control" ${w.control_type==='negative_control'?'selected':''}>Negative control</option>
     </select>
     <label style="margin-top:8px;">Sample name</label>
-    <input type="text" value="${escHtml(w.sample_name||'')}" onchange="updateWell('${name}', 'sample_name', this.value)" />
+    <input type="text" value="${escHtml(w.sample_name||'')}" onchange="updateWell('${safeName}', 'sample_name', this.value)" />
     <label style="margin-top:8px;">Replicate group</label>
-    <input type="text" value="${escHtml(w.replicate_group||'')}" onchange="updateWell('${name}', 'replicate_group', this.value)" />
+    <input type="text" value="${escHtml(w.replicate_group||'')}" onchange="updateWell('${safeName}', 'replicate_group', this.value)" />
   `;
 }
 

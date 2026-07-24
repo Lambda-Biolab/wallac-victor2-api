@@ -17,6 +17,7 @@ If the token is unset, auth is disabled (dev mode only).
 
 from __future__ import annotations
 
+import hmac
 import os
 from typing import Any, Callable
 
@@ -27,6 +28,7 @@ from .config import BridgeConfig
 from .designer import ATTACHMENT_NAMES, DesignerService, DraftObject
 from .elabftw import ElabftwClient
 from .errors import BridgeError
+from .security_headers import install_security_headers
 
 # --- Pydantic models for request/response ---
 
@@ -96,7 +98,11 @@ def _bridge_error_to_http(e: BridgeError) -> HTTPException:
 
 
 def _make_auth_check(token: str) -> Callable[..., None]:
-    """Return a FastAPI dependency that checks the bearer token."""
+    """Return a FastAPI dependency that checks the bearer token.
+
+    Uses ``hmac.compare_digest`` for constant-time comparison; ``compare_digest``
+    returns False (without raising) when lengths differ, so no guard is needed.
+    """
 
     def _check_auth(authorization: str | None = Header(default=None)) -> None:
         if not token:
@@ -106,7 +112,8 @@ def _make_auth_check(token: str) -> Callable[..., None]:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Missing or invalid Authorization header",
             )
-        if authorization.removeprefix("Bearer ") != token:
+        presented = authorization.removeprefix("Bearer ")
+        if not hmac.compare_digest(presented.encode("utf-8"), token.encode("utf-8")):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid token",
@@ -327,6 +334,8 @@ def create_designer_app(
         description="Authenticated draft APIs for protocol authoring",
         version="0.1.0",
     )
+
+    install_security_headers(app)
 
     @app.get("/health")
     def health() -> dict[str, str]:

@@ -203,8 +203,10 @@ class JobManager:
             The created Job with job_id and status=accepted.
         """
         key = dedup_key(job_spec)
+        # 16-hex prefix = 64 bits of entropy — comfortable margin against
+        # bearer-token-aided enumeration of jobs in flight.
         job = Job(
-            job_id=f"job-{uuid.uuid4().hex[:12]}",
+            job_id=f"job-{uuid.uuid4().hex[:16]}",
             title=job_spec.get("title", "Untitled"),
             execution_mode=job_spec.get("execution_mode", "existing_protocol"),
             protocol_name=job_spec.get("protocol_name", ""),

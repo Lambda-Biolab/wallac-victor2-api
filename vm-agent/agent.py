@@ -18,11 +18,13 @@ file is absent, auth is disabled (the NAT is host-only) and a warning logs.
 """
 
 import contextlib
+import hmac
 import json
 import logging
 import math
 import os
 import queue
+import re
 import shutil
 import sys
 import threading
@@ -111,6 +113,127 @@ class ApiError(Exception):
             out["detail"] = self.detail
         out.update(self.extra)
         return out
+
+
+# --------------------------------------------------------------------------
+# Read-only SQL validator for /mdb/query.
+# --------------------------------------------------------------------------
+# Reason: the previous startswith("SELECT") check was bypassable via
+# ``SELECT 1 UNION SELECT ProtName FROM AssayProtocol`` (read exfiltration)
+# or ``SELECT * INTO NewTable FROM AssayProtocol`` (write). The validator
+# below rejects stacked statements, comments, UNION/INTO, DDL/DML verbs,
+# and Jet system-table access. Keep this conservative; if legitimate
+# queries need richer syntax, extend the allowlist rather than relaxing
+# the validator. See docs/api-reference.md /mdb/query.
+
+_FORBIDDEN_SQL_PATTERNS = (
+    re.compile(r"\bUNION\b", re.IGNORECASE),
+    re.compile(r"\bINTO\b", re.IGNORECASE),  # SELECT INTO / INSERT INTO
+    re.compile(r"\bINSERT\b", re.IGNORECASE),
+    re.compile(r"\bUPDATE\b", re.IGNORECASE),
+    re.compile(r"\bDELETE\b", re.IGNORECASE),
+    re.compile(r"\bDROP\b", re.IGNORECASE),
+    re.compile(r"\bCREATE\b", re.IGNORECASE),
+    re.compile(r"\bALTER\b", re.IGNORECASE),
+    re.compile(r"\bEXEC(UTE)?\b", re.IGNORECASE),
+    re.compile(r"\bMSYS", re.IGNORECASE),  # Jet system-object prefix (MSysObjects, MSysQueries, …)
+    re.compile(r"\bTRANSFORM\b", re.IGNORECASE),  # crosstab queries
+    re.compile(r"\bPARAMETERS\b", re.IGNORECASE),  # parameter queries
+)
+
+
+def validate_readonly_sql(sql):
+    """Reject any SQL that is not a simple read-only SELECT.
+
+    Raises ApiError(400) on stacked statements, comments, system-table
+    access, or any DDL/DML verb. The ``/mdb/query`` endpoint is documented
+    as read-only — these checks make that contract enforceable.
+
+    This is a conservative validator. Legitimate queries that need richer
+    syntax should be added to an explicit allowlist rather than relaxing
+    these checks.
+    """
+    if not sql or not sql.strip():
+        raise ApiError(400, "invalid_query", "empty query")
+
+    s = sql.strip()
+
+    # Strip SQL line comments (-- ...) and block comments (/* ... */) FIRST
+    # so attackers can't hide UNION/INTO/';' inside a comment.
+    no_comments = re.sub(r"--[^\n]*", "", s)
+    no_comments = re.sub(r"/\*.*?\*/", "", no_comments, flags=re.DOTALL)
+
+    # Strip single-quoted string literals so protocol names that happen to
+    # contain SQL verbs (e.g. ``ProtName = 'UPDATE_v2_protocol'``) don't
+    # trigger false positives. Jet SQL escapes embedded quotes as ``''``,
+    # which this pattern handles. String literals are data, not code — the
+    # DAO engine treats them as values, so removing them from the keyword
+    # scan surface does not weaken the validator.
+    no_strings = re.sub(r"'(?:[^']|'')*'", "''", no_comments)
+
+    # Only a trailing ';' is allowed; reject any other ';' (stacked statements).
+    # Operate on no_strings so a ';' inside a line/block comment or string
+    # literal does not trigger a false positive. DAO's ``OpenRecordset``
+    # rejects multi-statement batches regardless of where ';' appears, so
+    # this check is defense in depth on top of the DAO behavior — but it must
+    # run on sanitized text to avoid breaking legitimate queries.
+    trailing = no_strings.rstrip()
+    if trailing.endswith(";"):
+        trailing = trailing[:-1].rstrip()
+    if ";" in trailing:
+        raise ApiError(400, "invalid_query", "multiple statements are not allowed")
+
+    # First non-whitespace token must be SELECT (case-insensitive).
+    first_token = no_strings.strip().split(None, 1)[0].upper()
+    # ruff flags the literal "SELECT" as a possible hardcoded password; it is
+    # the SQL keyword we're matching against, not a credential.
+    if first_token != "SELECT":  # noqa: S105
+        raise ApiError(400, "invalid_query", "only SELECT queries are allowed")
+
+    for pattern in _FORBIDDEN_SQL_PATTERNS:
+        if pattern.search(no_strings):
+            raise ApiError(400, "invalid_query", "forbidden keyword: " + pattern.pattern)
+
+
+# --------------------------------------------------------------------------
+# Filename sanitizer for /mdb/backup.
+# --------------------------------------------------------------------------
+# Reason: ``os.path.join(MDB_BACKUP_DIR, name)`` discards MDB_BACKUP_DIR when
+# ``name`` is absolute, letting a token holder copy the MDB to any path the
+# vm-agent process can write. Sanitize before joining. See docs/api-reference
+# /mdb/backup.
+_WINDOWS_RESERVED = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def sanitize_backup_filename(name):
+    """Return ``name`` if it is a safe filename; raise ApiError(400) otherwise.
+
+    Rejects:
+      - empty / whitespace names
+      - absolute paths (drive letters, UNC, leading ``/`` or ``\\``)
+      - parent-directory references (``..`` or ``.``)
+      - path separators anywhere in the name
+      - Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+      - any name that, after ``os.path.basename()``, differs from the input
+        (catches platform-specific hidden path components)
+    """
+    if not name or not name.strip():
+        raise ApiError(400, "invalid_name", "empty backup name")
+    candidate = name.strip()
+    if "/" in candidate or "\\" in candidate or ":" in candidate:
+        raise ApiError(400, "invalid_name", "path components not allowed")
+    if candidate in (".", ".."):
+        raise ApiError(400, "invalid_name", "invalid filename")
+    base_upper = candidate.upper().split(".")[0]
+    if base_upper in _WINDOWS_RESERVED:
+        raise ApiError(400, "invalid_name", "reserved device name")
+    if os.path.basename(candidate) != candidate:
+        raise ApiError(400, "invalid_name", "filename contains path components")
+    return candidate
 
 
 def _classify_exc(exc):
@@ -1318,8 +1441,6 @@ def _wells_to_plate_map(body):
                 for col in range(12):
                     grid[row_idx * 12 + col] = 1
     elif body.get("wells"):
-        import re
-
         for well in body["wells"]:
             m = re.match(r"^([A-H])(\d{1,2})$", well.upper().strip())
             if not m:
@@ -1400,9 +1521,10 @@ def op_mdb_update_plate_map(assay_prot_id, plate_map):
 
 def op_mdb_backup(name):
     def _op(_srv):
+        safe_name = sanitize_backup_filename(name)
         if not os.path.exists(MDB_BACKUP_DIR):
             os.makedirs(MDB_BACKUP_DIR)
-        backup_path = os.path.join(MDB_BACKUP_DIR, name)
+        backup_path = os.path.join(MDB_BACKUP_DIR, safe_name)
         shutil.copy2(MDB_SRC, backup_path)
         return backup_path
 
@@ -1411,9 +1533,7 @@ def op_mdb_backup(name):
 
 def op_mdb_query(sql):
     def _op(_srv):
-        stripped = sql.strip().upper()
-        if not stripped.startswith("SELECT"):
-            raise ApiError(400, "invalid_query", "only SELECT queries are allowed")
+        validate_readonly_sql(sql)
         db = _open_mdb_r()
         try:
             rs = db.OpenRecordset(sql)
@@ -1597,7 +1717,12 @@ class Handler(BaseHTTPRequestHandler):
         token = self.server.token
         if token is None:
             return True
-        return self.headers.get("Authorization", "") == "Bearer " + token
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return False
+        presented = auth[len("Bearer ") :]
+        # compare_digest returns False when lengths differ (no exception).
+        return hmac.compare_digest(presented.encode("utf-8"), token.encode("utf-8"))
 
     def _send_csv(self, code, text):
         body = text.encode("utf-8")
@@ -1752,6 +1877,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"backup_path": backup_path, "created": True})
 
     def _mdb_query(self):
+        _check_authoring()
         body = self._read_json()
         sql = body.get("sql", "")
         if not sql:
