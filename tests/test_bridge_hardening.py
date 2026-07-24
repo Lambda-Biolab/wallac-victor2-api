@@ -6,8 +6,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from bridge.bridge_app import create_bridge_app
-from bridge.config import ENV_ELABFTW_API_KEY, BridgeConfig, ConfigError
+from bridge.config import (
+    ENV_ELABFTW_API_KEY,
+    ENV_ELABFTW_CA_BUNDLE,
+    BridgeConfig,
+    ConfigError,
+)
 from bridge.designer_app import create_designer_app
+from bridge.elabftw import build_ssl_context
 from bridge.jobs import JobManager
 
 
@@ -47,9 +53,93 @@ def test_config_elabftw_verify_tls_defaults_true() -> None:
 @pytest.mark.parametrize("value", ["0", "false", "no", "off"])
 def test_config_elabftw_verify_tls_can_be_disabled(value: str) -> None:
     config = BridgeConfig.from_env(
-        env={ENV_ELABFTW_API_KEY: "5-key", "WALLAC_ELABFTW_VERIFY_TLS": value}
+        env={
+            ENV_ELABFTW_API_KEY: "5-key",
+            "WALLAC_ENV": "test",
+            "WALLAC_ELABFTW_VERIFY_TLS": value,
+        }
     )
     assert config.elabftw_verify_tls is False
+
+
+def test_config_rejects_invalid_boolean() -> None:
+    with pytest.raises(ConfigError, match="Invalid boolean"):
+        BridgeConfig.from_env(
+            env={ENV_ELABFTW_API_KEY: "5-key", "WALLAC_ELABFTW_VERIFY_TLS": "ture"}
+        )
+
+
+def test_config_defaults_to_secure_environment() -> None:
+    config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key"})
+    assert config.wallac_env == "production"
+
+
+@pytest.mark.parametrize("environment", ["staging", "prod", "production"])
+def test_config_rejects_tls_disable_in_secure_environments(environment: str) -> None:
+    with pytest.raises(ConfigError, match="only allowed"):
+        BridgeConfig.from_env(
+            env={
+                ENV_ELABFTW_API_KEY: "5-key",
+                "WALLAC_ENV": environment,
+                "WALLAC_ELABFTW_VERIFY_TLS": "0",
+            }
+        )
+
+    config = BridgeConfig.from_env(
+        env={
+            ENV_ELABFTW_API_KEY: "5-key",
+            "WALLAC_ENV": "dev",
+            "WALLAC_ELABFTW_VERIFY_TLS": "0",
+        }
+    )
+    assert config.wallac_env == "dev"
+    assert config.elabftw_verify_tls is False
+    assert config.elabftw_ca_bundle is None
+
+
+def test_config_rejects_tls_disable_in_production() -> None:
+    with pytest.raises(ConfigError, match="only allowed"):
+        BridgeConfig.from_env(
+            env={
+                ENV_ELABFTW_API_KEY: "5-key",
+                "WALLAC_ENV": "production",
+                "WALLAC_ELABFTW_VERIFY_TLS": "0",
+            }
+        )
+
+
+def test_config_rejects_bundle_with_tls_disabled(tmp_path) -> None:
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text("not used", encoding="utf-8")
+    with pytest.raises(ConfigError, match="cannot be set"):
+        BridgeConfig.from_env(
+            env={
+                ENV_ELABFTW_API_KEY: "5-key",
+                ENV_ELABFTW_CA_BUNDLE: str(bundle),
+                "WALLAC_ELABFTW_VERIFY_TLS": "0",
+            }
+        )
+
+
+def test_ssl_context_rejects_invalid_pem_bundle(tmp_path) -> None:
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text(
+        "-----BEGIN CERTIFICATE-----\n!!!notbase64!!!\n-----END CERTIFICATE-----\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="Invalid"):
+        build_ssl_context(verify_tls=True, ca_bundle=str(bundle))
+
+
+def test_designer_rejects_invalid_ca_bundle_at_startup(tmp_path) -> None:
+    config = BridgeConfig.from_env(
+        env={
+            ENV_ELABFTW_API_KEY: "5-key",
+            ENV_ELABFTW_CA_BUNDLE: str(tmp_path / "missing.pem"),
+        }
+    )
+    with pytest.raises(ConfigError, match="Invalid eLabFTW CA bundle"):
+        create_designer_app(config=config, service=object())
 
 
 def test_config_cors_origins_defaults_empty() -> None:

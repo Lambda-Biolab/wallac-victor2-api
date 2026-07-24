@@ -15,7 +15,30 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from bridge.config import ConfigError
+
 logger = logging.getLogger(__name__)
+
+
+def build_ssl_context(*, verify_tls: bool, ca_bundle: str | None = None) -> ssl.SSLContext:
+    """Build the eLabFTW trust context without weakening normal verification."""
+    # Reason: direct callers still receive the CA-bundle invariant even when
+    # they bypass BridgeConfig.from_env; environment gating remains there.
+    if ca_bundle and not verify_tls:
+        raise ConfigError("CA bundle cannot be used when TLS verification is disabled")
+    if not verify_tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    ctx = ssl.create_default_context()
+    if ca_bundle:
+        try:
+            ctx.load_verify_locations(cafile=ca_bundle)
+        except (OSError, ssl.SSLError) as exc:
+            raise ConfigError(f"Invalid eLabFTW CA bundle: {ca_bundle}") from exc
+    return ctx
 
 
 # --- Metadata helpers (shared by real and mock clients) --------------------
@@ -71,15 +94,14 @@ class ElabftwClient:
         api_key: str,
         *,
         verify_tls: bool = True,
+        ca_bundle: str | None = None,
     ) -> None:
         self.base = base_url.rstrip("/") + "/api/v2"
         self.api_key = api_key
-        if verify_tls:
-            self._ssl_ctx = ssl.create_default_context()
-        else:
-            self._ssl_ctx = ssl.create_default_context()
-            self._ssl_ctx.check_hostname = False
-            self._ssl_ctx.verify_mode = ssl.CERT_NONE
+        self._ssl_ctx = build_ssl_context(
+            verify_tls=verify_tls,
+            ca_bundle=ca_bundle,
+        )
 
     def _request(
         self,

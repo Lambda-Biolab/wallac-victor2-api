@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 
 from .config import BridgeConfig
 from .designer import ATTACHMENT_NAMES, DesignerService, DraftObject
-from .elabftw import ElabftwClient
+from .elabftw import ElabftwClient, build_ssl_context
 from .errors import BridgeError
 from .security_headers import install_security_headers
 
@@ -250,10 +250,18 @@ def _register_elabftw_proxy(
     untrusted certs. This proxy lets the browser call same-origin HTTP.
     """
     import json as _json
-    import ssl
     import urllib.error
     import urllib.parse
     import urllib.request
+
+    ctx = (
+        build_ssl_context(
+            verify_tls=config.elabftw_verify_tls,
+            ca_bundle=config.elabftw_ca_bundle,
+        )
+        if config
+        else None
+    )
 
     @app.get("/elabftw/events", dependencies=[Depends(auth_dep)])
     def get_elabftw_events(items_id: int, start: str = "", end: str = "") -> list:
@@ -265,8 +273,9 @@ def _register_elabftw_proxy(
         # parameters or path segments into the eLabFTW URL. ``items_id`` is
         # typed as ``int`` and the base URL comes from server config, so the
         # only user-controllable input is the query string, which we now
-        # encode. This addresses the CodeQL ``py/partial-ssrf`` finding at
-        # designer_app.py:258.
+        # encode. This addresses the CodeQL ``py/partial-ssrf`` finding in
+        # this handler.
+
         query: dict[str, str | int] = {"items_id": items_id}
         if start:
             query["start"] = start
@@ -276,13 +285,6 @@ def _register_elabftw_proxy(
         url = f"{config.elabftw_url}/api/v2/events?{urllib.parse.urlencode(query)}"
         req = urllib.request.Request(url)  # noqa: S310  # Base URL is server config.
         req.add_header("Authorization", config.elabftw_api_key)
-
-        ctx = ssl.create_default_context()
-        if not config.elabftw_verify_tls:
-            # Operator opt-out for self-signed eLabFTW certs. Set
-            # WALLAC_ELABFTW_VERIFY_TLS=0 in deploy/bridge.env.
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
 
         try:
             with urllib.request.urlopen(req, context=ctx) as resp:  # noqa: S310
@@ -314,6 +316,7 @@ def create_designer_app(
             base_url=config.elabftw_url,
             api_key=config.elabftw_api_key,
             verify_tls=config.elabftw_verify_tls,
+            ca_bundle=config.elabftw_ca_bundle,
         )
         service = DesignerService(client)
 
