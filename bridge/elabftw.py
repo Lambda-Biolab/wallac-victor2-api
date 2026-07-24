@@ -34,13 +34,21 @@ def build_ssl_context(*, verify_tls: bool, ca_bundle: str | None = None) -> ssl.
 
     ctx = ssl.create_default_context()
     if ca_bundle:
-        ca_count_before = ctx.cert_store_stats()["x509_ca"]
+        # Reason: validate in an empty store so a CA already present in system
+        # trust is not deduplicated and falsely rejected as a non-CA bundle.
+        validation_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        invalid_bundle_error = f"Invalid eLabFTW CA bundle: {ca_bundle}"
         try:
+            validation_ctx.load_verify_locations(cafile=ca_bundle)
+        except (OSError, ssl.SSLError) as exc:
+            raise ConfigError(invalid_bundle_error) from exc
+        if validation_ctx.cert_store_stats()["x509_ca"] == 0:
+            raise ConfigError(f"eLabFTW CA bundle contains no CA:TRUE trust anchor: {ca_bundle}")
+        try:
+            # Defensive second read catches replacement/removal between validation and use.
             ctx.load_verify_locations(cafile=ca_bundle)
         except (OSError, ssl.SSLError) as exc:
-            raise ConfigError(f"Invalid eLabFTW CA bundle: {ca_bundle}") from exc
-        if ctx.cert_store_stats()["x509_ca"] <= ca_count_before:
-            raise ConfigError(f"eLabFTW CA bundle contains no CA:TRUE trust anchor: {ca_bundle}")
+            raise ConfigError(invalid_bundle_error) from exc
     return ctx
 
 

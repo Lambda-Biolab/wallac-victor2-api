@@ -160,6 +160,25 @@ def test_ssl_context_accepts_ca_true_bundle() -> None:
     assert context.cert_store_stats()["x509_ca"] >= ca_count_before + 1
 
 
+def test_ssl_context_accepts_already_trusted_ca(monkeypatch: pytest.MonkeyPatch) -> None:
+    ca_bundle = str(CERT_FIXTURES / "ca-true.crt")
+    original_create_default_context = ssl.create_default_context
+
+    def create_context_with_ca() -> ssl.SSLContext:
+        context = original_create_default_context()
+        context.load_verify_locations(cafile=ca_bundle)
+        return context
+
+    preloaded_ca_count = create_context_with_ca().cert_store_stats()["x509_ca"]
+    # Regression guard: patch only the populated default context; the bare
+    # SSLContext used for semantic validation must remain empty.
+    monkeypatch.setattr("bridge.elabftw.ssl.create_default_context", create_context_with_ca)
+
+    context = build_ssl_context(verify_tls=True, ca_bundle=ca_bundle)
+    assert context.check_hostname is True
+    assert context.cert_store_stats()["x509_ca"] >= preloaded_ca_count
+
+
 def test_ssl_context_accepts_multi_ca_bundle(tmp_path) -> None:
     ca_count_before = ssl.create_default_context().cert_store_stats()["x509_ca"]
     bundle = tmp_path / "ca-bundle.pem"
