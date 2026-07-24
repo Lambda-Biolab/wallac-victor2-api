@@ -70,7 +70,13 @@ unpatched security bugs.
 
 | ID | Severity | Status | Summary |
 |---|---|---|---|
-| _none_ | | | All audit findings closed. The `vm-agent` token file is now restricted to `C:\ProgramData\Wallac\agent_token.txt` with a runtime path allowlist (PR #34, [issue #31](https://github.com/Lambda-Biolab/wallac-victor2-api/issues/31)). The directory ACL itself is still pending a Windows VM redeploy — see the PR description for the `icacls` command to run after the first deploy. |
+| [#37](https://github.com/Lambda-Biolab/wallac-victor2-api/issues/37) | Medium | open | Replace the Windows 7 VM (and Python 3.8 32-bit) with a supported host. Decomposed into sub-issues; both Windows are past end-of-life. |
+| [#38](https://github.com/Lambda-Biolab/wallac-victor2-api/issues/38) | Low | open | Ask GitHub Support to force-GC the repo to purge immutable refs containing the old (now-rotated) credential. Vendor action. |
+
+All audit findings from PR #30 are closed: path-allowlist code in
+[PR #34](https://github.com/Lambda-Biolab/wallac-victor2-api/pull/34)
+(issue #31), `icacls` and legacy-file removal on the production VM
+([issue #36](https://github.com/Lambda-Biolab/wallac-victor2-api/issues/36)).
 
 ## Related documentation
 
