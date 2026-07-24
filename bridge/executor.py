@@ -21,6 +21,8 @@ from __future__ import annotations
 import html
 import json
 import logging
+import socket
+import ssl
 import time
 import urllib.error
 from typing import Any, Callable
@@ -339,6 +341,21 @@ class BridgeExecutor:
         job.error = message
         job.add_event("operator_review_required", detail or message)
 
+    @staticmethod
+    def _classify_preflight_error(error: BaseException) -> str:
+        """Map transport failures to safe operator-facing categories."""
+        reason = getattr(error, "reason", None)
+        cause = reason if isinstance(reason, BaseException) else error
+        if isinstance(cause, ssl.SSLError):
+            return "tls"
+        if isinstance(cause, socket.gaierror):
+            return "dns"
+        if isinstance(cause, (TimeoutError, socket.timeout)):
+            return "timeout"
+        if isinstance(cause, (ConnectionRefusedError, ConnectionResetError, ConnectionError)):
+            return "connection"
+        return "unreachable"
+
     def _check_elabftw_preflight(self, job: Job) -> bool:
         """Fail the wet run before mutation when eLabFTW is unavailable."""
         try:
@@ -357,10 +374,11 @@ class BridgeExecutor:
             )
             return False
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as error:
-            self._fail_job(job, "eLabFTW preflight failed: service unreachable")
+            classification = self._classify_preflight_error(error)
+            self._fail_job(job, "eLabFTW preflight failed")
             job.add_event(
                 "elabftw_preflight_failed",
-                f"classification=unreachable error={type(error).__name__}",
+                f"classification={classification}",
             )
             return False
         except Exception as error:

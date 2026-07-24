@@ -11,6 +11,8 @@ Tests cover:
 
 from __future__ import annotations
 
+import socket
+import ssl
 import threading
 import urllib.error
 from typing import Any
@@ -276,6 +278,43 @@ class TestElabftwPreflight:
         assert vm_agent.plate_map_writes == []
         assert vm_agent._runs == {}
         assert any(event["event"] == "elabftw_preflight_failed" for event in job.events)
+
+    def test_auth_failure_is_classified_without_response_body(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+    ) -> None:
+        elabftw.preflight_error = urllib.error.HTTPError(
+            "https://elab/api/v2/experiments", 401, "Unauthorized", {}, None
+        )
+        job = Job(
+            job_id="preflight-auth",
+            title="Preflight auth",
+            execution_mode="existing_protocol",
+            protocol_id=1001,
+            created_at="2026-01-01T00:00:00",
+        )
+
+        executor_wet(job)
+
+        assert job.status == "failed"
+        event = next(event for event in job.events if event["event"] == "elabftw_preflight_failed")
+        assert "classification=auth" in event["detail"]
+        assert "Unauthorized" not in event["detail"]
+
+    @pytest.mark.parametrize(
+        ("error", "classification"),
+        [
+            (ssl.SSLError("certificate verify failed"), "tls"),
+            (urllib.error.URLError(socket.gaierror("name resolution failed")), "dns"),
+            (TimeoutError("timed out"), "timeout"),
+            (ConnectionRefusedError("refused"), "connection"),
+        ],
+    )
+    def test_transport_failures_are_classified_safely(
+        self, error: BaseException, classification: str
+    ) -> None:
+        assert BridgeExecutor._classify_preflight_error(error) == classification
 
     def test_dry_run_skips_remote_preflight(
         self,

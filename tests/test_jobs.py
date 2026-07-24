@@ -495,7 +495,7 @@ class TestReadinessResponse:
     def test_ready_when_worker_and_dependencies_are_available(self) -> None:
         executor = SimpleNamespace(
             elabftw=SimpleNamespace(check_connection=lambda **_: []),
-            vm_agent=SimpleNamespace(get_health=lambda: {"status": "ok"}),
+            vm_agent=SimpleNamespace(get_health=lambda **_: {"status": "ok"}),
         )
         body, ready = _health_ready_response(self._manager(), executor)
         assert ready is True
@@ -517,7 +517,7 @@ class TestReadinessResponse:
                 check_connection=fail if dependency == "elabftw" else lambda **_: []
             ),
             vm_agent=SimpleNamespace(
-                get_health=fail if dependency == "vm_agent" else lambda: {"status": "ok"}
+                get_health=fail if dependency == "vm_agent" else lambda **_: {"status": "ok"}
             ),
         )
         body, ready = _health_ready_response(self._manager(), executor)

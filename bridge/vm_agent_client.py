@@ -47,6 +47,7 @@ class VmAgentClient:
         method: str,
         path: str,
         body: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> Any:
         # URL-encode the path to handle protocol names with spaces/special chars
         import urllib.parse
@@ -72,7 +73,7 @@ class VmAgentClient:
         if body is not None:
             req.add_header("Content-Type", "application/json")
         try:
-            with urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
+            with urlopen(req, timeout=timeout or self.timeout) as resp:  # noqa: S310
                 content = resp.read()
                 if not content:
                     return None
@@ -93,9 +94,9 @@ class VmAgentClient:
 
     # --- Health & instrument ---
 
-    def get_health(self) -> dict[str, Any]:
+    def get_health(self, timeout: float | None = None) -> dict[str, Any]:
         """GET /health — liveness + instrument connection status."""
-        return self._request("GET", "/health")
+        return self._request("GET", "/health", timeout=timeout)
 
     def get_status(self) -> dict[str, Any]:
         """GET /status — latest monitor snapshot (no live COM call)."""

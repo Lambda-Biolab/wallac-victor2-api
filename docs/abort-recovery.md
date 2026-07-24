@@ -119,9 +119,11 @@ All errors include:
   cycle (``bridge/executor.py:390-415``).
 - **Preflight:** every non-dry-run job performs an authenticated, read-only
   eLabFTW request before any clone, plate-map mutation, assay snapshot, or
-  physical run. Success emits ``elabftw_preflight_ok``; failure emits
+  physical run.   Success emits ``elabftw_preflight_ok``; failure emits
   ``elabftw_preflight_failed`` and rejects the job without instrument side
-  effects.
+  effects. The probe requires HTTP 200, requests JSON, and does not log the
+  response body.
+
 - **Health probes:** ``GET /health/live`` reports process liveness;
   ``GET /health/ready`` reports worker and eLabFTW/vm-agent dependency readiness.
 - **No eLabFTW polling.** Abort requests arrive via HTTP, not eLabFTW metadata.

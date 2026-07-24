@@ -207,7 +207,8 @@ def _health_ready_response(
         except Exception:
             issues.append("elabftw_unavailable")
         try:
-            executor.vm_agent.get_health()
+            executor.vm_agent.get_health(timeout=1.5)
+
         except Exception:
             issues.append("vm_agent_unavailable")
     ready = not issues

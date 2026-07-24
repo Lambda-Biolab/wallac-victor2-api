@@ -116,12 +116,32 @@ class ElabftwClient:
             ca_bundle=ca_bundle,
         )
 
+    @staticmethod
+    def _parse_response(resp: Any, url: str, expected_status: int | None) -> Any:
+        """Validate status and decode an eLabFTW response without logging content."""
+        if expected_status is not None and resp.status != expected_status:
+            raise urllib.error.HTTPError(
+                url,
+                resp.status,
+                f"Unexpected HTTP status {resp.status}",
+                resp.headers,
+                None,
+            )
+        content = resp.read()
+        if not content:
+            loc = resp.headers.get("Location") or resp.headers.get("location") or ""
+            return {"_location": loc} if loc else None
+        return json.loads(content)
+
     def _request(
         self,
         method: str,
         path: str,
         body: dict[str, Any] | None = None,
         timeout: float | None = None,
+        expected_status: int | None = None,
+        log_error_body: bool = True,
+        headers: dict[str, str] | None = None,
     ) -> Any:
         url = f"{self.base}{path}"
         data = json.dumps(body).encode() if body is not None else None
@@ -129,31 +149,33 @@ class ElabftwClient:
             url, data=data, method=method
         )
         req.add_header("Authorization", self.api_key)
+        for name, value in (headers or {}).items():
+            req.add_header(name, value)
         if body is not None:
             req.add_header("Content-Type", "application/json")
         try:
             with urllib.request.urlopen(  # noqa: S310  # Base URL is operator config.
                 req, context=self._ssl_ctx, timeout=timeout or self.timeout
             ) as resp:
-                content = resp.read()
-                if not content:
-                    # POST may return 201 with Location header but empty body.
-                    # Return a dict with the Location so callers can parse the ID.
-                    loc = resp.headers.get("Location") or resp.headers.get("location") or ""
-                    if loc:
-                        return {"_location": loc}
-                    return None
-                return json.loads(content)
+                return self._parse_response(resp, url, expected_status)
         except urllib.error.HTTPError as e:
             detail = ""
-            with contextlib.suppress(Exception):
-                detail = e.read().decode()[:200]
+            if log_error_body:
+                with contextlib.suppress(Exception):
+                    detail = e.read().decode()[:200]
             logger.error("eLabFTW API %s %s -> %s: %s", method, path, e.code, detail)
             raise
 
     def check_connection(self, timeout: float | None = None) -> Any:
-        """Verify that eLabFTW is reachable and the API key is authorized."""
-        return self._request("GET", "/experiments?limit=1&scope=1", timeout=timeout)
+        """Run a strict, body-free authenticated eLabFTW preflight."""
+        return self._request(
+            "GET",
+            "/experiments?limit=1&scope=1",
+            timeout=timeout,
+            expected_status=200,
+            log_error_body=False,
+            headers={"Accept": "application/json"},
+        )
 
     def download_upload(self, item_id: int, upload_id: int) -> bytes:
         """Download the raw bytes of an upload attachment.
