@@ -66,6 +66,12 @@ find a vulnerability, open a private security advisory on GitHub or
 contact the maintainer directly. Please do not file public issues for
 unpatched security bugs.
 
+## Known follow-ups
+
+| ID | Severity | Status | Summary |
+|---|---|---|---|
+| #31 | Medium | open | Restrict the ACL on `C:\Users\Public\agent_token.txt` (or move to `C:\ProgramData\Wallac\` / `HKLM\SOFTWARE\Wallac\`). Deferred from the [OWASP Top 10 audit landed in PR #30](https://github.com/Lambda-Biolab/wallac-victor2-api/pull/30) — the fix requires a coordinated Windows VM redeploy and an ACL validation step in the agent's startup. |
+
 ## Related documentation
 
 - [`docs/auth-secrets-policy.md`](docs/auth-secrets-policy.md) — token
