@@ -238,6 +238,42 @@ class TestBridgeExecutorFindProtocolByName:
         result = executor._find_protocol_by_name("2000008")
         assert result is None
 
+    def test_ambiguous_normalized_match_returns_none(self) -> None:
+        """Review-blocker 1: the bridge fallback must NOT silently pick
+        the first of two protocols that happen to normalize identically.
+        Two installed factory presets ``Absorbance @ 600 (1.0s)`` and
+        ``Absorbance @ 600 (1.0 s)`` normalize to the same string. A
+        caller passing a third variant (e.g. ``Absorbance @ 600(1.0s)``
+        — no space after ``@`` would be unusual, but anything that
+        normalizes to the same string) must NOT pick whichever protocol
+        the listing happens to return first. Returning ``None`` makes
+        the caller fail the job with a 404, matching the vm-agent's
+        409 ambiguity behavior."""
+        executor, VmAgentCls = self._make_executor()
+        executor.vm_agent = VmAgentCls(
+            [
+                {"id": 1, "name": "Absorbance @ 600 (1.0s)"},
+                {"id": 2, "name": "Absorbance @ 600 (1.0 s)"},
+            ]
+        )
+        result = executor._find_protocol_by_name("Absorbance @ 600 (1.0 s)")
+        # Both raw names appear in the listing, so this is an exact
+        # match — the first one wins. The interesting case is when
+        # the query does NOT exactly match either raw name.
+        assert result is not None  # exact match wins for raw query
+
+        executor.vm_agent = VmAgentCls(
+            [
+                {"id": 1, "name": "Absorbance @ 600 (1.0s)"},
+                {"id": 2, "name": "Absorbance @ 600 (1.0 s)"},
+            ]
+        )
+        # Query that does not exactly match either, but normalizes to
+        # the same string. Bridge must refuse (None) rather than pick
+        # the first listing entry.
+        result = executor._find_protocol_by_name("absorbance @ 600 (1.0 s)")
+        assert result is None
+
 
 class TestVmAgentWellsDefensive:
     """The vm-agent's ``_wells_to_plate_map`` must reject legacy wrapped

@@ -3142,9 +3142,11 @@ class TestUpsertMarkerSection:
         assert _upsert_marker_section("", "<!-- S:START -->", "<!-- S:END -->", section) == section
 
     def test_recovers_from_only_start_marker(self) -> None:
-        """A body that has only the start marker (corrupt from a
-        previous aborted write) must be repaired by truncating the
-        partial section and inserting the new one."""
+        """Review-blocker 4: a body that has only the start marker
+        (corrupt from a previous aborted write) must be treated as
+        "no section present" — the new section is appended at the
+        end so the corrupt span and any operator content that
+        followed it are preserved."""
         from bridge.executor import _upsert_marker_section
 
         body = "before\n<!-- S:START -->\nHALF WRITTEN"
@@ -3154,8 +3156,10 @@ class TestUpsertMarkerSection:
             "<!-- S:END -->",
             "<!-- S:START -->\nNEW\n<!-- S:END -->",
         )
+        # All prior content is preserved verbatim — we never delete
+        # operator content on a guess.
         assert "before" in merged
-        assert "HALF WRITTEN" not in merged
+        assert "<!-- S:START -->\nHALF WRITTEN" in merged
         assert "NEW" in merged
 
     def test_recovers_from_only_end_marker(self) -> None:
@@ -3168,14 +3172,53 @@ class TestUpsertMarkerSection:
             "<!-- S:END -->",
             "<!-- S:START -->\nNEW\n<!-- S:END -->",
         )
-        # Both pieces of content survive; the new section replaces
-        # the corrupt span that ended at the stray end marker.
+        # Review-blocker 4: a stray end marker without a matching
+        # start must NOT cause us to delete the body up to that
+        # marker. All prior content survives; the new section is
+        # appended.
         assert "before-stray-end" in merged
         assert "after-stray-end" in merged
+        assert "<!-- S:END -->" in merged  # original stray marker preserved
         assert "NEW" in merged
-        # Only one pair of markers is present in the merged body.
-        assert merged.count("S:START") == 1
-        assert merged.count("S:END") == 1
+
+    def test_reversed_markers_are_treated_as_no_section(self) -> None:
+        """Review-blocker 4: a body where ``END`` appears before
+        ``START`` is malformed; the upsert must treat it as "no
+        section present" and append, not delete the reversed pair."""
+        from bridge.executor import _upsert_marker_section
+
+        body = "<!-- S:END -->\nUNREACHABLE\n<!-- S:START -->\nOLD"
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nNEW\n<!-- S:END -->",
+        )
+        assert "UNREACHABLE" in merged
+        assert "OLD" in merged
+        assert "NEW" in merged
+
+    def test_other_job_section_survives_after_corrupt_section(self) -> None:
+        """Review-blocker 4: a body that contains a well-formed
+        J2 section followed by a corrupt J1 start-marker-only span
+        must NOT lose the J2 section when J1 is upserted."""
+        from bridge.executor import _upsert_marker_section
+
+        body = (
+            "operator notes\n"
+            "<!-- J2:START -->\nJ2 CONTENT\n<!-- J2:END -->\n"
+            "<!-- J1:START -->\nJ1 HALF WRITTEN"  # corrupt: no end
+        )
+        merged = _upsert_marker_section(
+            body,
+            "<!-- J1:START -->",
+            "<!-- J1:END -->",
+            "<!-- J1:START -->\nJ1 NEW\n<!-- J1:END -->",
+        )
+        assert "operator notes" in merged
+        assert "J2 CONTENT" in merged
+        assert "J1 HALF WRITTEN" in merged
+        assert "J1 NEW" in merged
 
     def test_does_not_disturb_other_job_sections(self) -> None:
         """Two distinct marker pairs in the same body — only the

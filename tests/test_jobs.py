@@ -770,6 +770,59 @@ class TestWellsSpecContract:
         assert r.status_code == 201
         assert r.json()["wells_spec"] == {"rows": ["A", "B"]}
 
+    def test_existing_protocol_wells_spec_all_false_rejected(self, client: TestClient) -> None:
+        """Review-blocker 2: ``{"all": false}`` is rejected at the
+        boundary so a malformed caller cannot silently fall back to
+        the factory plate map."""
+        r = client.post(
+            "/jobs",
+            json={**self._EXISTING, "wells_spec": {"all": False}},
+        )
+        assert r.status_code == 422
+
+    def test_existing_protocol_wells_spec_empty_wells_rejected(self, client: TestClient) -> None:
+        """Review-blocker 2: ``{"wells": []}`` is rejected — an
+        accidental empty list must NOT silently mean "run the
+        factory plate map"."""
+        r = client.post(
+            "/jobs",
+            json={**self._EXISTING, "wells_spec": {"wells": []}},
+        )
+        assert r.status_code == 422
+
+    def test_existing_protocol_wells_spec_empty_rows_rejected(self, client: TestClient) -> None:
+        """Review-blocker 2: ``{"rows": []}`` is rejected at the
+        boundary."""
+        r = client.post(
+            "/jobs",
+            json={**self._EXISTING, "wells_spec": {"rows": []}},
+        )
+        assert r.status_code == 422
+
+    def test_existing_protocol_wells_spec_all_true_with_empty_rows_rejected(
+        self, client: TestClient
+    ) -> None:
+        """Review-blocker 2: even with ``all`` present, an empty
+        ``rows`` is rejected — the validator must use presence, not
+        truthiness."""
+        r = client.post(
+            "/jobs",
+            json={**self._EXISTING, "wells_spec": {"all": True, "rows": []}},
+        )
+        assert r.status_code == 422
+
+    def test_existing_protocol_wells_spec_zero_padded_rejected(self, client: TestClient) -> None:
+        """Review NIT: zero-padded well addresses like ``A01`` are
+        rejected at the boundary — the bridge's public contract is
+        the canonical ``A1..H12`` form. The vm-agent parses
+        zero-padded names internally, but the bridge does not
+        silently canonicalize them."""
+        r = client.post(
+            "/jobs",
+            json={**self._EXISTING, "wells_spec": {"wells": ["A01", "B02"]}},
+        )
+        assert r.status_code == 422
+
     def test_generated_protocol_preserves_nonempty_wells_spec(self, client: TestClient) -> None:
         """generated_protocol behavior is unchanged: a non-empty wells_spec
         is still accepted at the boundary (its use, or lack of use, by the
@@ -842,7 +895,11 @@ class TestRetryWriteback:
         class _StubExecutor:
             def retry_writeback(self, target: Job) -> None:
                 called.append(target.job_id)
-                target.add_event("writeback_completed", "experiment=42")
+                # Review concern 1: the executor must emit retry-specific
+                # events so the response builder can distinguish a
+                # retry success from a stale writeback_completed
+                # event in the job history.
+                target.add_event("writeback_retry_completed", "experiment=42")
 
         _, client, manager = self._build_app_and_client(_StubExecutor())
         self._seed_terminal_job(manager)
@@ -877,6 +934,45 @@ class TestRetryWriteback:
         r = client.post("/jobs/job-accepted/retry-writeback")
         assert r.status_code == 409
 
+    def test_retry_aborted_job_returns_409(self) -> None:
+        """Review-blocker 3: an aborted job with partial live_wells
+        accumulated before the abort MUST NOT be retried — those
+        readings are incomplete and publishing them as 'completed'
+        would be wrong."""
+        _, client, manager = self._build_app_and_client(_SimpleStubExecutor())
+        job = Job(
+            job_id="job-aborted",
+            title="aborted",
+            execution_mode="existing_protocol",
+            elabftw_experiment_id=7,
+            status="aborted",
+            created_at="2026-01-01T00:00:00",
+        )
+        job.live_wells = [{"well": "A01", "od": 0.1, "counts": 1000}]
+        manager._jobs[job.job_id] = job
+
+        r = client.post("/jobs/job-aborted/retry-writeback")
+        assert r.status_code == 409
+
+    def test_retry_failed_job_returns_409(self) -> None:
+        """Review-blocker 3: a failed job (instrument error, clone
+        failure, etc.) has no recoverable data — refuse with 409
+        regardless of cached live_wells."""
+        _, client, manager = self._build_app_and_client(_SimpleStubExecutor())
+        job = Job(
+            job_id="job-failed",
+            title="failed",
+            execution_mode="existing_protocol",
+            elabftw_experiment_id=7,
+            status="failed",
+            created_at="2026-01-01T00:00:00",
+        )
+        job.live_wells = [{"well": "A01", "od": 0.1, "counts": 1000}]
+        manager._jobs[job.job_id] = job
+
+        r = client.post("/jobs/job-failed/retry-writeback")
+        assert r.status_code == 409
+
     def test_retry_completed_job_without_live_wells_returns_409(self) -> None:
         _, client, manager = self._build_app_and_client(_SimpleStubExecutor())
         self._seed_terminal_job(manager, with_live_wells=False)
@@ -894,7 +990,7 @@ class TestRetryWriteback:
             def retry_writeback(self, target: Job) -> None:
                 called.append(target.job_id)
                 target.status = "completed"
-                target.add_event("writeback_completed", "experiment=42")
+                target.add_event("writeback_retry_completed", "experiment=42")
 
         _, client, manager = self._build_app_and_client(_StubExecutor())
         self._seed_terminal_job(manager, status="unknown_requires_operator_review")
@@ -917,7 +1013,7 @@ class TestRetryWriteback:
             """Deliberately exposes only retry_writeback; no start_run."""
 
             def retry_writeback(self, target: Job) -> None:
-                target.add_event("writeback_completed", "experiment=42")
+                target.add_event("writeback_retry_completed", "experiment=42")
 
         _, client, manager = self._build_app_and_client(_NoRunExecutor())
         self._seed_terminal_job(manager)

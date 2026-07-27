@@ -798,8 +798,8 @@ def _normalize_protocol_name(name):
       - Strip leading/trailing whitespace.
       - Collapse runs of internal whitespace to a single space.
       - Remove whitespace immediately before/after ``(`` and ``)``.
-      - Remove whitespace immediately before time-unit suffixes ``s`` and ``ms``
-        (the only places a stray space in a canonical name appears in practice).
+      - Remove whitespace between a digit and a time-unit suffix
+        (``1.0 s`` → ``1.0s``, ``100 ms`` → ``100ms``).
 
     The raw name is not logged because protocol names can carry operator
     context; only the normalized form flows through the match.
@@ -809,7 +809,10 @@ def _normalize_protocol_name(name):
     s = str(name).strip()
     s = _re.sub(r"\s+", " ", s)
     s = s.replace("( ", "(").replace(" )", ")")
-    s = _re.sub(r"\s+(s|ms)\b", r"\1", s)
+    # Match a digit followed by whitespace and a time-unit suffix so
+    # unrelated prose like ``Mode S`` is NOT collapsed (review
+    # concern 3).
+    s = _re.sub(r"(\d)\s+(ms|s)\b", r"\1\2", s)
     return s
 
 
