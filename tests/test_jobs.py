@@ -700,15 +700,14 @@ class TestWellsSpecContract:
         assert r.status_code == 201
         assert r.json()["wells_spec"] == {}
 
-    def test_existing_protocol_wells_spec_invalid_wells_rejected_at_vm_agent(
+    def test_existing_protocol_wells_spec_invalid_wells_rejected_at_boundary(
         self, client: TestClient
     ) -> None:
-        """An invalid well name (e.g. 'Z9') is accepted at the bridge
-        boundary (the bridge does not parse well addresses — it just
-        passes them to the vm-agent) but fails at the vm-agent, which
-        fails the job. The 422 gate was removed because the boundary can
-        no longer reject without parsing the wells; the executor's
-        cleanup in ``finally`` still runs so no stub protocol leaks."""
+        """An invalid well name (e.g. 'Z9') is rejected at the bridge
+        boundary with HTTP 422 *before* a job is created. Previously the
+        boundary passed garbage through and the vm-agent rejected it; the
+        bridge now owns the contract (slice 2 of
+        ``docs/plans/wallac-existing-protocol-writeback-repair.md``)."""
         r = client.post(
             "/jobs",
             json={
@@ -716,11 +715,60 @@ class TestWellsSpecContract:
                 "wells_spec": {"wells": ["Z9"]},
             },
         )
+        assert r.status_code == 422
+
+    def test_existing_protocol_wells_spec_invalid_row_rejected_at_boundary(
+        self, client: TestClient
+    ) -> None:
+        """``rows`` outside A..H is rejected at the boundary."""
+        r = client.post(
+            "/jobs",
+            json={**self._EXISTING, "wells_spec": {"rows": ["A", "Z"]}},
+        )
+        assert r.status_code == 422
+
+    def test_existing_protocol_wells_spec_multiple_keys_rejected(self, client: TestClient) -> None:
+        """Picking two of all/rows/wells is rejected — the bridge owns
+        the contract and disambiguates by serialization (slice 2)."""
+        r = client.post(
+            "/jobs",
+            json={**self._EXISTING, "wells_spec": {"all": True, "rows": ["A"]}},
+        )
+        assert r.status_code == 422
+
+    def test_existing_protocol_wells_spec_unknown_key_rejected(self, client: TestClient) -> None:
+        """An unsupported key (e.g. legacy ``wells_spec`` wrapper) is
+        rejected with 422 — this is the shape that previously leaked
+        through and broke the vm-agent PATCH endpoint."""
+        r = client.post(
+            "/jobs",
+            json={
+                **self._EXISTING,
+                "wells_spec": {"wells_spec": {"all": True}},
+            },
+        )
+        assert r.status_code == 422
+
+    def test_existing_protocol_wells_spec_wells_must_be_list(self, client: TestClient) -> None:
+        """``wells: "all"`` (a string) is rejected at the boundary. The
+        reported bridge failure passed this through and the executor
+        iterated the characters of ``"all"`` to ``["A","l","l"]``,
+        which the vm-agent then rejected. The boundary now owns the
+        contract."""
+        r = client.post(
+            "/jobs",
+            json={**self._EXISTING, "wells_spec": {"wells": "all"}},
+        )
+        assert r.status_code == 422
+
+    def test_existing_protocol_wells_spec_all_uppercased_row(self, client: TestClient) -> None:
+        """Lowercase rows are normalized to uppercase and accepted."""
+        r = client.post(
+            "/jobs",
+            json={**self._EXISTING, "wells_spec": {"rows": ["a", "b"]}},
+        )
         assert r.status_code == 201
-        body = r.json()
-        # The job is accepted; the executor's _clone_with_wells will
-        # surface the vm-agent's 400 to the job's events/error.
-        assert body["wells_spec"] == {"wells": ["Z9"]}
+        assert r.json()["wells_spec"] == {"rows": ["A", "B"]}
 
     def test_generated_protocol_preserves_nonempty_wells_spec(self, client: TestClient) -> None:
         """generated_protocol behavior is unchanged: a non-empty wells_spec
@@ -737,6 +785,149 @@ class TestWellsSpecContract:
         )
         assert r.status_code == 201
         assert r.json()["wells_spec"] == {"rows": ["A"]}
+
+
+class TestRetryWriteback:
+    """POST /jobs/{job_id}/retry-writeback (slice 5 of
+    ``docs/plans/wallac-existing-protocol-writeback-repair.md``).
+
+    The endpoint must NEVER restart hardware acquisition. It re-runs
+    the eLabFTW writeback using the cached live_wells on the job, so
+    the response is 200 for completed/unknown-review jobs that have
+    data, and 409 otherwise."""
+
+    @staticmethod
+    def _build_app_and_client(executor) -> tuple[Any, TestClient]:
+        """Create a bridge app whose JobManager is shared with the test.
+
+        Returning both lets the caller populate ``manager._jobs`` with
+        fixtures before issuing HTTP requests.
+        """
+        from bridge.bridge_app import create_bridge_app
+
+        manager = JobManager()
+        manager.set_executor(lambda _job: None)  # unused for retry
+        app = create_bridge_app(job_manager=manager, executor=executor)
+        return app, TestClient(app), manager
+
+    @staticmethod
+    def _seed_terminal_job(
+        manager: JobManager,
+        *,
+        job_id: str = "job-retry-001",
+        status: str = "completed",
+        with_live_wells: bool = True,
+    ) -> Job:
+        from bridge.jobs import COMPLETED, UNKNOWN
+
+        job = Job(
+            job_id=job_id,
+            title="retry",
+            execution_mode="existing_protocol",
+            elabftw_experiment_id=42,
+            status=COMPLETED if status == "completed" else UNKNOWN,
+            created_at="2026-01-01T00:00:00",
+        )
+        if with_live_wells:
+            job.live_wells = [
+                {"well": "A01", "od": 0.1, "counts": 1000},
+                {"well": "B02", "od": 0.2, "counts": 1000},
+            ]
+        manager._jobs[job.job_id] = job
+        return job
+
+    def test_retry_runs_executor_and_returns_200(self) -> None:
+        called = []
+
+        class _StubExecutor:
+            def retry_writeback(self, target: Job) -> None:
+                called.append(target.job_id)
+                target.add_event("writeback_completed", "experiment=42")
+
+        _, client, manager = self._build_app_and_client(_StubExecutor())
+        self._seed_terminal_job(manager)
+        r = client.post("/jobs/job-retry-001/retry-writeback")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["job_id"] == "job-retry-001"
+        assert body["retried"] is True
+        assert called == ["job-retry-001"]
+
+    def test_retry_unknown_job_returns_404(self) -> None:
+        _, client, _ = self._build_app_and_client(_SimpleStubExecutor())
+        r = client.post("/jobs/job-does-not-exist/retry-writeback")
+        assert r.status_code == 404
+
+    def test_retry_accepted_status_job_with_data_returns_409(self) -> None:
+        """A job in 'accepted' state with cached live_wells must NOT be
+        retry-able — that would race with an in-flight run. The endpoint
+        must return 409 even if live_wells is populated."""
+        _, client, manager = self._build_app_and_client(_SimpleStubExecutor())
+        job = Job(
+            job_id="job-accepted",
+            title="accepted",
+            execution_mode="existing_protocol",
+            elabftw_experiment_id=7,
+            status="accepted",
+            created_at="2026-01-01T00:00:00",
+        )
+        job.live_wells = [{"well": "A01", "od": 0.1, "counts": 1000}]
+        manager._jobs[job.job_id] = job
+
+        r = client.post("/jobs/job-accepted/retry-writeback")
+        assert r.status_code == 409
+
+    def test_retry_completed_job_without_live_wells_returns_409(self) -> None:
+        _, client, manager = self._build_app_and_client(_SimpleStubExecutor())
+        self._seed_terminal_job(manager, with_live_wells=False)
+
+        r = client.post("/jobs/job-retry-001/retry-writeback")
+        assert r.status_code == 409
+
+    def test_retry_unknown_review_job_is_allowed(self) -> None:
+        """A job promoted to unknown_requires_operator_review after a
+        failed writeback MUST be retry-able — that's the entire point
+        of the endpoint."""
+        called = []
+
+        class _StubExecutor:
+            def retry_writeback(self, target: Job) -> None:
+                called.append(target.job_id)
+                target.status = "completed"
+                target.add_event("writeback_completed", "experiment=42")
+
+        _, client, manager = self._build_app_and_client(_StubExecutor())
+        self._seed_terminal_job(manager, status="unknown_requires_operator_review")
+
+        r = client.post("/jobs/job-retry-001/retry-writeback")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["retried"] is True
+        assert body["status"] == "completed"
+        assert called == ["job-retry-001"]
+
+    def test_retry_does_not_call_vm_agent_or_restart_hardware(self) -> None:
+        """Slice 5 acceptance: the retry endpoint MUST NOT trigger any
+        vm-agent run calls. We assert it by giving the stub executor
+        no ``start_run`` method at all — if the endpoint tried to
+        restart a run, Python would raise AttributeError and the test
+        would fail."""
+
+        class _NoRunExecutor:
+            """Deliberately exposes only retry_writeback; no start_run."""
+
+            def retry_writeback(self, target: Job) -> None:
+                target.add_event("writeback_completed", "experiment=42")
+
+        _, client, manager = self._build_app_and_client(_NoRunExecutor())
+        self._seed_terminal_job(manager)
+
+        r = client.post("/jobs/job-retry-001/retry-writeback")
+        assert r.status_code == 200, r.text
+
+
+class _SimpleStubExecutor:
+    """Minimal stub for tests that don't need to drive retry_writeback."""
 
 
 # --- JobManager-level duplicate detection tests ---

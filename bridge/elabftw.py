@@ -375,6 +375,18 @@ class ElabftwClient:
         """Patch fields on an experiment (title, body, etc.)."""
         self._request("PATCH", f"/experiments/{experiment_id}", body=fields)
 
+    def get_experiment(self, experiment_id: int) -> dict[str, Any]:
+        """Fetch an experiment by id.
+
+        Used by the write-back path when ``elabftw_experiment_id > 0``:
+        the bridge must read the current body, splice its Wallac
+        results section in place, and PATCH the merged body back.
+        Replacing the body outright would clobber unrelated content
+        (notes, prior amendments, references). See slice 4 of
+        ``docs/plans/wallac-existing-protocol-writeback-repair.md``.
+        """
+        return self._request("GET", f"/experiments/{experiment_id}")
+
     def upload_experiment_file(
         self, experiment_id: int, filename: str, content: bytes, comment: str = ""
     ) -> dict[str, Any]:
