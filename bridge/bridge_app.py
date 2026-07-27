@@ -557,11 +557,18 @@ def _register_routes(
         Slice 5 of
         ``docs/plans/wallac-existing-protocol-writeback-repair.md``.
 
-        Returns 404 if the job is unknown, 409 if the job is in a state
-        where retry is meaningless (not terminal, or no live_wells
-        data), and 200 otherwise. The handler does not block on the
-        retry itself; ``executor.retry_writeback`` is fast (HTTP PATCH
-        to eLabFTW) and any failure is recorded on the job's events.
+        Returns 200 when the retry succeeded, 503 when the retry
+        attempt itself failed (eLabFTW still unreachable, see the
+        underlying ``elabftw_writeback_failed`` event), 404 if the
+        job is unknown, 409 if the job is in a state where retry is
+        meaningless (not completed/unknown-review, or no live_wells
+        data), and 503 if the executor is not wired (test/dev path).
+
+        The handler does not block on the retry itself;
+        ``executor.retry_writeback`` is fast (HTTP PATCH to eLabFTW).
+        The success/failure outcome comes from its return value, not
+        from searching ``job.events`` — concurrent retry requests
+        can interleave events on the shared event list.
         """
         _check_auth(token, authorization)
         job, error_response = _resolve_retry_writeback_target(manager, job_id, executor)

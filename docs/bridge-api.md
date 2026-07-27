@@ -94,9 +94,13 @@ body.
 | Outcome | HTTP status |
 |---|---|
 | writeback re-ran successfully | `200 {"retried": true, "status": "completed", "elabftw_experiment_id": <id>}` |
+| writeback attempt failed (eLabFTW still unreachable) | `503 {"detail": "Retry writeback for job <id> did not succeed; see job events for the underlying error"}` |
 | job is unknown | `404` |
 | job is in a non-terminal state (would race with an in-flight run) | `409` |
+| job is `failed` or `aborted` (not retry-eligible) | `409` |
 | job has no `live_wells` data (nothing to write) | `409` |
 | executor not wired (test/dev path) | `503` |
+
+The success/failure outcome is taken from `BridgeExecutor.retry_writeback`'s return value, not from searching `job.events` — concurrent retry requests can interleave events on the shared event list, so the handler MUST trust the attempt-local result.
 
 Slice 5 of [`wallac-existing-protocol-writeback-repair.md`](plans/wallac-existing-protocol-writeback-repair.md).
