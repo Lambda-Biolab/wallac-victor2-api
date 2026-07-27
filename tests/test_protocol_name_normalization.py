@@ -90,6 +90,19 @@ class TestNormalizeProtocolName:
     def test_collapses_whitespace(self, vm_agent_module, raw: str, expected: str) -> None:
         assert vm_agent_module._normalize_protocol_name(raw) == expected
 
+    def test_mode_s_unchanged(self, vm_agent_module) -> None:
+        """Review NIT round 1: the time-unit collapse must only fire
+        when preceded by a digit. ``Mode S`` is a real protocol
+        category name in some Wallac installations and MUST NOT
+        collapse to ``ModeS``."""
+        assert vm_agent_module._normalize_protocol_name("Mode S") == "Mode S"
+        assert vm_agent_module._normalize_protocol_name("Mode  S") == "Mode S"
+
+    def test_non_numeric_suffix_unchanged(self, vm_agent_module) -> None:
+        """Defensive: a digit followed by a unit suffix collapses;
+        the same digit followed by non-unit text does not."""
+        assert vm_agent_module._normalize_protocol_name("100 abc") == "100 abc"
+
 
 class TestVmAgentResolveProtocol:
     def _fixtures(self) -> list[dict[str, Any]]:

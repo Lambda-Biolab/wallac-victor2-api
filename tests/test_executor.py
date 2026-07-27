@@ -3220,6 +3220,85 @@ class TestUpsertMarkerSection:
         assert "J1 HALF WRITTEN" in merged
         assert "J1 NEW" in merged
 
+    def test_repeat_upsert_replaces_only_last_complete_pair(self) -> None:
+        """Review-blocker 4 round 2: after a malformed start-marker
+        only span, a subsequent well-formed upsert must target the
+        LAST complete (start, end) pair, not the FIRST start marker
+        in the body — the latter would delete unrelated content
+        grown between the stray start and the new end."""
+        from bridge.executor import _upsert_marker_section
+
+        # State after a previous upsert into a body that had only a
+        # stray start marker: the helper appended a complete
+        # section at the end, leaving the old stray start in place.
+        body = (
+            "operator notes\n"
+            "<!-- S:START -->\nSTRAY PARTIAL\n"
+            "more operator content\n"
+            "<!-- S:START -->\nFIRST SECTION\n<!-- S:END -->\n"
+        )
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nSECOND SECTION\n<!-- S:END -->",
+        )
+        # The stray partial and the operator content between the
+        # stray and the new section MUST survive — only the LAST
+        # complete pair is replaced.
+        assert "operator notes" in merged
+        assert "STRAY PARTIAL" in merged
+        assert "more operator content" in merged
+        assert "SECOND SECTION" in merged
+        assert "FIRST SECTION" not in merged
+
+    def test_repeat_upsert_after_only_start_marker_preserves_content(self) -> None:
+        """Review-blocker 4 round 2: a body with a stray start marker
+        that has been upserted ONCE becomes well-formed with the
+        stray still in place. A second upsert must not destroy the
+        operator content between the stray and the section."""
+        from bridge.executor import _upsert_marker_section
+
+        body = (
+            "<!-- S:START -->\nOLD PARTIAL\n"
+            "operator note\n"
+            "<!-- S:START -->\nSECTION\n<!-- S:END -->\n"
+        )
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nSECTION\n<!-- S:END -->\n",
+        )
+        # Operator content and the old partial are preserved; the
+        # last complete pair is replaced.
+        assert "OLD PARTIAL" in merged
+        assert "operator note" in merged
+
+    def test_repeat_upsert_after_only_end_marker_preserves_content(self) -> None:
+        """Review-blocker 4 round 2: same idea but with a stray end
+        marker. The first upsert appends a complete section at the
+        end (leaving the stray end in place); the second upsert
+        targets the well-formed last pair and must not delete
+        anything between the stray end and the new end."""
+        from bridge.executor import _upsert_marker_section
+
+        body = (
+            "operator note\n"
+            "<!-- S:END -->STRAY\n"
+            "more operator\n"
+            "<!-- S:START -->\nSECTION\n<!-- S:END -->\n"
+        )
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nSECTION\n<!-- S:END -->\n",
+        )
+        assert "operator note" in merged
+        assert "STRAY" in merged
+        assert "more operator" in merged
+
     def test_does_not_disturb_other_job_sections(self) -> None:
         """Two distinct marker pairs in the same body — only the
         targeted section is replaced."""
@@ -3239,3 +3318,59 @@ class TestUpsertMarkerSection:
         assert "J1 OLD" not in merged
         assert "J2 CONTENT" in merged
         assert merged.count("J2:START") == 1
+
+
+class TestRetryWritebackRealExecutor:
+    """Review-blocker 1 (round 2): the real ``BridgeExecutor.retry_writeback``
+    must use ``_writeback``'s boolean return value to decide between
+    ``writeback_retry_completed`` and ``writeback_retry_failed``.
+    Previously the retry layer unconditionally emitted the success
+    event because ``_writeback`` swallowed exceptions internally,
+    making the HTTP endpoint always report ``retried: true``."""
+
+    def test_real_executor_records_retry_failure_on_writeback_error(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        from bridge.jobs import UNKNOWN
+
+        vm_agent.jobs = [
+            {
+                "assay_id": 200,
+                "protocol_name": "Absorbance @ 600 (1.0s)",
+                "protocol_id": 1001,
+            }
+        ]
+        job = Job(
+            job_id="test-real-retry-fail",
+            title="real retry fail",
+            execution_mode="existing_protocol",
+            protocol_id=1001,
+            elabftw_experiment_id=42,
+            status=UNKNOWN,
+            created_at="2026-01-01T00:00:00",
+        )
+        # Seed live_wells so the executor's retry-eligibility guard
+        # does not short-circuit on "no data".
+        job.live_wells = [
+            {"well": "A01", "od": 0.1, "counts": 1000},
+            {"well": "B02", "od": 0.2, "counts": 1000},
+        ]
+
+        # Force the eLabFTW upload path to raise.
+        elabftw.fail_upload = True
+
+        # The retry must NOT raise — it must record the failure and
+        # return cleanly so the response builder can surface the
+        # error.
+        executor_wet.retry_writeback(job)
+
+        events = [evt["event"] for evt in job.events]
+        assert "writeback_retry_started" in events
+        assert "writeback_retry_failed" in events
+        # The retry must NOT pretend success.
+        assert "writeback_retry_completed" not in events
+        # The job stays in operator review (not falsely promoted).
+        assert job.status == UNKNOWN

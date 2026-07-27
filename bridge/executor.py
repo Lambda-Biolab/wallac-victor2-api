@@ -203,38 +203,45 @@ def _upsert_marker_section(
     greppable per-job prefix so two different jobs in the same
     experiment never collide.
 
-    Behavior (review-blocker 4: malformed marker structures are
-    treated as "no section present" rather than repaired — we never
-    delete operator content on a guess):
+    Behavior (review-blocker 4, refined round 2):
 
-    * If both markers are present and ``end`` follows ``start``,
-      the span between them (inclusive) is replaced with
-      ``new_section`` and the markers are kept around it.
-      Surrounding content is preserved verbatim.
-    * If only one marker is present, or the end marker appears
-      before the start marker, the body is treated as having no
-      existing section for this job — the new section is appended
-      so operator-authored content is never lost.
-    * If neither marker is present, the new section is appended.
+    * If a well-formed pair (start, then end) exists, the LAST such
+      pair's span is replaced. Targeting the LAST pair rather than
+      the first protects against repeat-upsert scenarios where an
+      earlier stray start marker (left over from a previous aborted
+      write) could otherwise anchor the replacement and delete
+      unrelated content that grew between the stray start and the
+      new end. Surrounding content is preserved verbatim.
+    * If no well-formed pair exists (only one marker, or the end
+      marker appears before its start marker, or no marker at all),
+      the body is treated as having no existing section for this
+      job — the new section is appended so operator-authored
+      content is never lost on a guess.
     """
     if not existing_body:
         return new_section
 
-    start_idx = existing_body.find(start_marker)
-    end_idx = existing_body.find(end_marker)
+    # Find the LAST well-formed (start, end) pair. We scan from the
+    # end of the body backwards so an old stray start marker cannot
+    # mislead the replacement span.
+    last_start = existing_body.rfind(start_marker)
+    last_end = existing_body.rfind(end_marker)
     well_formed = (
-        start_idx >= 0 and end_idx > start_idx and end_idx + len(end_marker) <= len(existing_body)
+        last_start >= 0
+        and last_end > last_start
+        and last_end + len(end_marker) <= len(existing_body)
     )
 
     if well_formed:
-        before = existing_body[:start_idx]
-        after = existing_body[end_idx + len(end_marker) :]
+        before = existing_body[:last_start]
+        after = existing_body[last_end + len(end_marker) :]
         return before + new_section + after
 
     # Malformed marker structure (only one marker, or end before
-    # start). Treat as "no section present" and append — never
-    # delete content on a guess. If a real conflict later surfaces,
-    # operators can manually clean up the stray marker.
+    # start, or no marker at all). Treat as "no section present" and
+    # append — never delete content on a guess. If a real conflict
+    # later surfaces, operators can manually clean up the stray
+    # marker.
     sep = "" if existing_body.endswith("\n") else "\n"
     return existing_body + sep + "\n" + new_section + "\n"
 
@@ -1468,7 +1475,7 @@ class BridgeExecutor:
         if job.status == "completed":
             job.add_event("execution_completed", "")
 
-    def _writeback(self, job: Job, raw_wells: list[dict[str, Any]], analyzed_csv: str) -> None:
+    def _writeback(self, job: Job, raw_wells: list[dict[str, Any]], analyzed_csv: str) -> bool:
         """Write results back to eLabFTW as an experiment.
 
         Two writeback shapes exist (slice 4 of
@@ -1487,6 +1494,16 @@ class BridgeExecutor:
         The body content (job metadata, plate heatmap, results table,
         raw/analyzed attachment pointers) is identical between the two
         paths.
+
+        Returns:
+            ``True`` on success, ``False`` on failure. Failures are
+            also recorded as ``elabftw_writeback_failed`` events and
+            promote the job to ``unknown_requires_operator_review``.
+            Review-blocker 1 (round 2): callers like
+            ``retry_writeback`` need an explicit success/failure
+            signal — the previous swallow-and-record implementation
+            made every retry look successful because the
+            ``elabftw_writeback_failed`` event never re-raised.
         """
         job.add_event("writeback_started", "")
 
@@ -1544,6 +1561,7 @@ class BridgeExecutor:
             if job.status != "failed":
                 job.status = "completed"
             job.add_event("writeback_completed", f"experiment={exp_id}")
+            return True
 
         except Exception as e:
             detail = (
@@ -1557,6 +1575,7 @@ class BridgeExecutor:
             )
             job.add_event("elabftw_writeback_failed", str(e))
             logger.exception("Write-back failed for job %s", job.job_id)
+            return False
 
     def retry_writeback(self, job: Job) -> None:
         """Re-run writeback for a job whose hardware run already completed.
@@ -1619,23 +1638,24 @@ class BridgeExecutor:
             }
             for reading in job.live_wells
         ]
-        # Reason (review-blocker 3 follow-up): ``_writeback`` records
-        # its own elabftw_writeback_failed event when the eLabFTW
-        # call fails, but the response builder needs a
-        # retry-specific signal so the API can distinguish "retry
-        # failed" from "retry succeeded but a stale prior event
-        # misled the search" (review concern 1). We wrap the call
-        # so retry success/failure get their own events.
+        # Review-blocker 1 (round 2): ``_writeback`` returns a bool
+        # because the failure path records events and re-promotes to
+        # operator review but does NOT raise. Using the return value
+        # (not a try/except wrapper) gives us an unambiguous
+        # success/failure signal for the response builder.
         try:
-            self._writeback(job, raw_wells, "")
+            success = self._writeback(job, raw_wells, "")
         except Exception as error:
+            # Defensive: an unexpected exception that escaped
+            # _writeback's own error handling (e.g. bug in the lock
+            # helper) still gets recorded as a retry failure.
             job.add_event("writeback_retry_failed", str(error))
-            logger.exception("Writeback retry failed for job %s", job.job_id)
+            logger.exception("Writeback retry raised for job %s", job.job_id)
             return
-        # The most recent event is now either writeback_completed
-        # (success) or elabftw_writeback_failed (caught and recorded
-        # by _writeback). Either way we are done.
-        job.add_event("writeback_retry_completed", f"experiment={job.elabftw_experiment_id}")
+        if success:
+            job.add_event("writeback_retry_completed", f"experiment={job.elabftw_experiment_id}")
+        else:
+            job.add_event("writeback_retry_failed", "see elabftw_writeback_failed event")
 
     def _build_results_html(self, job: Job, raw_wells: list[dict[str, Any]]) -> str:
         """Build a rich HTML body with plate heatmap and results table."""
