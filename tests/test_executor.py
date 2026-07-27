@@ -3299,6 +3299,89 @@ class TestUpsertMarkerSection:
         assert "STRAY" in merged
         assert "more operator" in merged
 
+    def test_trailing_stray_end_after_complete_pair_preserves_content(
+        self,
+    ) -> None:
+        """Review-blocker round 3: a complete pair followed by
+        operator content and a trailing stray end marker must NOT
+        lose the operator content. The earlier ``rfind``-both-ends
+        heuristic paired the valid section's start with the
+        trailing stray end, deleting everything between them. The
+        round-3 search pairs each candidate start with the first
+        end-after-it that has no other start in between, so the
+        trailing stray end is ignored."""
+        from bridge.executor import _upsert_marker_section
+
+        body = (
+            "<!-- S:START -->\nVALID SECTION\n<!-- S:END -->\n"
+            "operator content that must survive\n"
+            "<!-- S:END -->\n"
+        )
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nREPLACED\n<!-- S:END -->\n",
+        )
+        assert "operator content that must survive" in merged
+        assert "VALID SECTION" not in merged
+        assert "REPLACED" in merged
+
+    def test_trailing_stray_start_after_complete_pair_replaces_inner(
+        self,
+    ) -> None:
+        """Review-blocker round 3: trailing stray start (no end
+        after it) must NOT be paired with the previous valid
+        section's end. The well-formed pair is the inner one —
+        the algorithm finds it via rfind(start) + find(end,
+        start+len) and replaces it."""
+        from bridge.executor import _upsert_marker_section
+
+        body = (
+            "<!-- S:START -->\nVALID SECTION\n<!-- S:END -->\n"
+            "operator content that must survive\n"
+            "<!-- S:START -->\n"
+        )
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nREPLACED\n<!-- S:END -->\n",
+        )
+        # The well-formed inner pair is replaced; operator content
+        # between the replaced pair and the trailing stray start
+        # survives; the trailing stray start survives.
+        assert "operator content that must survive" in merged
+        assert "VALID SECTION" not in merged
+        assert "REPLACED" in merged
+        assert merged.count("S:START") == 2  # replaced pair + trailing stray
+
+    def test_two_starts_one_end_with_inner_pair_replaces_inner(self) -> None:
+        """Review-blocker round 3 + round 2 alignment: a body with
+        two starts followed by a single end (no orphan end) must
+        target the INNER pair (the second start is the active
+        section opener; the first start is the previous run's
+        stray that we should not anchor on)."""
+        from bridge.executor import _upsert_marker_section
+
+        body = (
+            "<!-- S:START -->\nSTRAY PARTIAL\n"
+            "more operator content\n"
+            "<!-- S:START -->\nFIRST SECTION\n<!-- S:END -->\n"
+        )
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nREPLACED\n<!-- S:END -->\n",
+        )
+        # The round-2 requirement: stray partial and operator
+        # content survive; the inner pair is replaced.
+        assert "STRAY PARTIAL" in merged
+        assert "more operator content" in merged
+        assert "FIRST SECTION" not in merged
+        assert "REPLACED" in merged
+
     def test_does_not_disturb_other_job_sections(self) -> None:
         """Two distinct marker pairs in the same body — only the
         targeted section is replaced."""
@@ -3364,8 +3447,10 @@ class TestRetryWritebackRealExecutor:
 
         # The retry must NOT raise — it must record the failure and
         # return cleanly so the response builder can surface the
-        # error.
-        executor_wet.retry_writeback(job)
+        # error. The return value (review concern round 3) is the
+        # authoritative outcome the HTTP handler uses to build the
+        # response.
+        success = executor_wet.retry_writeback(job)
 
         events = [evt["event"] for evt in job.events]
         assert "writeback_retry_started" in events
@@ -3374,3 +3459,5 @@ class TestRetryWritebackRealExecutor:
         assert "writeback_retry_completed" not in events
         # The job stays in operator review (not falsely promoted).
         assert job.status == UNKNOWN
+        # The return value matches the recorded outcome.
+        assert success is False

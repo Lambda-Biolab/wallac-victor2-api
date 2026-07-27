@@ -203,17 +203,18 @@ def _upsert_marker_section(
     greppable per-job prefix so two different jobs in the same
     experiment never collide.
 
-    Behavior (review-blocker 4, refined round 2):
+    Behavior (review-blocker 4, refined round 3):
 
-    * If a well-formed pair (start, then end) exists, the LAST such
-      pair's span is replaced. Targeting the LAST pair rather than
-      the first protects against repeat-upsert scenarios where an
-      earlier stray start marker (left over from a previous aborted
-      write) could otherwise anchor the replacement and delete
-      unrelated content that grew between the stray start and the
-      new end. Surrounding content is preserved verbatim.
-    * If no well-formed pair exists (only one marker, or the end
-      marker appears before its start marker, or no marker at all),
+    * If a well-formed (start, end) pair exists, the LAST such pair
+      — defined as a start marker that has an end marker after it
+      and before any other start marker — has its span (inclusive
+      of both markers) replaced. Scanning from the right and
+      pairing the first end-after-start found protects against
+      repeat-upsert scenarios where stray markers from earlier
+      aborted writes could otherwise anchor the replacement and
+      delete unrelated content grown around them.
+    * If no well-formed pair exists (only one marker, no marker,
+      or every start is followed by another start before an end),
       the body is treated as having no existing section for this
       job — the new section is appended so operator-authored
       content is never lost on a guess.
@@ -221,29 +222,72 @@ def _upsert_marker_section(
     if not existing_body:
         return new_section
 
-    # Find the LAST well-formed (start, end) pair. We scan from the
-    # end of the body backwards so an old stray start marker cannot
-    # mislead the replacement span.
-    last_start = existing_body.rfind(start_marker)
-    last_end = existing_body.rfind(end_marker)
-    well_formed = (
-        last_start >= 0
-        and last_end > last_start
-        and last_end + len(end_marker) <= len(existing_body)
-    )
+    last_start, end_after = _last_well_formed_pair(existing_body, start_marker, end_marker)
 
-    if well_formed:
+    if last_start is not None:
         before = existing_body[:last_start]
-        after = existing_body[last_end + len(end_marker) :]
+        after = existing_body[end_after:]
         return before + new_section + after
 
-    # Malformed marker structure (only one marker, or end before
-    # start, or no marker at all). Treat as "no section present" and
-    # append — never delete content on a guess. If a real conflict
-    # later surfaces, operators can manually clean up the stray
-    # marker.
+    # Malformed marker structure (only one marker, no marker, or
+    # every start is followed by another start before an end). Treat
+    # as "no section present" and append — never delete content on
+    # a guess. If a real conflict later surfaces, operators can
+    # manually clean up the stray markers.
     sep = "" if existing_body.endswith("\n") else "\n"
     return existing_body + sep + "\n" + new_section + "\n"
+
+
+def _last_well_formed_pair(body: str, start_marker: str, end_marker: str) -> tuple[int | None, int]:
+    """Find the LAST well-formed ``(start, end)`` pair in ``body``.
+
+    The well-formed pair is identified by ``rfind(start_marker)``
+    followed by ``find(end_marker, start_idx + len(start_marker))``
+    (review-round-3 proposal). That is:
+
+      * pick the rightmost start marker;
+      * pair it with the FIRST end marker after it AND before any
+        other start marker (a nested start would mean this end
+        actually belongs to the inner section);
+      * if no end after the rightmost start, walk left to the
+        previous start and try again;
+      * if no pair is found, return ``(None, 0)``.
+
+    This handles the three failure modes the review process
+    identified:
+
+    * Round 1: clean body — first start matched with first end.
+    * Round 2: stray start before a complete pair — the algorithm
+      walks past the stray (no end after it) to the inner pair.
+    * Round 3: complete pair + trailing orphan end — the orphan end
+      is NOT selected because the rightmost start is paired with
+      the FIRST end after it, not the last end in the body.
+
+    Returns ``(start_idx, end_idx_after_end_marker)`` or
+    ``(None, 0)`` when no well-formed pair exists. The end index is
+    positioned just after the end marker so callers can slice the
+    body as ``body[:start_idx] + new + body[end_idx_after_end_marker:]``.
+    """
+    start_len = len(start_marker)
+    end_len = len(end_marker)
+    search_from = len(body)
+    while True:
+        start_idx = body.rfind(start_marker, 0, search_from)
+        if start_idx < 0:
+            return None, 0
+        end_after_start = body.find(end_marker, start_idx + start_len)
+        if end_after_start < 0:
+            # No end after this start — try an earlier one.
+            search_from = start_idx
+            continue
+        # If another start marker sits between this start and the
+        # end we found, the end actually belongs to the inner
+        # section. Walk left.
+        next_start_between = body.find(start_marker, start_idx + start_len, end_after_start)
+        if next_start_between >= 0:
+            search_from = start_idx
+            continue
+        return start_idx, end_after_start + end_len
 
 
 def _protocol_match(
@@ -1577,7 +1621,7 @@ class BridgeExecutor:
             logger.exception("Write-back failed for job %s", job.job_id)
             return False
 
-    def retry_writeback(self, job: Job) -> None:
+    def retry_writeback(self, job: Job) -> bool:
         """Re-run writeback for a job whose hardware run already completed.
 
         Used by ``POST /jobs/{job_id}/retry-writeback`` (slice 5 of
@@ -1598,10 +1642,19 @@ class BridgeExecutor:
           recoverable data.
         * ``job.live_wells`` is non-empty.
 
+        Returns:
+            ``True`` on successful retry, ``False`` otherwise. The
+            return value (review concern round 3) is the authoritative
+            outcome for the HTTP handler — the handler MUST NOT
+            re-derive the outcome by searching ``job.events``,
+            because concurrent retry requests can interleave events
+            and confuse the search.
+
         Side effects:
 
         * New ``writeback_retry_started`` /
           ``writeback_retry_completed`` /
+          ``writeback_retry_failed`` /
           ``writeback_retry_rejected`` events so operators can see
           when the retry happened and whether it succeeded.
         * On success, ``writeback_completed`` is recorded and the job
@@ -1615,13 +1668,13 @@ class BridgeExecutor:
                 f"job status {job.status!r} is not retry-eligible; "
                 "only completed or unknown_requires_operator_review jobs can be retried",
             )
-            return
+            return False
         if not job.live_wells:
             job.add_event(
                 "writeback_retry_rejected",
                 "no live_wells on job; the original run never produced usable data",
             )
-            return
+            return False
 
         job.add_event("writeback_retry_started", f"experiment={job.elabftw_experiment_id}")
         # Reason: keep the same writeback semantics as the original
@@ -1651,11 +1704,12 @@ class BridgeExecutor:
             # helper) still gets recorded as a retry failure.
             job.add_event("writeback_retry_failed", str(error))
             logger.exception("Writeback retry raised for job %s", job.job_id)
-            return
+            return False
         if success:
             job.add_event("writeback_retry_completed", f"experiment={job.elabftw_experiment_id}")
-        else:
-            job.add_event("writeback_retry_failed", "see elabftw_writeback_failed event")
+            return True
+        job.add_event("writeback_retry_failed", "see elabftw_writeback_failed event")
+        return False
 
     def _build_results_html(self, job: Job, raw_wells: list[dict[str, Any]]) -> str:
         """Build a rich HTML body with plate heatmap and results table."""

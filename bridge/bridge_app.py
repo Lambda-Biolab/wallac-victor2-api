@@ -450,34 +450,36 @@ def _resolve_retry_writeback_target(
     return job, None
 
 
-def _build_retry_writeback_response(job_id: str, job: Any) -> RetryWritebackResponse:
+def _build_retry_writeback_response(
+    job_id: str, job: Any, *, success: bool
+) -> RetryWritebackResponse:
     """Build the response payload after ``executor.retry_writeback`` ran.
 
-    Uses retry-specific events (``writeback_retry_completed`` /
-    ``writeback_retry_failed``) so a stale ``writeback_completed`` from
-    a previous attempt cannot mislead the response (review concern 1).
+    Review concern round 3: the ``success`` flag is the authoritative
+    outcome — the caller passes the return value of
+    ``executor.retry_writeback``. Searching ``job.events`` for the
+    latest retry event is unreliable under concurrent retry requests
+    because two requests can interleave events and confuse the
+    search. The flag bypasses that race entirely.
+
+    The function still picks up the most recent retry event for the
+    human-readable ``reason`` field — that is informational and does
+    not influence the ``retried`` boolean.
     """
-    retry_events = ("writeback_retry_completed", "writeback_retry_failed")
     retry_event = next(
-        (evt for evt in reversed(job.events) if evt["event"] in retry_events),
+        (
+            evt
+            for evt in reversed(job.events)
+            if evt["event"]
+            in ("writeback_retry_completed", "writeback_retry_failed", "writeback_retry_rejected")
+        ),
         None,
     )
-    if retry_event is None:
-        # Should not happen — retry_writeback always records one of
-        # these — but treat as failure rather than silently 200.
-        return RetryWritebackResponse(
-            job_id=job_id,
-            retried=False,
-            status=job.status,
-            reason="retry did not record a completion event",
-            elabftw_experiment_id=job.elabftw_experiment_id,
-        )
-    retried = retry_event["event"] == "writeback_retry_completed"
     return RetryWritebackResponse(
         job_id=job_id,
-        retried=retried,
+        retried=success,
         status=job.status,
-        reason=retry_event["detail"],
+        reason=retry_event["detail"] if retry_event else "",
         elabftw_experiment_id=job.elabftw_experiment_id,
     )
 
@@ -567,8 +569,20 @@ def _register_routes(
             raise error_response
         # ``_resolve_retry_writeback_target`` guarantees ``executor`` is
         # non-None when ``error_response`` is None — see the 503 branch.
-        executor.retry_writeback(job)  # type: ignore[union-attr]
-        return _build_retry_writeback_response(job_id, job)
+        # Review concern round 3: use the return value as the
+        # authoritative outcome. Two concurrent retry requests can
+        # interleave events on the shared job.events list, so we
+        # MUST NOT re-derive success by searching the events.
+        success = executor.retry_writeback(job)  # type: ignore[union-attr]
+        if not success:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Retry writeback for job {job_id} did not succeed; "
+                    "see job events for the underlying error"
+                ),
+            )
+        return _build_retry_writeback_response(job_id, job, success=True)
 
 
 # --- App factory ---

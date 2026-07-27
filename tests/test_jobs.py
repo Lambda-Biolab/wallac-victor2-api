@@ -893,13 +893,12 @@ class TestRetryWriteback:
         called = []
 
         class _StubExecutor:
-            def retry_writeback(self, target: Job) -> None:
+            def retry_writeback(self, target: Job) -> bool:
                 called.append(target.job_id)
-                # Review concern 1: the executor must emit retry-specific
-                # events so the response builder can distinguish a
-                # retry success from a stale writeback_completed
-                # event in the job history.
+                # Review concern round 3: the boolean return value is
+                # the authoritative outcome, not the event.
                 target.add_event("writeback_retry_completed", "experiment=42")
+                return True
 
         _, client, manager = self._build_app_and_client(_StubExecutor())
         self._seed_terminal_job(manager)
@@ -914,6 +913,33 @@ class TestRetryWriteback:
         _, client, _ = self._build_app_and_client(_SimpleStubExecutor())
         r = client.post("/jobs/job-does-not-exist/retry-writeback")
         assert r.status_code == 404
+
+    def test_retry_failure_returns_503(self) -> None:
+        """Review concern round 3: a retry that completes but the
+        underlying eLabFTW call fails MUST surface as HTTP 503, not
+        HTTP 200 with retried=False (which would mislead operators
+        about whether a recovery happened).
+
+        Concurrent retry cross-reporting concern: even when the
+        event log says the retry succeeded, the handler trusts the
+        return value. This stub returns ``False`` while emitting
+        the success event, simulating a buggy executor; the handler
+        must return 503 regardless of the event log."""
+
+        class _MisreportingStubExecutor:
+            def retry_writeback(self, target: Job) -> bool:
+                # Deliberately emit the success event but return
+                # False to simulate an executor that recorded a
+                # stale event before the actual failure. The
+                # handler must NOT trust the event — it must trust
+                # the return value.
+                target.add_event("writeback_retry_completed", "experiment=42")
+                return False
+
+        _, client, manager = self._build_app_and_client(_MisreportingStubExecutor())
+        self._seed_terminal_job(manager)
+        r = client.post("/jobs/job-retry-001/retry-writeback")
+        assert r.status_code == 503, r.text
 
     def test_retry_accepted_status_job_with_data_returns_409(self) -> None:
         """A job in 'accepted' state with cached live_wells must NOT be
@@ -987,10 +1013,11 @@ class TestRetryWriteback:
         called = []
 
         class _StubExecutor:
-            def retry_writeback(self, target: Job) -> None:
+            def retry_writeback(self, target: Job) -> bool:
                 called.append(target.job_id)
                 target.status = "completed"
                 target.add_event("writeback_retry_completed", "experiment=42")
+                return True
 
         _, client, manager = self._build_app_and_client(_StubExecutor())
         self._seed_terminal_job(manager, status="unknown_requires_operator_review")
@@ -1012,8 +1039,9 @@ class TestRetryWriteback:
         class _NoRunExecutor:
             """Deliberately exposes only retry_writeback; no start_run."""
 
-            def retry_writeback(self, target: Job) -> None:
+            def retry_writeback(self, target: Job) -> bool:
                 target.add_event("writeback_retry_completed", "experiment=42")
+                return True
 
         _, client, manager = self._build_app_and_client(_NoRunExecutor())
         self._seed_terminal_job(manager)
