@@ -75,8 +75,10 @@ When a job fails, aborts, or enters an ambiguous state:
 3. **Write back results and mark terminal state.** The executor uploads any
    available results and artifacts to eLabFTW synchronously, then writes the
    final state (``completed``, ``failed``, ``aborted``, or
-   ``unknown_requires_operator_review``). If the eLabFTW write-back fails, the
-   job is marked ``failed`` — there is no local spool or retry queue.
+   ``unknown_requires_operator_review``). If eLabFTW write-back fails after
+   measurement, the job enters ``unknown_requires_operator_review`` with the
+   instrument ``run_id`` and explicit guidance not to rerun automatically.
+   There is no local spool or retry queue.
 
 4. **Mark for operator review if ambiguous.** If the bridge cannot determine
    whether the run completed (partial results, failed analysis), it sets the
@@ -115,6 +117,15 @@ All errors include:
 - **Minimum abort age:** vm-agent enforces 60 s minimum (returns 425 "too
   early" if the run is too young). The executor retries on the next poll
   cycle (``bridge/executor.py:390-415``).
+- **Preflight:** every non-dry-run job performs an authenticated, read-only
+  eLabFTW request before any clone, plate-map mutation, assay snapshot, or
+  physical run.   Success emits ``elabftw_preflight_ok``; failure emits
+  ``elabftw_preflight_failed`` and rejects the job without instrument side
+  effects. The probe requires HTTP 200, requests JSON, and does not log the
+  response body.
+
+- **Health probes:** ``GET /health/live`` reports process liveness;
+  ``GET /health/ready`` reports worker and eLabFTW/vm-agent dependency readiness.
 - **No eLabFTW polling.** Abort requests arrive via HTTP, not eLabFTW metadata.
 - **Tests:** ``tests/`` cover abort during existing-protocol and
   generated-protocol execution in ``JobManager`` and ``BridgeExecutor`` tests.

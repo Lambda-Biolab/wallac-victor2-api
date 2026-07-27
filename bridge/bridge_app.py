@@ -5,7 +5,9 @@ eLabFTW for jobs. Instead, it accepts job submissions via HTTP POST and
 executes them on a background worker thread.
 
 Endpoints:
-  GET  /health           — bridge health check
+  GET  /health           — backwards-compatible health summary
+  GET  /health/live      — process liveness check
+  GET  /health/ready     — worker and dependency readiness check
   POST /jobs             — submit a job for execution
   GET  /jobs             — list all jobs
   GET  /jobs/{job_id}    — get job status
@@ -21,9 +23,9 @@ import hmac
 import os
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, status
+from fastapi import FastAPI, Header, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .config import BridgeConfig
 from .elabftw import ElabftwClient
@@ -33,6 +35,150 @@ from .security_headers import install_security_headers
 from .vm_agent_client import VmAgentClient
 
 # --- Pydantic models ---
+
+
+# 8 rows (A..H) by 12 columns (1..12). Used to expand ``{all: true}`` and
+# ``{rows: [...]}`` server-side so the vm-agent only ever sees the
+# canonical ``{wells: [...]}`` shape. Duplicating the constants here keeps
+# the public Pydantic model independent of vm-agent internals.
+_VALID_ROWS = "ABCDEFGH"
+# Strict 1..12 well address with no zero-padding. The vm-agent parses
+# zero-padded names (e.g. ``A01``) by extracting the digits and
+# range-checking the integer, but the bridge's public contract uses
+# the canonical ``A1..H12`` form. Review NIT: callers sending
+# ``A01`` will see HTTP 422 at the boundary — round-trip to the
+# canonical form before resubmitting.
+_WELL_PATTERN_RE = r"^[A-H](?:[1-9]|1[0-2])$"
+
+
+def _clean_rows(rows: list[str]) -> list[str]:
+    """Normalize and validate ``wells_spec.rows`` entries (A..H).
+
+    Extracted from ``WellsSpec._validate_shape`` to keep the model's
+    complexity under the project ceiling. Raises ``ValueError`` on
+    any row outside A..H.
+    """
+    cleaned: list[str] = []
+    for row in rows:
+        token = str(row).strip().upper()
+        if len(token) != 1 or token not in _VALID_ROWS:
+            raise ValueError(f"wells_spec.rows must be a list of single letters A..H; got {row!r}")
+        cleaned.append(token)
+    return cleaned
+
+
+def _clean_wells(wells: list[str]) -> list[str]:
+    """Normalize and validate ``wells_spec.wells`` entries (A1..H12).
+
+    Extracted from ``WellsSpec._validate_shape`` to keep the model's
+    complexity under the project ceiling. Raises ``ValueError`` on
+    any well outside the canonical address space.
+    """
+    import re as _re
+
+    cleaned: list[str] = []
+    for well in wells:
+        token = str(well).strip().upper()
+        if not _re.match(_WELL_PATTERN_RE, token):
+            raise ValueError(f"wells_spec.wells must look like A1..H12; got {well!r}")
+        cleaned.append(token)
+    return cleaned
+
+
+class WellsSpec(BaseModel):
+    """Public ``wells_spec`` contract.
+
+    Accepts ONE of the following keys (presence-based, not truthiness):
+
+    * ``all: true`` — measure every well on the 96-well plate.
+      ``all: false`` is rejected so a malformed caller cannot silently
+      fall back to the factory plate map.
+    * ``rows: ["A", "B", ...]`` — measure every well in the named rows.
+      The list MUST be non-empty; an empty list is rejected at the
+      boundary.
+    * ``wells: ["A1", "A2", ...]`` — measure only the named wells.
+      The list MUST be non-empty; an empty list is rejected at the
+      boundary.
+
+    Anything else (multiple keys at once, an empty list, an
+    unsupported key, a row outside A..H, a well outside A1..H12) is
+    rejected with HTTP 422 *before* the job is queued, so the vm-agent
+    never sees garbage shapes.
+
+    To run the protocol's factory 96-well plate map unchanged, omit
+    the field entirely or pass ``{}``.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    all: bool | None = None
+    rows: list[str] | None = None
+    wells: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> WellsSpec:
+        # Presence-based, not truthiness: ``{"all": false}`` and
+        # ``{"rows": []}`` are explicitly rejected so a malformed
+        # caller cannot accidentally fall back to the factory plate
+        # map when they meant to constrain the run.
+        chosen: list[str] = []
+        if "all" in self.model_fields_set:
+            chosen.append("all")
+            if self.all is not True:
+                raise ValueError("wells_spec.all must be exactly true when present")
+        if "rows" in self.model_fields_set:
+            chosen.append("rows")
+            if not self.rows:
+                raise ValueError("wells_spec.rows must be a non-empty list when present")
+        if "wells" in self.model_fields_set:
+            chosen.append("wells")
+            if not self.wells:
+                raise ValueError("wells_spec.wells must be a non-empty list when present")
+
+        if len(chosen) == 0:
+            # Empty/absent spec — caller wants the factory plate map.
+            return self
+        if len(chosen) > 1:
+            raise ValueError(
+                f"wells_spec accepts exactly one of all/rows/wells; got {sorted(chosen)}"
+            )
+        if self.rows is not None:
+            self.rows = _clean_rows(self.rows)
+        if self.wells is not None:
+            self.wells = _clean_wells(self.wells)
+        return self
+
+    def expanded(self) -> list[str] | None:
+        """Return the canonical ``wells: [...]`` form, or ``None`` if empty.
+
+        ``None`` means "use the factory plate map"; an empty list means
+        "explicit empty plate" (which the vm-agent rejects, but only the
+        executor needs to handle that). The bridge expands ``all`` and
+        ``rows`` here so the vm-agent only ever sees the canonical shape.
+        """
+        if self.all:
+            return [f"{r}{c}" for r in _VALID_ROWS for c in range(1, 13)]
+        if self.rows:
+            return [f"{r}{c}" for r in self.rows for c in range(1, 13)]
+        if self.wells:
+            return list(self.wells)
+        return None
+
+    def to_slim_dict(self) -> dict[str, Any]:
+        """Return only the populated fields, for round-trip serialization.
+
+        Pydantic's default ``model_dump`` emits all three keys with
+        ``None`` siblings, which leaks internal model state to clients
+        and breaks the round-trip expectation ``body["wells_spec"] ==
+        submitted_spec``. Use this helper to keep the wire shape stable.
+        """
+        if self.all:
+            return {"all": True}
+        if self.rows is not None:
+            return {"rows": list(self.rows)}
+        if self.wells is not None:
+            return {"wells": list(self.wells)}
+        return {}
 
 
 class JobSubmitRequest(BaseModel):
@@ -46,8 +192,8 @@ class JobSubmitRequest(BaseModel):
         description="Wallac protocol ID (existing_protocol mode, takes precedence over protocol_name)",
     )
     elabftw_experiment_id: int = Field(0, description="eLabFTW experiment ID for result write-back")
-    wells_spec: dict[str, Any] = Field(
-        default_factory=dict,
+    wells_spec: WellsSpec = Field(
+        default_factory=WellsSpec,
         description=(
             "Optional plate-map override. Accepts {all: true}, "
             "{rows: [A,B]}, or {wells: [A1,A2]}. "
@@ -96,6 +242,14 @@ class JobResponse(BaseModel):
 class AbortResponse(BaseModel):
     job_id: str
     abort_requested: bool
+
+
+class RetryWritebackResponse(BaseModel):
+    job_id: str
+    retried: bool
+    status: str
+    reason: str = ""
+    elabftw_experiment_id: int = 0
 
 
 def _job_to_response(job: Job) -> JobResponse:
@@ -153,8 +307,8 @@ def _bridge_token(config: BridgeConfig | None) -> str:
     return token
 
 
-def _wire_executor(config: BridgeConfig, job_manager: JobManager) -> None:
-    """Connect the job manager to the configured external adapters."""
+def _wire_executor(config: BridgeConfig, job_manager: JobManager) -> BridgeExecutor:
+    """Connect the job manager to configured adapters and return the executor."""
     vm_agent = VmAgentClient(base_url=config.vm_agent_url, token=config.vm_agent_token)
     elabftw = ElabftwClient(
         base_url=config.elabftw_url,
@@ -162,10 +316,10 @@ def _wire_executor(config: BridgeConfig, job_manager: JobManager) -> None:
         verify_tls=config.elabftw_verify_tls,
         ca_bundle=config.elabftw_ca_bundle,
     )
-    job_manager.set_executor(
-        BridgeExecutor(vm_agent=vm_agent, elabftw=elabftw, dry_run=config.dry_run)
-    )
+    executor = BridgeExecutor(vm_agent=vm_agent, elabftw=elabftw, dry_run=config.dry_run)
+    job_manager.set_executor(executor)
     job_manager.start_worker()
+    return executor
 
 
 def _configure_cors(app: FastAPI, config: BridgeConfig | None) -> None:
@@ -188,19 +342,157 @@ def _configure_cors(app: FastAPI, config: BridgeConfig | None) -> None:
     )
 
 
-def _register_routes(app: FastAPI, manager: JobManager, token: str) -> None:
-    """Register the bridge HTTP contract against one job manager."""
+def _health_ready_response(
+    manager: JobManager, executor: BridgeExecutor | None
+) -> tuple[dict[str, Any], bool]:
+    """Build the /health/ready response dict and ready flag."""
+    issues: list[str] = []
+    worker_running = manager.worker_running
+    if not worker_running:
+        issues.append("worker_not_running")
+    if executor is None:
+        issues.append("dependencies_not_configured")
+    else:
+        try:
+            executor.elabftw.check_connection(timeout=1.5)
+
+        except Exception:
+            issues.append("elabftw_unavailable")
+        try:
+            executor.vm_agent.get_health(timeout=1.5)
+
+        except Exception:
+            issues.append("vm_agent_unavailable")
+    ready = not issues
+    return {
+        "status": "ready" if ready else "not_ready",
+        "ready": ready,
+        "worker_running": worker_running,
+        "issues": issues,
+    }, ready
+
+
+def _register_health_routes(
+    app: FastAPI,
+    manager: JobManager,
+    executor: BridgeExecutor | None,
+) -> None:
+    """Register liveness/readiness endpoints on the app."""
 
     @app.get("/health")
     def health() -> dict[str, Any]:
         current = manager.current_job
         return {
             "status": "ok",
-            "worker_running": (
-                manager._worker_thread is not None and manager._worker_thread.is_alive()
-            ),
+            "worker_running": manager.worker_running,
             "current_job": current.job_id if current else "",
         }
+
+    @app.get("/health/live")
+    def health_live() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/health/ready")
+    def health_ready(response: Response) -> dict[str, Any]:
+        body, ready = _health_ready_response(manager, executor)
+        if not ready:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return body
+
+
+def _resolve_retry_writeback_target(
+    manager: JobManager,
+    job_id: str,
+    executor: BridgeExecutor | None,
+) -> tuple[Any, HTTPException | None]:
+    """Validate a retry-writeback request and return the target Job.
+
+    Returns ``(job, None)`` when the request is valid, or
+    ``(None, HTTPException)`` when the request must be rejected with
+    the indicated HTTP status. Splitting this from the handler keeps
+    ``_register_routes`` under the complexity ceiling.
+
+    Retry eligibility (review-blocker 3): only ``completed`` and
+    ``unknown_requires_operator_review`` jobs. ``failed`` and
+    ``aborted`` jobs are refused because:
+
+    * An aborted run can have partial ``live_wells`` accumulated
+      before the abort landed — retrying those would publish a
+      partial measurement set marked as completed.
+    * A failed run typically has no recoverable data.
+    """
+    job = manager.get_job(job_id)
+    if job is None:
+        return None, HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    from bridge.jobs import COMPLETED, UNKNOWN
+
+    if job.status not in (COMPLETED, UNKNOWN):
+        return None, HTTPException(
+            status_code=409,
+            detail=(
+                f"Job {job_id} is not retry-eligible (status={job.status!r}); "
+                "only completed or unknown_requires_operator_review jobs can be retried"
+            ),
+        )
+    if not job.live_wells:
+        return None, HTTPException(
+            status_code=409,
+            detail=(
+                f"Job {job_id} has no live_wells data; the original run never produced "
+                "usable readings and writeback cannot be reconstructed"
+            ),
+        )
+    if executor is None:
+        return None, HTTPException(
+            status_code=503,
+            detail="executor not configured",
+        )
+    return job, None
+
+
+def _build_retry_writeback_response(
+    job_id: str, job: Any, *, success: bool
+) -> RetryWritebackResponse:
+    """Build the response payload after ``executor.retry_writeback`` ran.
+
+    Review concern round 3: the ``success`` flag is the authoritative
+    outcome — the caller passes the return value of
+    ``executor.retry_writeback``. Searching ``job.events`` for the
+    latest retry event is unreliable under concurrent retry requests
+    because two requests can interleave events and confuse the
+    search. The flag bypasses that race entirely.
+
+    The function still picks up the most recent retry event for the
+    human-readable ``reason`` field — that is informational and does
+    not influence the ``retried`` boolean.
+    """
+    retry_event = next(
+        (
+            evt
+            for evt in reversed(job.events)
+            if evt["event"]
+            in ("writeback_retry_completed", "writeback_retry_failed", "writeback_retry_rejected")
+        ),
+        None,
+    )
+    return RetryWritebackResponse(
+        job_id=job_id,
+        retried=success,
+        status=job.status,
+        reason=retry_event["detail"] if retry_event else "",
+        elabftw_experiment_id=job.elabftw_experiment_id,
+    )
+
+
+def _register_routes(
+    app: FastAPI,
+    manager: JobManager,
+    token: str,
+    executor: BridgeExecutor | None,
+) -> None:
+    """Register the bridge HTTP contract against one job manager."""
+
+    _register_health_routes(app, manager, executor)
 
     @app.post("/jobs", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
     def submit_job(
@@ -208,7 +500,15 @@ def _register_routes(app: FastAPI, manager: JobManager, token: str) -> None:
     ) -> JobResponse:
         _check_auth(token, authorization)
         try:
-            job = manager.submit_job(req.model_dump())
+            # Reason: WellsSpec is a typed Pydantic model so default
+            # ``model_dump`` includes all three sibling keys with Nones.
+            # Normalize to the slim form so the stored Job.wells_spec
+            # matches what the caller submitted — keeps the public
+            # contract stable and prevents accidental garbage reaching
+            # the executor / vm-agent.
+            payload = req.model_dump()
+            payload["wells_spec"] = req.wells_spec.to_slim_dict()
+            job = manager.submit_job(payload)
         except DuplicateJobError as e:
             existing = manager.get_job(e.existing_job_id)
             detail: dict[str, Any] = {
@@ -243,6 +543,54 @@ def _register_routes(app: FastAPI, manager: JobManager, token: str) -> None:
             raise HTTPException(status_code=409, detail=f"Job {job_id} not found or not abortable")
         return AbortResponse(job_id=job_id, abort_requested=True)
 
+    @app.post(
+        "/jobs/{job_id}/retry-writeback",
+        response_model=RetryWritebackResponse,
+    )
+    def retry_writeback(
+        job_id: str, authorization: str | None = Header(default=None)
+    ) -> RetryWritebackResponse:
+        """Re-run eLabFTW writeback for a job whose hardware run already
+        completed but whose writeback failed (e.g. transient TLS blip,
+        eLabFTW restart). MUST NOT restart the hardware run.
+
+        Slice 5 of
+        ``docs/plans/wallac-existing-protocol-writeback-repair.md``.
+
+        Returns 200 when the retry succeeded, 503 when the retry
+        attempt itself failed (eLabFTW still unreachable, see the
+        underlying ``elabftw_writeback_failed`` event), 404 if the
+        job is unknown, 409 if the job is in a state where retry is
+        meaningless (not completed/unknown-review, or no live_wells
+        data), and 503 if the executor is not wired (test/dev path).
+
+        The handler does not block on the retry itself;
+        ``executor.retry_writeback`` is fast (HTTP PATCH to eLabFTW).
+        The success/failure outcome comes from its return value, not
+        from searching ``job.events`` — concurrent retry requests
+        can interleave events on the shared event list.
+        """
+        _check_auth(token, authorization)
+        job, error_response = _resolve_retry_writeback_target(manager, job_id, executor)
+        if error_response is not None:
+            raise error_response
+        # ``_resolve_retry_writeback_target`` guarantees ``executor`` is
+        # non-None when ``error_response`` is None — see the 503 branch.
+        # Review concern round 3: use the return value as the
+        # authoritative outcome. Two concurrent retry requests can
+        # interleave events on the shared job.events list, so we
+        # MUST NOT re-derive success by searching the events.
+        success = executor.retry_writeback(job)  # type: ignore[union-attr]
+        if not success:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Retry writeback for job {job_id} did not succeed; "
+                    "see job events for the underlying error"
+                ),
+            )
+        return _build_retry_writeback_response(job_id, job, success=True)
+
 
 # --- App factory ---
 
@@ -250,19 +598,25 @@ def _register_routes(app: FastAPI, manager: JobManager, token: str) -> None:
 def create_bridge_app(
     config: BridgeConfig | None = None,
     job_manager: JobManager | None = None,
+    *,
+    executor: Any | None = None,
 ) -> FastAPI:
     """Create the FastAPI bridge app.
 
     Args:
         config: Bridge config (for production). If None, reads from env.
         job_manager: Pre-configured JobManager (for testing). If None, creates one.
+        executor: Optional executor to wire when ``config`` is None (the
+            test-only path). Lets unit tests drive the retry-writeback
+            endpoint without booting the production wiring.
     """
     if config is None and job_manager is None:
         config = BridgeConfig.from_env()
     manager = job_manager or JobManager()
     token = _bridge_token(config)
     if config is not None:
-        _wire_executor(config, manager)
+        executor = _wire_executor(config, manager)
+    # else: ``executor`` is whatever the caller supplied (or None).
 
     app = FastAPI(
         title="Wallac Victor2 Bridge",
@@ -272,5 +626,5 @@ def create_bridge_app(
 
     install_security_headers(app)
     _configure_cors(app, config)
-    _register_routes(app, manager, token)
+    _register_routes(app, manager, token, executor)
     return app

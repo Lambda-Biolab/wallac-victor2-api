@@ -21,7 +21,11 @@ from __future__ import annotations
 import html
 import json
 import logging
+import socket
+import ssl
+import threading
 import time
+import urllib.error
 from typing import Any, Callable
 
 from .analysis import AnalysisPipeline
@@ -183,6 +187,109 @@ def _ordered_protocols(protocols: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return factory + custom
 
 
+def _upsert_marker_section(
+    existing_body: str,
+    start_marker: str,
+    end_marker: str,
+    new_section: str,
+) -> str:
+    """Replace or append a marker-delimited section in ``existing_body``.
+
+    Used by the writeback path (slice 4 of
+    ``docs/plans/wallac-existing-protocol-writeback-repair.md``) to
+    safely amend an experiment body with a job's results without
+    disturbing other content. The markers must be exact byte strings;
+    the caller (``results_section_markers``) guarantees a unique,
+    greppable per-job prefix so two different jobs in the same
+    experiment never collide.
+
+    Behavior (review-blocker 4, refined round 3):
+
+    * If a well-formed (start, end) pair exists, the LAST such pair
+      — defined as a start marker that has an end marker after it
+      and before any other start marker — has its span (inclusive
+      of both markers) replaced. Scanning from the right and
+      pairing the first end-after-start found protects against
+      repeat-upsert scenarios where stray markers from earlier
+      aborted writes could otherwise anchor the replacement and
+      delete unrelated content grown around them.
+    * If no well-formed pair exists (only one marker, no marker,
+      or every start is followed by another start before an end),
+      the body is treated as having no existing section for this
+      job — the new section is appended so operator-authored
+      content is never lost on a guess.
+    """
+    if not existing_body:
+        return new_section
+
+    last_start, end_after = _last_well_formed_pair(existing_body, start_marker, end_marker)
+
+    if last_start is not None:
+        before = existing_body[:last_start]
+        after = existing_body[end_after:]
+        return before + new_section + after
+
+    # Malformed marker structure (only one marker, no marker, or
+    # every start is followed by another start before an end). Treat
+    # as "no section present" and append — never delete content on
+    # a guess. If a real conflict later surfaces, operators can
+    # manually clean up the stray markers.
+    sep = "" if existing_body.endswith("\n") else "\n"
+    return existing_body + sep + "\n" + new_section + "\n"
+
+
+def _last_well_formed_pair(body: str, start_marker: str, end_marker: str) -> tuple[int | None, int]:
+    """Find the LAST well-formed ``(start, end)`` pair in ``body``.
+
+    The well-formed pair is identified by ``rfind(start_marker)``
+    followed by ``find(end_marker, start_idx + len(start_marker))``
+    (review-round-3 proposal). That is:
+
+      * pick the rightmost start marker;
+      * pair it with the FIRST end marker after it AND before any
+        other start marker (a nested start would mean this end
+        actually belongs to the inner section);
+      * if no end after the rightmost start, walk left to the
+        previous start and try again;
+      * if no pair is found, return ``(None, 0)``.
+
+    This handles the three failure modes the review process
+    identified:
+
+    * Round 1: clean body — first start matched with first end.
+    * Round 2: stray start before a complete pair — the algorithm
+      walks past the stray (no end after it) to the inner pair.
+    * Round 3: complete pair + trailing orphan end — the orphan end
+      is NOT selected because the rightmost start is paired with
+      the FIRST end after it, not the last end in the body.
+
+    Returns ``(start_idx, end_idx_after_end_marker)`` or
+    ``(None, 0)`` when no well-formed pair exists. The end index is
+    positioned just after the end marker so callers can slice the
+    body as ``body[:start_idx] + new + body[end_idx_after_end_marker:]``.
+    """
+    start_len = len(start_marker)
+    end_len = len(end_marker)
+    search_from = len(body)
+    while True:
+        start_idx = body.rfind(start_marker, 0, search_from)
+        if start_idx < 0:
+            return None, 0
+        end_after_start = body.find(end_marker, start_idx + start_len)
+        if end_after_start < 0:
+            # No end after this start — try an earlier one.
+            search_from = start_idx
+            continue
+        # If another start marker sits between this start and the
+        # end we found, the end actually belongs to the inner
+        # section. Walk left.
+        next_start_between = body.find(start_marker, start_idx + start_len, end_after_start)
+        if next_start_between >= 0:
+            search_from = start_idx
+            continue
+        return start_idx, end_after_start + end_len
+
+
 def _protocol_match(
     protocols: list[dict[str, Any]],
     predicate: Callable[[str], bool],
@@ -303,6 +410,17 @@ class BridgeExecutor:
         self.elabftw = elabftw
         self.dry_run = dry_run
         self.analysis = AnalysisPipeline()
+        # Per-experiment writeback lock (review concern 2). The bridge
+        # worker thread is already serialized (one job at a time), but
+        # retry-writeback calls come in from the request thread and
+        # can race with the worker's in-flight writeback or with
+        # another retry for a different job targeting the same
+        # experiment. Without this lock, two concurrent GET-merge-PATCH
+        # cycles can lose updates — one writer's section can be
+        # overwritten by another writer's stale body. The lock maps
+        # experiment id to a per-experiment threading.Lock.
+        self._writeback_locks: dict[int, threading.Lock] = {}
+        self._writeback_locks_guard = threading.Lock()
 
     def __call__(self, job: Job) -> None:
         """Execute a job. Called by the JobManager worker thread."""
@@ -338,13 +456,119 @@ class BridgeExecutor:
         job.error = message
         job.add_event("operator_review_required", detail or message)
 
+    @staticmethod
+    def _classify_preflight_error(error: BaseException) -> str:
+        """Map transport failures to safe operator-facing categories."""
+        reason = getattr(error, "reason", None)
+        cause = reason if isinstance(reason, BaseException) else error
+        if isinstance(cause, ssl.SSLError):
+            return "tls"
+        if isinstance(cause, socket.gaierror):
+            return "dns"
+        if isinstance(cause, (TimeoutError, socket.timeout)):
+            return "timeout"
+        if isinstance(cause, (ConnectionRefusedError, ConnectionResetError, ConnectionError)):
+            return "connection"
+        return "unreachable"
+
+    def _check_elabftw_preflight(self, job: Job) -> bool:
+        """Fail the wet run before mutation when eLabFTW is unavailable."""
+        try:
+            self.elabftw.check_connection()
+        except urllib.error.HTTPError as error:
+            classification = "auth" if error.code in (401, 403) else "http"
+            message = (
+                "eLabFTW preflight authentication failed"
+                if classification == "auth"
+                else f"eLabFTW preflight failed with HTTP {error.code}"
+            )
+            self._fail_job(job, message)
+            job.add_event(
+                "elabftw_preflight_failed",
+                f"classification={classification} status={error.code}",
+            )
+            return False
+        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as error:
+            classification = self._classify_preflight_error(error)
+            self._fail_job(job, "eLabFTW preflight failed")
+            job.add_event(
+                "elabftw_preflight_failed",
+                f"classification={classification}",
+            )
+            return False
+        except Exception as error:
+            logger.exception("Unexpected eLabFTW preflight error for job %s", job.job_id)
+            self._fail_job(job, "eLabFTW preflight failed unexpectedly")
+            job.add_event(
+                "elabftw_preflight_failed",
+                f"classification=unexpected error={type(error).__name__}",
+            )
+            return False
+        job.add_event("elabftw_preflight_ok", "")
+        return True
+
+    @staticmethod
+    def _normalize_protocol_name(name: str) -> str:
+        """Whitespace-collapse protocol names so callers can match either
+        the eLabFTW-recorded form (``Absorbance @ 610 (1.0 s)``) or the
+        canonical MDB form (``Absorbance @ 610 (1.0s)``).
+
+        Mirrors ``_normalize_protocol_name`` in ``vm-agent/agent.py``. Kept
+        intentionally narrow: strip + collapse runs + remove space around
+        parentheses + remove space before a numeric duration unit
+        (``<digits> s`` or ``<digits> ms``). Review-concern 3: the unit
+        suffix is matched only after a digit so unrelated prose like
+        ``Mode S`` is NOT collapsed to ``ModeS``.
+        """
+        import re as _re
+
+        s = str(name).strip()
+        s = _re.sub(r"\s+", " ", s)
+        s = s.replace("( ", "(").replace(" )", ")")
+        # Only collapse whitespace between a digit and a time-unit
+        # suffix. ``\d\s+ms?`` matches both ``1.0 s`` and ``100ms``
+        # but not standalone ``s``.
+        s = _re.sub(r"(\d)\s+(ms|s)\b", r"\1\2", s)
+        return s
+
     def _find_protocol_by_name(self, protocol_name: str) -> dict[str, Any] | None:
-        """Find a protocol by exact name in the vm-agent listing."""
+        """Find a protocol in the vm-agent listing.
+
+        Tries an exact name match first, then a whitespace-collapsed match
+        so that callers passing names recorded in eLabFTW (which may carry a
+        stray space, e.g. ``"Absorbance @ 610 (1.0 s)"``) still resolve to
+        the canonical MDB entry (``"Absorbance @ 610 (1.0s)"``).
+
+        Ambiguity handling: when more than one installed protocol
+        normalizes to the same string AND none of them exactly matches
+        the raw query, return ``None`` so the caller fails the job with
+        a 404 rather than silently picking whichever protocol appears
+        first in the listing. This mirrors the vm-agent's
+        ``_resolve_protocol`` behavior so a mixed bridge / vm-agent
+        deployment cannot disagree.
+        """
         response = self.vm_agent.get_protocols()
         protocols = response.get("protocols", response) if isinstance(response, dict) else response
-        return next(
-            (protocol for protocol in protocols if protocol.get("name") == protocol_name), None
+        # Exact match wins; whitespace-collapsed match only kicks in when
+        # the exact form is absent, so canonical MDB names are not
+        # shadowed by an ambiguous variant.
+        exact = next(
+            (protocol for protocol in protocols if protocol.get("name") == protocol_name),
+            None,
         )
+        if exact is not None:
+            return exact
+        target = self._normalize_protocol_name(protocol_name).lower()
+        normalized_matches = [
+            protocol
+            for protocol in protocols
+            if self._normalize_protocol_name(str(protocol.get("name", ""))).lower() == target
+        ]
+        if len(normalized_matches) == 1:
+            return normalized_matches[0]
+        # Zero or multiple normalized matches — refuse rather than
+        # silently pick. Caller surfaces the failure as a 404.
+        return None
 
     def _resolve_existing_protocol(self, job: Job) -> dict[str, Any] | None:
         """Resolve an existing protocol by ID, direct name, then list fallback."""
@@ -455,6 +679,11 @@ class BridgeExecutor:
             )
             return
 
+        # Reason: no clone, plate-map update, assay snapshot, or physical run
+        # may occur until eLabFTW authentication and TLS have succeeded.
+        if not self._check_elabftw_preflight(job):
+            return
+
         # Plate-map override path: clone the factory preset, PATCH the plate
         # map on the clone, run on the clone, and clean up the clone in
         # ``finally``. The factory preset is never written to.
@@ -510,23 +739,36 @@ class BridgeExecutor:
     def _extract_wells_from_spec(self, wells_spec: dict[str, Any]) -> list[str] | None:
         """Normalize ``wells_spec`` to a list of well names, or None if empty.
 
-        Returns ``None`` when the spec is empty or absent (caller should
-        run the factory plate map). Returns a (possibly empty) list of
-        explicit well names when the spec is populated. The vm-agent's
-        ``/wells`` endpoint handles both ``{"wells": [...]}`` and
-        ``{"rows": [...]}`` shapes natively; this method just normalizes
-        what the bridge has stored on the job to that input format.
+        The bridge Pydantic schema (``WellsSpec``) guarantees by the time
+        we get here that at most one of ``all`` / ``rows`` / ``wells`` is
+        populated, that the populated key has a non-empty value, and that
+        any ``rows`` / ``wells`` values are syntactically valid (A..H,
+        A1..H12). This helper expands each shape into the canonical
+        ``wells`` form the vm-agent expects.
+
+        Returns:
+            ``None`` when the spec is empty or absent (caller should run
+            the factory plate map). Returns a list of explicit well
+            names when the spec is populated — for ``{all: true}`` this
+            is all 96 wells, for ``{rows: [...]}`` it is ``len(rows) *
+            12`` wells, for ``{wells: [...]}`` it is the supplied list.
         """
         if not wells_spec:
             return None
-        # Reason: an empty list inside the spec is a valid no-op (run the
-        # factory plate map). Treat it the same as an absent spec so the
-        # caller does not have to know that {"wells": []} is equivalent
-        # to omitting the field.
+        rows = "ABCDEFGH"
+        if wells_spec.get("all"):
+            return [f"{r}{c}" for r in rows for c in range(1, 13)]
+        row_names = wells_spec.get("rows") or []
+        if row_names:
+            return [f"{str(r).upper()}{c}" for r in row_names for c in range(1, 13)]
         wells = wells_spec.get("wells") or []
-        if not wells and not wells_spec.get("rows") and not wells_spec.get("all"):
-            return None
-        return [str(w).upper() for w in wells]
+        if wells:
+            return [str(w).upper() for w in wells]
+        # Empty spec (e.g. ``{}``) — same as absent. Note: the
+        # boundary Pydantic model rejects ``{"wells": []}`` and
+        # ``{"all": false}`` outright so they can never reach here
+        # through the public API.
+        return None
 
     def _clone_with_wells(
         self,
@@ -897,6 +1139,11 @@ class BridgeExecutor:
             job.add_event("dry_run_complete", "Specs validated, would run on instrument")
             return
 
+        # Reason: protocol matching leads to clone/MDB mutation, so wet jobs
+        # must prove eLabFTW authentication and TLS first.
+        if not self._check_elabftw_preflight(job):
+            return
+
         protocol_name, protocol_id = self._match_protocol_from_method(method_spec)
         if not protocol_name:
             self._fail_job(job, "Could not match method spec to an instrument protocol")
@@ -1254,8 +1501,8 @@ class BridgeExecutor:
 
         # Requested analysis raised: raw results were written back so the
         # operator can inspect them, but the job is not cleanly completed.
-        # A write-back failure keeps the job ``failed`` — that stronger
-        # terminal state wins.
+        # A write-back failure already promotes the measured run to operator
+        # review, so either ambiguity remains terminal.
         if analysis_failed and job.status == "completed":
             self._mark_operator_review(
                 job,
@@ -1268,18 +1515,39 @@ class BridgeExecutor:
         # promotion decision above is final, so event consumers never see
         # execution_completed for a job that ends in
         # unknown_requires_operator_review. A failed write-back already
-        # recorded writeback_failed and stays failed.
+        # recorded elabftw_writeback_failed and remains operator-review.
         if job.status == "completed":
             job.add_event("execution_completed", "")
 
-    def _writeback(self, job: Job, raw_wells: list[dict[str, Any]], analyzed_csv: str) -> None:
+    def _writeback(self, job: Job, raw_wells: list[dict[str, Any]], analyzed_csv: str) -> bool:
         """Write results back to eLabFTW as an experiment.
 
-        The experiment body contains:
-        - Job metadata (ID, protocol, run ID)
-        - A 96-well plate heatmap with color-coded values
-        - A results table with per-well readings
-        - Raw JSON and analyzed CSV as downloadable attachments
+        Two writeback shapes exist (slice 4 of
+        ``docs/plans/wallac-existing-protocol-writeback-repair.md``):
+
+        * **Caller-supplied experiment** (``elabftw_experiment_id > 0``):
+          the bridge MUST append/upsert its results into the existing
+          body — never overwrite unrelated content. The section is
+          bracketed by ``<!-- WALLAC_RESULTS:<job_id>:START -->`` /
+          ``<!-- WALLAC_RESULTS:<job_id>:END -->`` markers so repeat
+          writebacks for the same job replace the section in place.
+        * **New-experiment path** (``elabftw_experiment_id == 0``): the
+          bridge creates a fresh experiment with the results body. No
+          prior content to preserve.
+
+        The body content (job metadata, plate heatmap, results table,
+        raw/analyzed attachment pointers) is identical between the two
+        paths.
+
+        Returns:
+            ``True`` on success, ``False`` on failure. Failures are
+            also recorded as ``elabftw_writeback_failed`` events and
+            promote the job to ``unknown_requires_operator_review``.
+            Review-blocker 1 (round 2): callers like
+            ``retry_writeback`` need an explicit success/failure
+            signal — the previous swallow-and-record implementation
+            made every retry look successful because the
+            ``elabftw_writeback_failed`` event never re-raised.
         """
         job.add_event("writeback_started", "")
 
@@ -1315,9 +1583,17 @@ class BridgeExecutor:
                 job.artifacts.append({"name": "analyzed.csv", "type": "analyzed", "uploaded": True})
                 job.add_event("analyzed_results_uploaded", "")
 
-            # Build rich HTML body with plate heatmap + results table
-            body = self._build_results_html(job, raw_wells)
-            self.elabftw.patch_experiment(exp_id, {"body": body})
+            # Build rich HTML body with plate heatmap + results table,
+            # bracketed by per-job markers for safe append/upsert.
+            section = self._build_results_section(job, raw_wells)
+            # Review concern 2: serialize the body GET-merge-PATCH
+            # cycle per experiment so concurrent writebacks (the
+            # worker thread + a retry from the request thread, or
+            # two retries for different jobs targeting the same
+            # experiment) cannot lose updates to each other.
+            with self._writeback_lock_for(exp_id):
+                merged = self._merge_results_section(exp_id, section, job_id=job.job_id)
+                self.elabftw.patch_experiment(exp_id, {"body": merged})
 
             # Reason: writeback success and terminal completion are distinct
             # signals. status is set to completed here so _fetch_and_writeback
@@ -1329,12 +1605,111 @@ class BridgeExecutor:
             if job.status != "failed":
                 job.status = "completed"
             job.add_event("writeback_completed", f"experiment={exp_id}")
+            return True
 
         except Exception as e:
-            job.status = "failed"
-            job.error = f"Write-back failed: {e}"
-            job.add_event("writeback_failed", str(e))
+            detail = (
+                f"run_id={job.run_id or 'unknown'}; eLabFTW write-back failed after measurement; "
+                "do not automatically rerun the assay"
+            )
+            self._mark_operator_review(
+                job,
+                f"Write-back failed after measurement: {e}",
+                detail=detail,
+            )
+            job.add_event("elabftw_writeback_failed", str(e))
             logger.exception("Write-back failed for job %s", job.job_id)
+            return False
+
+    def retry_writeback(self, job: Job) -> bool:
+        """Re-run writeback for a job whose hardware run already completed.
+
+        Used by ``POST /jobs/{job_id}/retry-writeback`` (slice 5 of
+        ``docs/plans/wallac-existing-protocol-writeback-repair.md``)
+        after a transient writeback failure (TLS blip, eLabFTW
+        restart, network split). The hardware run is NOT restarted —
+        the existing ``live_wells`` data on the job is reused so the
+        retry is safe and idempotent at the experiment-body level.
+
+        Pre-conditions (review-blocker 3 — tighter than the original):
+
+        * ``job.status`` is ``completed`` or
+          ``unknown_requires_operator_review``. ``failed`` and
+          ``aborted`` jobs are refused — an aborted run can have
+          partial ``live_wells`` accumulated before the abort landed,
+          and retrying those would write a partial measurement set
+          marked as completed; a failed run typically has no
+          recoverable data.
+        * ``job.live_wells`` is non-empty.
+
+        Returns:
+            ``True`` on successful retry, ``False`` otherwise. The
+            return value (review concern round 3) is the authoritative
+            outcome for the HTTP handler — the handler MUST NOT
+            re-derive the outcome by searching ``job.events``,
+            because concurrent retry requests can interleave events
+            and confuse the search.
+
+        Side effects:
+
+        * New ``writeback_retry_started`` /
+          ``writeback_retry_completed`` /
+          ``writeback_retry_failed`` /
+          ``writeback_retry_rejected`` events so operators can see
+          when the retry happened and whether it succeeded.
+        * On success, ``writeback_completed`` is recorded and the job
+          is promoted from operator-review to ``completed``.
+        """
+        from bridge.jobs import COMPLETED, UNKNOWN
+
+        if job.status not in (COMPLETED, UNKNOWN):
+            job.add_event(
+                "writeback_retry_rejected",
+                f"job status {job.status!r} is not retry-eligible; "
+                "only completed or unknown_requires_operator_review jobs can be retried",
+            )
+            return False
+        if not job.live_wells:
+            job.add_event(
+                "writeback_retry_rejected",
+                "no live_wells on job; the original run never produced usable data",
+            )
+            return False
+
+        job.add_event("writeback_retry_started", f"experiment={job.elabftw_experiment_id}")
+        # Reason: keep the same writeback semantics as the original
+        # path — analyzer is only run when a layout + analysis spec
+        # are on the job (see _analyze_results). For retries the
+        # caller has not supplied new specs, so the analyzer sees no
+        # inputs and returns ("", False), which is the abstention
+        # case documented in docs/abort-recovery.md.
+        raw_wells = [
+            {
+                "well": reading.get("well", ""),
+                "od": reading.get("od"),
+                "counts": reading.get("counts"),
+            }
+            for reading in job.live_wells
+        ]
+        # Review-blocker 1 (round 2): ``_writeback`` returns a bool
+        # because the failure path records events and re-promotes to
+        # operator review but does NOT raise. Using the return value
+        # (not a try/except wrapper) gives us an unambiguous
+        # success/failure signal for the response builder.
+        try:
+            success = self._writeback(job, raw_wells, "")
+        except Exception as error:
+            # Defensive: an unexpected exception that escaped
+            # _writeback's own error handling (e.g. bug in the lock
+            # helper) still gets recorded as a retry failure.
+            job.add_event("writeback_retry_failed", str(error))
+            logger.exception("Writeback retry raised for job %s", job.job_id)
+            return False
+        if success:
+            job.add_event("writeback_retry_completed", f"experiment={job.elabftw_experiment_id}")
+            return True
+        job.add_event("writeback_retry_failed", "see elabftw_writeback_failed event")
+        return False
 
     def _build_results_html(self, job: Job, raw_wells: list[dict[str, Any]]) -> str:
         """Build a rich HTML body with plate heatmap and results table."""
@@ -1364,6 +1739,102 @@ class BridgeExecutor:
             f"Raw results (JSON) and analyzed data (CSV) are attached as files below."
             f"</p>"
         )
+
+    @staticmethod
+    def results_section_markers(job_id: str) -> tuple[str, str]:
+        """Return the (start, end) HTML comment markers for a job's results section.
+
+        The markers are stable per job_id so a repeat writeback for the
+        same job replaces its own section without disturbing sections
+        from other jobs in the same experiment. The format is
+        deliberately ASCII and human-greppable for operator forensics.
+        """
+        safe_id = html.escape(job_id)
+        return (
+            f"<!-- WALLAC_RESULTS:{safe_id}:START -->",
+            f"<!-- WALLAC_RESULTS:{safe_id}:END -->",
+        )
+
+    def _writeback_lock_for(self, exp_id: int) -> threading.Lock:
+        """Return the per-experiment writeback lock, creating it if needed.
+
+        Used to serialize the GET-merge-PATCH body cycle for a given
+        eLabFTW experiment id (review concern 2). LRU eviction is
+        intentionally not implemented — the lock map lives for the
+        process lifetime and grows only with the number of distinct
+        experiments the bridge ever wrote to. In practice that count
+        is small (one per active experiment), so unbounded growth is
+        not a real concern; the guard dict is bounded by the working
+        set of experiments.
+        """
+        with self._writeback_locks_guard:
+            lock = self._writeback_locks.get(exp_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._writeback_locks[exp_id] = lock
+            return lock
+
+    def _build_results_section(self, job: Job, raw_wells: list[dict[str, Any]]) -> str:
+        """Build a single-job results section wrapped in marker comments.
+
+        The section is the content ``_build_results_html`` returns plus
+        the start/end markers, ready to be spliced into the experiment
+        body. Kept separate from the body builder so callers that need
+        only the bare HTML (e.g. tests) can use ``_build_results_html``
+        directly.
+        """
+        start, end = self.results_section_markers(job.job_id)
+        body_html = self._build_results_html(job, raw_wells)
+        return f"{start}\n{body_html}\n{end}"
+
+    def _merge_results_section(
+        self,
+        exp_id: int,
+        section: str,
+        *,
+        job_id: str,
+    ) -> str:
+        """Merge ``section`` into the experiment body for ``exp_id``.
+
+        Upsert semantics (slice 4 of the writeback repair plan):
+
+        * If the body already contains a section with this job's
+          markers, replace the existing section in place. Sections for
+          other jobs (different ``job_id``) are preserved untouched.
+        * If no marker is present, append the section to the existing
+          body, separated by a paragraph break.
+
+        If the experiment cannot be read (network blip, the experiment
+        no longer exists, etc.) the section is returned untouched and
+        the caller falls back to ``patch_experiment(exp_id, body=section)``
+        semantics — which is wrong for our use case, so the executor
+        also handles the create-new path separately. In practice the
+        only callers of this helper are inside ``_writeback`` where the
+        experiment already exists.
+        """
+        try:
+            experiment = self.elabftw.get_experiment(exp_id)
+        except Exception as error:
+            # Reason: if we can't read the body, we MUST NOT overwrite
+            # the experiment body — better to drop this section's
+            # marker-only update and let the caller see the upload
+            # completed. The raw results + analyzed CSV attachments
+            # are already in place; the worst case is that the
+            # experiment body never gets the heatmap. Operators can
+            # re-trigger writeback via the retry endpoint once the
+            # eLabFTW read path recovers. See slice 5.
+            logger.warning(
+                "Could not fetch experiment %s body for upsert: %s; skipping body merge for job %s",
+                exp_id,
+                error,
+                job_id,
+            )
+            raise
+        existing_body = experiment.get("body") or ""
+
+        start, end = self.results_section_markers(job_id)
+        upserted = _upsert_marker_section(existing_body, start, end, section)
+        return upserted
 
     def _download_ref(self, ref: dict[str, Any]) -> dict[str, Any]:
         """Download a canonical JSON attachment from eLabFTW using a ref dict, verifying hash.

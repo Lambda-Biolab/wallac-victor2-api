@@ -789,10 +789,37 @@ def op_protocols(refresh):
     return _op
 
 
+def _normalize_protocol_name(name):
+    """Collapse internal whitespace so callers can supply eLabFTW-recorded
+    names like ``"Absorbance @ 610 (1.0 s)"`` and still match the canonical
+    MDB name ``"Absorbance @ 610 (1.0s)"`` (or vice versa).
+
+    Rules (intentionally conservative — only safe transformations):
+      - Strip leading/trailing whitespace.
+      - Collapse runs of internal whitespace to a single space.
+      - Remove whitespace immediately before/after ``(`` and ``)``.
+      - Remove whitespace between a digit and a time-unit suffix
+        (``1.0 s`` → ``1.0s``, ``100 ms`` → ``100ms``).
+
+    The raw name is not logged because protocol names can carry operator
+    context; only the normalized form flows through the match.
+    """
+    import re as _re
+
+    s = str(name).strip()
+    s = _re.sub(r"\s+", " ", s)
+    s = s.replace("( ", "(").replace(" )", ")")
+    # Match a digit followed by whitespace and a time-unit suffix so
+    # unrelated prose like ``Mode S`` is NOT collapsed (review
+    # concern 3).
+    s = _re.sub(r"(\d)\s+(ms|s)\b", r"\1\2", s)
+    return s
+
+
 def _resolve_protocol(spec, worker):
-    """Resolve a protocol given as numeric id OR name (case-insensitive: exact
-    match, then unique substring). Returns the full protocol record
-    (``{id, name, group, factory_preset, ...}``).
+    """Resolve a protocol given as numeric id OR name (case-insensitive and
+    whitespace-collapsed: exact match, then unique substring). Returns the
+    full protocol record (``{id, name, group, factory_preset, ...}``).
 
     Raises ``ApiError`` (404 not found / 409 ambiguous) with candidates, so the
     caller never has to memorize the magic integer ids.
@@ -816,11 +843,12 @@ def _resolve_protocol(spec, worker):
             "no protocol has that id; GET /protocols to list them",
             extra={"requested": spec},
         )
-    low = s.lower()
-    exact = [p for p in protos if p["name"].lower() == low]
+    low = _normalize_protocol_name(s).lower()
+    cand_names = [_normalize_protocol_name(p["name"]).lower() for p in protos]
+    exact = [p for p, cname in zip(protos, cand_names) if cname == low]
     if len(exact) == 1:
         return exact[0]
-    cands = exact if len(exact) > 1 else [p for p in protos if low in p["name"].lower()]
+    cands = exact if len(exact) > 1 else [p for p, cname in zip(protos, cand_names) if low in cname]
     if len(cands) == 1:
         return cands[0]
     if cands:
@@ -1586,13 +1614,38 @@ def op_mdb_delete_protocol(assay_prot_id):
 def _wells_to_plate_map(body):
     """Convert a well selection dict to a 108-byte plate_map array.
 
-    Accepts:
+    Accepts top-level keys only:
         {"wells": ["A1","A2",...,"B12"]}  — explicit well list
         {"rows": ["A","B"]}               — entire rows
         {"all": true}                     — full 96-well plate
 
     Returns: list of 108 ints (12-byte header + 96 well flags).
+
+    Defensive: a caller that wraps the selection inside a
+    ``{"wells_spec": {...}}`` envelope (a shape that was historically
+    sent by a buggy bridge build) must NOT be silently expanded — it
+    would otherwise pass the ``not body.get(...)`` check below and
+    produce a 400 with a confusing hint. Detect the wrapper up front
+    and refuse with a clear, actionable error so the operator can fix
+    the client. This is slice 2 of
+    ``docs/plans/wallac-existing-protocol-writeback-repair.md``.
     """
+    if not isinstance(body, dict):
+        raise ApiError(
+            400,
+            "invalid_body",
+            "body must be a JSON object with top-level 'wells', 'rows', or 'all'",
+        )
+    # Legacy/wrapped shapes — these were the bridge failure mode that
+    # produced "provide 'wells' (list like [...])" 400s in production.
+    if "wells_spec" in body and not ("all" in body or "rows" in body or "wells" in body):
+        raise ApiError(
+            400,
+            "invalid_body",
+            "top-level 'wells_spec' wrapper is not accepted; pass 'wells', 'rows', or 'all' at the top level",
+            extra={"got_keys": sorted(body.keys())},
+        )
+
     header = [1, 0, 0, 0, 12, 0, 0, 0, 8, 0, 0, 0]
     grid = [0] * 96  # 8 rows x 12 cols, all off
 

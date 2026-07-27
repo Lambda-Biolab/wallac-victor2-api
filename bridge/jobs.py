@@ -372,6 +372,11 @@ class JobManager:
             self._current_job = None
 
     @property
+    def worker_running(self) -> bool:
+        """Whether the background execution worker is alive."""
+        return self._worker_thread is not None and self._worker_thread.is_alive()
+
+    @property
     def current_job(self) -> Job | None:
         """The currently executing job, if any."""
         with self._lock:

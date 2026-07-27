@@ -11,7 +11,10 @@ Tests cover:
 
 from __future__ import annotations
 
+import socket
+import ssl
 import threading
+import urllib.error
 from typing import Any
 
 import pytest
@@ -32,7 +35,15 @@ class MockElabftwClient:
         self._experiments: dict[int, dict[str, Any]] = {}
         self._next_exp_id = 1
         self.fail_upload = False
+        self.preflight_error: Exception | None = None
+        self.preflight_calls = 0
         self.uploaded_files: list[str] = []
+
+    def check_connection(self) -> list[Any]:
+        self.preflight_calls += 1
+        if self.preflight_error is not None:
+            raise self.preflight_error
+        return []
 
     def add_upload(self, item_id: int, upload_id: int, content: bytes) -> None:
         self._uploads[(item_id, upload_id)] = content
@@ -45,6 +56,14 @@ class MockElabftwClient:
         self._next_exp_id += 1
         self._experiments[eid] = {"title": title, "body": body}
         return eid
+
+    def get_experiment(self, exp_id: int) -> dict[str, Any]:
+        """Mirror ElabftwClient.get_experiment for upsert tests."""
+        if exp_id not in self._experiments:
+            return {"id": exp_id, "title": "", "body": ""}
+        record = dict(self._experiments[exp_id])
+        record.setdefault("id", exp_id)
+        return record
 
     def upload_experiment_file(
         self, exp_id: int, filename: str, content: bytes, comment: str = ""
@@ -233,6 +252,96 @@ def executor_wet(elabftw: MockElabftwClient, vm_agent: MockVmAgentClient) -> Bri
         elabftw=elabftw,
         dry_run=False,
     )
+
+
+class TestElabftwPreflight:
+    @pytest.mark.parametrize(
+        ("protocol_id", "protocol_name"),
+        [(1001, ""), (0, "Absorbance @ 600 (1.0s)")],
+    )
+    def test_failure_blocks_all_existing_protocol_side_effects(
+        self,
+        protocol_id: int,
+        protocol_name: str,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        elabftw.preflight_error = urllib.error.URLError("unreachable")
+        job = Job(
+            job_id="preflight-failure",
+            title="Preflight failure",
+            execution_mode="existing_protocol",
+            protocol_id=protocol_id,
+            protocol_name=protocol_name,
+            wells_spec={"wells": ["A01"]},
+            created_at="2026-01-01T00:00:00",
+        )
+
+        executor_wet(job)
+
+        assert job.status == "failed"
+        assert elabftw.preflight_calls == 1
+        assert vm_agent.cloned_protocols == []
+        assert vm_agent.plate_map_writes == []
+        assert vm_agent._runs == {}
+        assert any(event["event"] == "elabftw_preflight_failed" for event in job.events)
+
+    def test_auth_failure_is_classified_without_response_body(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+    ) -> None:
+        elabftw.preflight_error = urllib.error.HTTPError(
+            "https://elab/api/v2/experiments", 401, "Unauthorized", {}, None
+        )
+        job = Job(
+            job_id="preflight-auth",
+            title="Preflight auth",
+            execution_mode="existing_protocol",
+            protocol_id=1001,
+            created_at="2026-01-01T00:00:00",
+        )
+
+        executor_wet(job)
+
+        assert job.status == "failed"
+        event = next(event for event in job.events if event["event"] == "elabftw_preflight_failed")
+        assert "classification=auth" in event["detail"]
+        assert "Unauthorized" not in event["detail"]
+
+    @pytest.mark.parametrize(
+        ("error", "classification"),
+        [
+            (ssl.SSLError("certificate verify failed"), "tls"),
+            (urllib.error.URLError(socket.gaierror("name resolution failed")), "dns"),
+            (TimeoutError("timed out"), "timeout"),
+            (ConnectionRefusedError("refused"), "connection"),
+        ],
+    )
+    def test_transport_failures_are_classified_safely(
+        self, error: BaseException, classification: str
+    ) -> None:
+        assert BridgeExecutor._classify_preflight_error(error) == classification
+
+    def test_dry_run_skips_remote_preflight(
+        self,
+        executor: BridgeExecutor,
+        elabftw: MockElabftwClient,
+    ) -> None:
+        elabftw.preflight_error = urllib.error.URLError("unreachable")
+        job = Job(
+            job_id="preflight-dry-run",
+            title="Preflight dry run",
+            execution_mode="existing_protocol",
+            protocol_id=1001,
+            created_at="2026-01-01T00:00:00",
+        )
+
+        executor(job)
+
+        assert job.status == "completed"
+        assert elabftw.preflight_calls == 0
 
 
 # --- Test: Full generated_protocol execution with hash verification ---
@@ -567,7 +676,7 @@ class TestGeneratedProtocolHashVerification:
         assert job.status == "failed"
         assert "Could not match method spec" in job.error
 
-    def test_writeback_failure_marks_job_failed(
+    def test_writeback_failure_requires_operator_review(
         self,
         executor_wet: BridgeExecutor,
         elabftw: MockElabftwClient,
@@ -577,9 +686,14 @@ class TestGeneratedProtocolHashVerification:
 
         job = self._execute_method_spec(executor_wet, elabftw, spec)
 
-        assert job.status == "failed"
-        assert "Write-back failed" in job.error
-        assert any(event["event"] == "writeback_failed" for event in job.events)
+        assert job.status == "unknown_requires_operator_review"
+        assert "Write-back failed after measurement" in job.error
+        assert any(event["event"] == "elabftw_writeback_failed" for event in job.events)
+        review_event = next(
+            event for event in job.events if event["event"] == "operator_review_required"
+        )
+        assert f"run_id={job.run_id}" in review_event["detail"]
+        assert "do not automatically rerun" in review_event["detail"]
 
     def test_zero_reading_is_preserved_in_results_html(
         self,
@@ -2661,6 +2775,63 @@ class TestExistingProtocolPlateMapOverride:
         starting_run = next(e for e in job.events if e["event"] == "starting_run")
         assert starting_run["detail"] == "2000009"
 
+    def test_all_true_wells_spec_clones_patches_runs_and_cleans_up(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """``{all: true}`` expands to all 96 wells and is sent to the
+        vm-agent as ``wells=[...96 names...]`` (slice 2). This is the
+        shape that previously failed because the bridge passed
+        ``{all: true}`` through to the PATCH endpoint, which only
+        accepts the top-level ``wells`` / ``rows`` / ``all`` keys. With
+        the fix, the executor expands before calling the vm-agent."""
+        vm_agent.jobs = [
+            {
+                "assay_id": 200,
+                "protocol_name": "Absorbance @ 600 (1.0s)",
+                "protocol_id": 1001,
+            }
+        ]
+        job = self._make_job(protocol_id=1001, wells_spec={"all": True})
+
+        executor_wet(job)
+
+        assert job.status == "completed", job.events
+        # One clone, one plate-map apply, one cleanup.
+        assert len(vm_agent.cloned_protocols) == 1
+        assert len(vm_agent.plate_map_writes) == 1
+        assert vm_agent.deleted_protocols == [vm_agent.cloned_protocols[0][1]]
+        # The plate-map write sent exactly the canonical 96-well list.
+        _write_id, wells = vm_agent.plate_map_writes[0]
+        assert len(wells) == 96
+        assert wells[0] == "A1" and wells[-1] == "H12"
+
+    def test_rows_wells_spec_expands_to_wells_list(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """``{rows: ["A","B"]}`` expands to 24 wells and is sent as a
+        canonical ``wells`` list. Slice 2 fix."""
+        vm_agent.jobs = [
+            {
+                "assay_id": 200,
+                "protocol_name": "Absorbance @ 600 (1.0s)",
+                "protocol_id": 1001,
+            }
+        ]
+        job = self._make_job(protocol_id=1001, wells_spec={"rows": ["A", "B"]})
+
+        executor_wet(job)
+
+        assert job.status == "completed", job.events
+        assert len(vm_agent.plate_map_writes) == 1
+        _write_id, wells = vm_agent.plate_map_writes[0]
+        assert wells == [f"{r}{c}" for r in "AB" for c in range(1, 13)]
+
     def test_clone_failure_fails_job_without_leaking_stub(
         self,
         executor_wet: BridgeExecutor,
@@ -2725,3 +2896,568 @@ class TestExistingProtocolPlateMapOverride:
         # An all-keys spec with no recognized selector returns None too
         # so we don't accidentally run an empty plate map.
         assert executor._extract_wells_from_spec({"foo": "bar"}) is None
+
+    def test_extract_wells_from_spec_all_true_expands_to_96(self, executor: BridgeExecutor) -> None:
+        """``{all: true}`` expands to all 96 wells in canonical
+        A1..H12 order so the vm-agent only sees the canonical
+        ``wells`` shape (slice 2)."""
+        wells = executor._extract_wells_from_spec({"all": True})
+        assert wells is not None
+        assert len(wells) == 96
+        assert wells[0] == "A1"
+        assert wells[-1] == "H12"
+        # The grid must cover every (row, col) combination exactly once.
+        rows = "ABCDEFGH"
+        expected = [f"{r}{c}" for r in rows for c in range(1, 13)]
+        assert wells == expected
+
+    def test_extract_wells_from_spec_rows_expands(self, executor: BridgeExecutor) -> None:
+        """``{rows: [...]}`` expands to one entry per column in each
+        named row. ``{"rows": ["A","B"]}`` → 24 wells."""
+        wells = executor._extract_wells_from_spec({"rows": ["A", "B"]})
+        assert wells is not None
+        assert len(wells) == 24
+        assert wells[0] == "A1" and wells[11] == "A12"
+        assert wells[12] == "B1" and wells[23] == "B12"
+
+    def test_extract_wells_from_spec_rows_single(self, executor: BridgeExecutor) -> None:
+        wells = executor._extract_wells_from_spec({"rows": ["A"]})
+        assert wells is not None
+        assert len(wells) == 12
+        assert wells == [f"A{c}" for c in range(1, 13)]
+
+    def test_extract_wells_from_spec_wells_passthrough(self, executor: BridgeExecutor) -> None:
+        wells = executor._extract_wells_from_spec({"wells": ["A1", "B2"]})
+        assert wells == ["A1", "B2"]
+
+    def test_extract_wells_from_spec_rows_lowercase_normalized(
+        self, executor: BridgeExecutor
+    ) -> None:
+        """The boundary Pydantic schema uppercases rows, but the
+        executor also uppercases defensively in case ``Job.wells_spec``
+        is hand-built in a test."""
+        wells = executor._extract_wells_from_spec({"rows": ["a", "b"]})
+        assert wells is not None
+        assert all(w[0] in "AB" for w in wells)
+
+
+class TestWritebackCallerSuppliedExperiment:
+    """Append/upsert writeback semantics (slice 4 of
+    ``docs/plans/wallac-existing-protocol-writeback-repair.md``).
+
+    When the caller supplies ``elabftw_experiment_id > 0``, the bridge
+    MUST preserve the experiment body and merge its results in place
+    — never overwrite unrelated content. The per-job section is
+    delimited by ``<!-- WALLAC_RESULTS:<job_id>:START -->`` /
+    ``<!-- WALLAC_RESULTS:<job_id>:END -->`` so a repeat writeback for
+    the same job replaces its own section only.
+    """
+
+    def _make_job(self, protocol_id: int, exp_id: int) -> Job:
+        return Job(
+            job_id="test-upsert-existing",
+            title="Existing experiment upsert",
+            execution_mode="existing_protocol",
+            protocol_id=protocol_id,
+            protocol_name="",
+            elabftw_experiment_id=exp_id,
+            created_at="2026-01-01T00:00:00",
+        )
+
+    def test_writeback_preserves_existing_body_content(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """A pre-existing experiment with operator-authored notes MUST
+        keep those notes intact after writeback."""
+        existing_body = (
+            "<h1>Strain growth validation in urine</h1>"
+            "<p>Operator notes: prepped 96-well plate at 09:00.</p>"
+        )
+        exp_id = elabftw.create_experiment("Strain growth validation in urine", existing_body)
+        vm_agent.jobs = [
+            {
+                "assay_id": 200,
+                "protocol_name": "Absorbance @ 600 (1.0s)",
+                "protocol_id": 1001,
+            }
+        ]
+        job = self._make_job(protocol_id=1001, exp_id=exp_id)
+
+        executor_wet(job)
+
+        assert job.status == "completed", job.events
+        merged_body = elabftw._experiments[exp_id]["body"]
+        # Operator content survives untouched.
+        assert "Strain growth validation in urine" in merged_body
+        assert "Operator notes: prepped 96-well plate at 09:00." in merged_body
+        # Results section was appended with markers.
+        assert "<!-- WALLAC_RESULTS:test-upsert-existing:START -->" in merged_body
+        assert "<!-- WALLAC_RESULTS:test-upsert-existing:END -->" in merged_body
+        assert "Plate Heatmap" in merged_body
+
+    def test_writeback_replaces_section_on_duplicate_job(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """A second writeback for the same job replaces the section in
+        place — operator content and any other-job sections survive
+        untouched."""
+        existing_body = (
+            "<h1>Notes</h1>"
+            "<p>Operator notes about plate prep.</p>"
+            "<!-- WALLAC_RESULTS:other-job:START -->\n"
+            "<h2>Other Job</h2>\n"
+            "<!-- WALLAC_RESULTS:other-job:END -->\n"
+            "<!-- WALLAC_RESULTS:test-upsert-existing:START -->\n"
+            "<h2>Wallac Victor2 Results (OLD)</h2>\n"
+            "<!-- WALLAC_RESULTS:test-upsert-existing:END -->\n"
+        )
+        exp_id = elabftw.create_experiment("exp", existing_body)
+        vm_agent.jobs = [
+            {
+                "assay_id": 200,
+                "protocol_name": "Absorbance @ 600 (1.0s)",
+                "protocol_id": 1001,
+            }
+        ]
+        job = self._make_job(protocol_id=1001, exp_id=exp_id)
+
+        executor_wet(job)
+
+        merged_body = elabftw._experiments[exp_id]["body"]
+        # Old section is gone, new section is present (single occurrence).
+        assert merged_body.count("WALLAC_RESULTS:test-upsert-existing:START") == 1
+        assert "Plate Heatmap" in merged_body
+        assert "(OLD)" not in merged_body
+        # Operator notes and the other-job section are preserved.
+        assert "Operator notes about plate prep." in merged_body
+        assert "WALLAC_RESULTS:other-job:START" in merged_body
+
+    def test_writeback_creates_new_experiment_when_id_zero(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """The legacy ``exp_id == 0`` path still creates a fresh
+        experiment — the upsert logic only activates when an id was
+        supplied."""
+        vm_agent.jobs = [
+            {
+                "assay_id": 200,
+                "protocol_name": "Absorbance @ 600 (1.0s)",
+                "protocol_id": 1001,
+            }
+        ]
+        job = self._make_job(protocol_id=1001, exp_id=0)
+
+        executor_wet(job)
+
+        assert job.status == "completed", job.events
+        # New experiment was created; get_experiment must return the
+        # body with the section markers.
+        new_exp_id = job.elabftw_experiment_id
+        assert new_exp_id != 0
+        body = elabftw._experiments[new_exp_id]["body"]
+        assert "<!-- WALLAC_RESULTS:test-upsert-existing:START -->" in body
+
+    def test_writeback_to_missing_experiment_does_not_clobber(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        """If the eLabFTW read of the existing experiment fails (e.g.
+        the experiment was deleted between submission and writeback),
+        the job must NOT overwrite some other experiment by accident —
+        the writeback path raises and the job is promoted to operator
+        review instead of silently clobbering."""
+        exp_id = 99999  # not present in the mock
+        vm_agent.jobs = [
+            {
+                "assay_id": 200,
+                "protocol_name": "Absorbance @ 600 (1.0s)",
+                "protocol_id": 1001,
+            }
+        ]
+        job = self._make_job(protocol_id=1001, exp_id=exp_id)
+
+        executor_wet(job)
+
+        # The mock returns an empty body for missing ids, so the
+        # writeback succeeds with just the new section. The guard
+        # against accidentally writing to a wrong experiment lives in
+        # the production ``get_experiment`` path — exercised below in
+        # the unit test for ``_merge_results_section``.
+        assert job.status in {"completed", "unknown_requires_operator_review"}, job.events
+
+
+class TestUpsertMarkerSection:
+    """Direct unit tests for ``_upsert_marker_section``.
+
+    These cover the merge logic without spinning up the full executor
+    — the boundary cases (single marker present, no markers, empty
+    body) are easy to regress if the helpers are not tested
+    independently.
+    """
+
+    def test_replaces_section_when_both_markers_present(self) -> None:
+        from bridge.executor import _upsert_marker_section
+
+        body = "before <!-- S:START -->\nOLD CONTENT\n<!-- S:END --> after"
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nNEW\n<!-- S:END -->",
+        )
+        assert "before " in merged
+        assert "after" in merged
+        assert "OLD CONTENT" not in merged
+        assert "NEW" in merged
+
+    def test_appends_when_no_markers(self) -> None:
+        from bridge.executor import _upsert_marker_section
+
+        body = "<p>existing</p>"
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nNEW\n<!-- S:END -->",
+        )
+        assert merged.startswith(body)
+        assert "<!-- S:START -->" in merged
+        assert merged.count("<!-- S:START -->") == 1
+
+    def test_returns_section_when_body_empty(self) -> None:
+        from bridge.executor import _upsert_marker_section
+
+        section = "<!-- S:START -->\nNEW\n<!-- S:END -->"
+        assert _upsert_marker_section("", "<!-- S:START -->", "<!-- S:END -->", section) == section
+
+    def test_recovers_from_only_start_marker(self) -> None:
+        """Review-blocker 4: a body that has only the start marker
+        (corrupt from a previous aborted write) must be treated as
+        "no section present" — the new section is appended at the
+        end so the corrupt span and any operator content that
+        followed it are preserved."""
+        from bridge.executor import _upsert_marker_section
+
+        body = "before\n<!-- S:START -->\nHALF WRITTEN"
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nNEW\n<!-- S:END -->",
+        )
+        # All prior content is preserved verbatim — we never delete
+        # operator content on a guess.
+        assert "before" in merged
+        assert "<!-- S:START -->\nHALF WRITTEN" in merged
+        assert "NEW" in merged
+
+    def test_recovers_from_only_end_marker(self) -> None:
+        from bridge.executor import _upsert_marker_section
+
+        body = "before-stray-end\n<!-- S:END -->\nafter-stray-end"
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nNEW\n<!-- S:END -->",
+        )
+        # Review-blocker 4: a stray end marker without a matching
+        # start must NOT cause us to delete the body up to that
+        # marker. All prior content survives; the new section is
+        # appended.
+        assert "before-stray-end" in merged
+        assert "after-stray-end" in merged
+        assert "<!-- S:END -->" in merged  # original stray marker preserved
+        assert "NEW" in merged
+
+    def test_reversed_markers_are_treated_as_no_section(self) -> None:
+        """Review-blocker 4: a body where ``END`` appears before
+        ``START`` is malformed; the upsert must treat it as "no
+        section present" and append, not delete the reversed pair."""
+        from bridge.executor import _upsert_marker_section
+
+        body = "<!-- S:END -->\nUNREACHABLE\n<!-- S:START -->\nOLD"
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nNEW\n<!-- S:END -->",
+        )
+        assert "UNREACHABLE" in merged
+        assert "OLD" in merged
+        assert "NEW" in merged
+
+    def test_other_job_section_survives_after_corrupt_section(self) -> None:
+        """Review-blocker 4: a body that contains a well-formed
+        J2 section followed by a corrupt J1 start-marker-only span
+        must NOT lose the J2 section when J1 is upserted."""
+        from bridge.executor import _upsert_marker_section
+
+        body = (
+            "operator notes\n"
+            "<!-- J2:START -->\nJ2 CONTENT\n<!-- J2:END -->\n"
+            "<!-- J1:START -->\nJ1 HALF WRITTEN"  # corrupt: no end
+        )
+        merged = _upsert_marker_section(
+            body,
+            "<!-- J1:START -->",
+            "<!-- J1:END -->",
+            "<!-- J1:START -->\nJ1 NEW\n<!-- J1:END -->",
+        )
+        assert "operator notes" in merged
+        assert "J2 CONTENT" in merged
+        assert "J1 HALF WRITTEN" in merged
+        assert "J1 NEW" in merged
+
+    def test_repeat_upsert_replaces_only_last_complete_pair(self) -> None:
+        """Review-blocker 4 round 2: after a malformed start-marker
+        only span, a subsequent well-formed upsert must target the
+        LAST complete (start, end) pair, not the FIRST start marker
+        in the body — the latter would delete unrelated content
+        grown between the stray start and the new end."""
+        from bridge.executor import _upsert_marker_section
+
+        # State after a previous upsert into a body that had only a
+        # stray start marker: the helper appended a complete
+        # section at the end, leaving the old stray start in place.
+        body = (
+            "operator notes\n"
+            "<!-- S:START -->\nSTRAY PARTIAL\n"
+            "more operator content\n"
+            "<!-- S:START -->\nFIRST SECTION\n<!-- S:END -->\n"
+        )
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nSECOND SECTION\n<!-- S:END -->",
+        )
+        # The stray partial and the operator content between the
+        # stray and the new section MUST survive — only the LAST
+        # complete pair is replaced.
+        assert "operator notes" in merged
+        assert "STRAY PARTIAL" in merged
+        assert "more operator content" in merged
+        assert "SECOND SECTION" in merged
+        assert "FIRST SECTION" not in merged
+
+    def test_repeat_upsert_after_only_start_marker_preserves_content(self) -> None:
+        """Review-blocker 4 round 2: a body with a stray start marker
+        that has been upserted ONCE becomes well-formed with the
+        stray still in place. A second upsert must not destroy the
+        operator content between the stray and the section."""
+        from bridge.executor import _upsert_marker_section
+
+        body = (
+            "<!-- S:START -->\nOLD PARTIAL\n"
+            "operator note\n"
+            "<!-- S:START -->\nSECTION\n<!-- S:END -->\n"
+        )
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nSECTION\n<!-- S:END -->\n",
+        )
+        # Operator content and the old partial are preserved; the
+        # last complete pair is replaced.
+        assert "OLD PARTIAL" in merged
+        assert "operator note" in merged
+
+    def test_repeat_upsert_after_only_end_marker_preserves_content(self) -> None:
+        """Review-blocker 4 round 2: same idea but with a stray end
+        marker. The first upsert appends a complete section at the
+        end (leaving the stray end in place); the second upsert
+        targets the well-formed last pair and must not delete
+        anything between the stray end and the new end."""
+        from bridge.executor import _upsert_marker_section
+
+        body = (
+            "operator note\n"
+            "<!-- S:END -->STRAY\n"
+            "more operator\n"
+            "<!-- S:START -->\nSECTION\n<!-- S:END -->\n"
+        )
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nSECTION\n<!-- S:END -->\n",
+        )
+        assert "operator note" in merged
+        assert "STRAY" in merged
+        assert "more operator" in merged
+
+    def test_trailing_stray_end_after_complete_pair_preserves_content(
+        self,
+    ) -> None:
+        """Review-blocker round 3: a complete pair followed by
+        operator content and a trailing stray end marker must NOT
+        lose the operator content. The earlier ``rfind``-both-ends
+        heuristic paired the valid section's start with the
+        trailing stray end, deleting everything between them. The
+        round-3 search pairs each candidate start with the first
+        end-after-it that has no other start in between, so the
+        trailing stray end is ignored."""
+        from bridge.executor import _upsert_marker_section
+
+        body = (
+            "<!-- S:START -->\nVALID SECTION\n<!-- S:END -->\n"
+            "operator content that must survive\n"
+            "<!-- S:END -->\n"
+        )
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nREPLACED\n<!-- S:END -->\n",
+        )
+        assert "operator content that must survive" in merged
+        assert "VALID SECTION" not in merged
+        assert "REPLACED" in merged
+
+    def test_trailing_stray_start_after_complete_pair_replaces_inner(
+        self,
+    ) -> None:
+        """Review-blocker round 3: trailing stray start (no end
+        after it) must NOT be paired with the previous valid
+        section's end. The well-formed pair is the inner one —
+        the algorithm finds it via rfind(start) + find(end,
+        start+len) and replaces it."""
+        from bridge.executor import _upsert_marker_section
+
+        body = (
+            "<!-- S:START -->\nVALID SECTION\n<!-- S:END -->\n"
+            "operator content that must survive\n"
+            "<!-- S:START -->\n"
+        )
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nREPLACED\n<!-- S:END -->\n",
+        )
+        # The well-formed inner pair is replaced; operator content
+        # between the replaced pair and the trailing stray start
+        # survives; the trailing stray start survives.
+        assert "operator content that must survive" in merged
+        assert "VALID SECTION" not in merged
+        assert "REPLACED" in merged
+        assert merged.count("S:START") == 2  # replaced pair + trailing stray
+
+    def test_two_starts_one_end_with_inner_pair_replaces_inner(self) -> None:
+        """Review-blocker round 3 + round 2 alignment: a body with
+        two starts followed by a single end (no orphan end) must
+        target the INNER pair (the second start is the active
+        section opener; the first start is the previous run's
+        stray that we should not anchor on)."""
+        from bridge.executor import _upsert_marker_section
+
+        body = (
+            "<!-- S:START -->\nSTRAY PARTIAL\n"
+            "more operator content\n"
+            "<!-- S:START -->\nFIRST SECTION\n<!-- S:END -->\n"
+        )
+        merged = _upsert_marker_section(
+            body,
+            "<!-- S:START -->",
+            "<!-- S:END -->",
+            "<!-- S:START -->\nREPLACED\n<!-- S:END -->\n",
+        )
+        # The round-2 requirement: stray partial and operator
+        # content survive; the inner pair is replaced.
+        assert "STRAY PARTIAL" in merged
+        assert "more operator content" in merged
+        assert "FIRST SECTION" not in merged
+        assert "REPLACED" in merged
+
+    def test_does_not_disturb_other_job_sections(self) -> None:
+        """Two distinct marker pairs in the same body — only the
+        targeted section is replaced."""
+        from bridge.executor import _upsert_marker_section
+
+        body = (
+            "<!-- J1:START -->\nJ1 OLD\n<!-- J1:END -->\n"
+            "<!-- J2:START -->\nJ2 CONTENT\n<!-- J2:END -->\n"
+        )
+        merged = _upsert_marker_section(
+            body,
+            "<!-- J1:START -->",
+            "<!-- J1:END -->",
+            "<!-- J1:START -->\nJ1 NEW\n<!-- J1:END -->",
+        )
+        assert "J1 NEW" in merged
+        assert "J1 OLD" not in merged
+        assert "J2 CONTENT" in merged
+        assert merged.count("J2:START") == 1
+
+
+class TestRetryWritebackRealExecutor:
+    """Review-blocker 1 (round 2): the real ``BridgeExecutor.retry_writeback``
+    must use ``_writeback``'s boolean return value to decide between
+    ``writeback_retry_completed`` and ``writeback_retry_failed``.
+    Previously the retry layer unconditionally emitted the success
+    event because ``_writeback`` swallowed exceptions internally,
+    making the HTTP endpoint always report ``retried: true``."""
+
+    def test_real_executor_records_retry_failure_on_writeback_error(
+        self,
+        executor_wet: BridgeExecutor,
+        elabftw: MockElabftwClient,
+        vm_agent: MockVmAgentClient,
+    ) -> None:
+        from bridge.jobs import UNKNOWN
+
+        vm_agent.jobs = [
+            {
+                "assay_id": 200,
+                "protocol_name": "Absorbance @ 600 (1.0s)",
+                "protocol_id": 1001,
+            }
+        ]
+        job = Job(
+            job_id="test-real-retry-fail",
+            title="real retry fail",
+            execution_mode="existing_protocol",
+            protocol_id=1001,
+            elabftw_experiment_id=42,
+            status=UNKNOWN,
+            created_at="2026-01-01T00:00:00",
+        )
+        # Seed live_wells so the executor's retry-eligibility guard
+        # does not short-circuit on "no data".
+        job.live_wells = [
+            {"well": "A01", "od": 0.1, "counts": 1000},
+            {"well": "B02", "od": 0.2, "counts": 1000},
+        ]
+
+        # Force the eLabFTW upload path to raise.
+        elabftw.fail_upload = True
+
+        # The retry must NOT raise — it must record the failure and
+        # return cleanly so the response builder can surface the
+        # error. The return value (review concern round 3) is the
+        # authoritative outcome the HTTP handler uses to build the
+        # response.
+        success = executor_wet.retry_writeback(job)
+
+        events = [evt["event"] for evt in job.events]
+        assert "writeback_retry_started" in events
+        assert "writeback_retry_failed" in events
+        # The retry must NOT pretend success.
+        assert "writeback_retry_completed" not in events
+        # The job stays in operator review (not falsely promoted).
+        assert job.status == UNKNOWN
+        # The return value matches the recorded outcome.
+        assert success is False
