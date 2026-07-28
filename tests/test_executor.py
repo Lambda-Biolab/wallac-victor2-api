@@ -75,6 +75,7 @@ class MockElabftwClient:
         comment: str = "",
         *,
         metadata: dict[str, str] | None = None,
+        metadata_encoding: str = "dict",
     ) -> dict[str, Any]:
         if self.fail_upload:
             raise RuntimeError("upload unavailable")
@@ -84,10 +85,23 @@ class MockElabftwClient:
         if metadata is not None:
             self._last_metadata = dict(metadata)
         # Track the upload so ``get_experiment_uploads`` can return
-        # it on a retry (re-review round 4 blocker #3).
-        self._uploads.setdefault(exp_id, []).append(
-            {"real_name": filename, "metadata": dict(metadata or {})}
-        )
+        # it on a retry (re-review round 4 blocker #3). The mock
+        # supports two encodings so the test for round 5 blocker #3
+        # can drive the JSON-string / double-encoded paths the real
+        # eLabFTW API actually produces (``normalize_metadata``
+        # decodes both).
+        raw_meta = dict(metadata or {})
+        if metadata_encoding == "json":
+            import json as _json
+
+            wire_meta = _json.dumps(raw_meta, sort_keys=True)
+        elif metadata_encoding == "double_json":
+            import json as _json
+
+            wire_meta = _json.dumps(_json.dumps(raw_meta, sort_keys=True))
+        else:
+            wire_meta = raw_meta
+        self._uploads.setdefault(exp_id, []).append({"real_name": filename, "metadata": wire_meta})
         return {"id": exp_id, "real_name": filename}
 
     def get_experiment_uploads(self, exp_id: int) -> list[dict[str, Any]]:

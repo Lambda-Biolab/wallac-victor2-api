@@ -725,6 +725,16 @@ def _start_durable_worker(
             f"paused steps: {','.join(paused_actions)}",
         )
 
+    def _on_step_paused(job_id: str, action: str) -> None:
+        # Re-review round 5 blocker #4: the worker's exception
+        # handler pauses a step on an unknown dispatcher bug and
+        # then calls this hook. Cascade-pause the dependent steps
+        # (so they don't keep deferring forever on a bug that's
+        # in create_experiment) and call _maybe_finish so the
+        # job transitions to operator review.
+        dispatcher._cascade_pause_dependents(job_id, reason=f"{action} permanently failed")
+        dispatcher._maybe_finish(job_id)
+
     dispatcher = WritebackDispatcher(
         durable_manager,
         elabftw,
@@ -735,6 +745,7 @@ def _start_durable_worker(
     worker = WritebackWorker(
         durable_manager.conn,
         on_step=dispatcher.dispatch,
+        on_step_paused=_on_step_paused,
         interval_seconds=15.0,
     )
     worker.start()

@@ -271,10 +271,12 @@ class WritebackWorker:
         conn: sqlite3.Connection,
         *,
         on_step: Callable[[RetryAction], Any],
+        on_step_paused: Callable[[str, str], None] | None = None,
         interval_seconds: float = 15.0,
     ) -> None:
         self.ledger = StepLedger(conn)
         self._on_step = on_step
+        self._on_step_paused = on_step_paused
         self._interval = interval_seconds
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -341,6 +343,18 @@ class WritebackWorker:
                     "writeback dispatch raised; step %s paused",
                     action.step_id,
                 )
+                # Re-review round 5 blocker #4: an unknown
+                # exception during create_experiment recreates the
+                # previous deadlock (create paused, dependent steps
+                # pending forever). Fire the on_step_paused hook so
+                # the bridge can cascade-pause the dependents and
+                # call _maybe_finish, transitioning the job to
+                # operator review.
+                if self._on_step_paused is not None:
+                    try:
+                        self._on_step_paused(action.job_id, action.action)
+                    except Exception:
+                        logger.exception("on_step_paused hook raised")
         return dispatched
 
     def _loop(self) -> None:

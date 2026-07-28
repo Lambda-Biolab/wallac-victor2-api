@@ -1226,3 +1226,318 @@ def test_dispatcher_skips_upload_when_remote_has_matching_idempotency(
         assert artifact.uploaded, (
             f"durable ledger should mark {kind} as uploaded after the remote-side idempotency check"
         )
+
+
+# --- Re-review round 5 ---------------------------------------------------
+
+
+def test_reconciliation_listing_failure_does_not_fall_through(
+    durable_manager: JobManager,
+) -> None:
+    """If the reconciliation listing fails with a transport or TLS
+    error, the dispatcher MUST NOT fall through to a fresh upload
+    — the previous upload may have succeeded and the listing
+    failure is not evidence that it didn't.
+
+    Re-review round 5 blocker #2: the previous round's fix fell
+    through to ``upload_experiment_file`` on any
+    ``_TRANSIENT_EXC``. The fix classifies the listing failure
+    through the same bounded retry / TLS-permanent policy and
+    returns without uploading. A permanent listing failure
+    (e.g. TLS) cascade-pauses the dependent steps so the stuck
+    hook fires.
+    """
+    import urllib.error
+
+    class ListingFailsElabftw(MockElabftwClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.listing_calls = 0
+
+        def get_experiment_uploads(  # type: ignore[override]
+            self, exp_id: int
+        ) -> list[dict[str, Any]]:
+            self.listing_calls += 1
+            raise urllib.error.HTTPError(
+                url=f"http://elabftw/experiments/{exp_id}/uploads",
+                code=410,
+                msg="Gone",
+                hdrs={},  # type: ignore[arg-type]
+                fp=None,
+            )
+
+    elabftw = ListingFailsElabftw()
+    vm_agent = MockVmAgentClient()
+    executor = _build_executor(elabftw, vm_agent, durable=durable_manager)
+    job = _make_job("job-e2e-listing-fail")
+    _durable_record_for(durable_manager, job)
+    executor._durable_writeback(job, CANNED_WELLS, "well,value\nA1,0.078\n")
+    # Pre-seed exp_id so the dispatcher skips create_experiment.
+    # (In production the create_experiment step has run by now.)
+    dispatcher = WritebackDispatcher(durable_manager, elabftw)
+    worker = WritebackWorker(
+        durable_manager.conn,
+        on_step=dispatcher.dispatch,
+        interval_seconds=0.0,
+    )
+    # Set exp_id so create_experiment is skipped on the upload path.
+    # The dispatcher will then call get_experiment_uploads, which
+    # raises 410. The dispatcher must NOT call upload_experiment_file.
+    # Easiest: run a tick to get create_experiment done first
+    # (the default mock returns exp_id=1 on create_experiment).
+    worker.run_once()
+    durable_manager.update_experiment_id(job.job_id, 1)
+    # Reset the mock so the next tick does not short-circuit
+    # the upload path with the existing mock state.
+    before = list(elabftw.uploaded_files)
+    worker.run_once()
+    after = list(elabftw.uploaded_files)
+    # The listing raised 410 → permanent → no upload was
+    # attempted. uploaded_files is unchanged.
+    assert after == before, (
+        f"dispatcher should have classified the listing 410 as "
+        f"permanent and NOT uploaded; before={before!r} after={after!r}"
+    )
+    # The upload step is paused (per the permanent policy).
+    row = durable_manager.conn.execute(
+        "SELECT status FROM writeback_steps "
+        "WHERE job_id = ? AND action IN ('upload_raw', 'upload_analyzed')",
+        (job.job_id,),
+    ).fetchone()
+    assert row["status"] == "paused"
+
+
+def test_reconciliation_handles_encoded_metadata() -> None:
+    """The real eLabFTW API can return per-upload ``metadata`` as a
+    JSON-encoded string or as a double-encoded string. The
+    dispatcher must normalise both shapes before checking the
+    idempotency token, otherwise ``u.get("metadata").get(...)``
+    raises ``AttributeError`` (a string has no ``.get``).
+
+    Re-review round 5 blocker #3: the previous round assumed the
+    metadata was already a dict. The dispatcher now uses
+    :func:`bridge.elabftw.normalize_metadata` to decode both
+    shapes.
+    """
+    from bridge.durable.dispatcher import WritebackDispatcher
+    from bridge.durable.manager import JobManager
+    from bridge.durable.worker import StepLedger, WritebackWorker
+    from bridge.executor import BridgeExecutor
+    from tests.test_executor import MockElabftwClient, MockVmAgentClient
+
+    with tempfile.TemporaryDirectory(prefix="wallac-bridge-meta-") as tmp:
+        state = Path(tmp)
+        durable = JobManager(state)
+        try:
+            elabftw = MockElabftwClient()
+            # Force the mock to encode the metadata as a JSON
+            # string (the first common eLabFTW API shape).
+            import json as _json
+
+            vm_agent = MockVmAgentClient()
+            executor = BridgeExecutor(
+                vm_agent=vm_agent,
+                elabftw=elabftw,
+                dry_run=False,
+                durable_manager=durable,
+                durable_ledger=StepLedger(durable.conn),
+            )
+            job = _make_job("job-e2e-encoded-meta")
+            durable.submit_job(
+                job_id=job.job_id,
+                title=job.title,
+                execution_mode=job.execution_mode,
+                protocol_name=job.protocol_name,
+                protocol_id=job.protocol_id,
+                elabftw_experiment_id=0,
+                wells_spec={"wells": ["A1", "A2"]},
+            )
+            executor._durable_writeback(job, CANNED_WELLS, "well,value\nA1,0.078\n")
+            # Pre-seed the create_experiment result so the
+            # dispatcher skips create.
+            durable.update_experiment_id(job.job_id, 1)
+            # Pre-seed the mock's experiment so patch_experiment
+            # doesn't raise KeyError on the first tick.
+            elabftw._experiments[1] = {"title": "seeded", "body": ""}
+            # Pre-seed the mock's uploads with JSON-encoded
+            # metadata — the shape the real eLabFTW API
+            # produces when the per-upload metadata is a string.
+            # We seed BOTH the raw and the analyzed uploads so
+            # the dispatcher's reconciliation pass for either
+            # kind finds its matching token.
+            raw_step = durable.conn.execute(
+                "SELECT idempotency FROM writeback_steps "
+                "WHERE job_id = ? AND action = 'upload_raw'",
+                (job.job_id,),
+            ).fetchone()
+            an_step = durable.conn.execute(
+                "SELECT idempotency FROM writeback_steps "
+                "WHERE job_id = ? AND action = 'upload_analyzed'",
+                (job.job_id,),
+            ).fetchone()
+            elabftw._uploads[1] = [
+                {
+                    "real_name": f"{job.job_id}_raw_results.json",
+                    "metadata": _json.dumps(
+                        {"wallac.bridge.idempotency": raw_step["idempotency"]},
+                        sort_keys=True,
+                    ),
+                },
+                {
+                    "real_name": f"{job.job_id}_analyzed.csv",
+                    "metadata": _json.dumps(
+                        {"wallac.bridge.idempotency": an_step["idempotency"]},
+                        sort_keys=True,
+                    ),
+                },
+            ]
+            # Reset the local flag to simulate a crash window.
+            durable.conn.execute("UPDATE artifacts SET uploaded = 0")
+            durable.conn.execute(
+                "UPDATE writeback_steps SET status = 'pending', attempts = 0 "
+                "WHERE action IN ('upload_raw', 'upload_analyzed')"
+            )
+            # Run the worker. The dispatcher should normalise the
+            # JSON-string metadata, find the matching token, and
+            # skip the upload.
+            dispatcher = WritebackDispatcher(durable, elabftw)
+            worker = WritebackWorker(
+                durable.conn,
+                on_step=dispatcher.dispatch,
+                interval_seconds=0.0,
+            )
+            before = list(elabftw.uploaded_files)
+            worker.run_once()
+            after = list(elabftw.uploaded_files)
+            assert after == before, (
+                f"dispatcher should have decoded the JSON-string metadata "
+                f"and skipped the re-upload; before={before!r} after={after!r}"
+            )
+            for kind in ("raw", "analyzed"):
+                artifact = durable.find_artifact(job.job_id, kind)
+                assert artifact is not None
+                assert artifact.uploaded, (
+                    f"durable ledger should mark {kind} as uploaded after the "
+                    f"JSON-string metadata was decoded and the token matched"
+                )
+        finally:
+            durable.close()
+
+
+def test_unknown_dispatcher_exception_cascade_pauses_and_fires_stuck(
+    durable_manager: JobManager,
+) -> None:
+    """When the dispatcher raises an exception that is NOT in the
+    transport set (i.e. a real bug), the worker's exception
+    handler cascade-pauses the dependent steps and fires the
+    on_step_paused hook. The bridge wires that hook to
+    ``dispatcher._cascade_pause_dependents`` +
+    ``dispatcher._maybe_finish`` so the job transitions to
+    operator review.
+
+    Re-review round 5 blocker #4: previously the worker's
+    exception handler only paused the individual step. An
+    unknown exception during create_experiment recreated the
+    previous deadlock (create paused, dependent steps pending
+    forever, no operator-review transition).
+    """
+    executor = _build_executor(MockElabftwClient(), MockVmAgentClient(), durable=durable_manager)
+    job = _make_job("job-e2e-unknown-bug")
+    _durable_record_for(durable_manager, job)
+    executor._durable_writeback(job, CANNED_WELLS, "well,value\nA1,0.078\n")
+
+    stuck: list[tuple[str, list[str]]] = []
+
+    def _on_stuck(job_id: str, paused_actions: list[str]) -> None:
+        stuck.append((job_id, list(paused_actions)))
+
+    def _on_step_paused(job_id: str, action: str) -> None:
+        # The bridge wires this hook to cascade-pause and call
+        # _maybe_finish. We simulate the bridge's wiring here.
+        dispatcher._cascade_pause_dependents(job_id, reason=f"{action} permanently failed")
+        dispatcher._maybe_finish(job_id)
+
+    dispatcher = WritebackDispatcher(
+        durable_manager,
+        MockElabftwClient(),
+        on_job_stuck=_on_stuck,
+    )
+
+    def broken_create(title: str, body: str = "") -> int:
+        # An unknown exception type (not in _TRANSIENT_EXC). The
+        # dispatcher's _create_experiment propagates this; the
+        # worker's ``except Exception`` handler catches it.
+        raise RuntimeError("simulated bridge bug")
+
+    elabftw = MockElabftwClient()
+    elabftw.create_experiment = broken_create  # type: ignore[method-assign]
+    dispatcher = WritebackDispatcher(durable_manager, elabftw, on_job_stuck=_on_stuck)
+    worker = WritebackWorker(
+        durable_manager.conn,
+        on_step=dispatcher.dispatch,
+        on_step_paused=_on_step_paused,
+        interval_seconds=0.0,
+    )
+    worker.run_once()
+
+    rows = list(
+        durable_manager.conn.execute(
+            "SELECT action, status FROM writeback_steps WHERE job_id = ? ORDER BY step_id",
+            (job.job_id,),
+        )
+    )
+    create = next(r for r in rows if r["action"] == "create_experiment")
+    assert create["status"] == "paused", create
+    for action in ("upload_raw", "upload_analyzed", "patch_body"):
+        step = next(r for r in rows if r["action"] == action)
+        assert step["status"] == "paused", (
+            f"{action} should be cascaded to paused on unknown exception, got {step['status']!r}"
+        )
+    assert len(stuck) == 1
+    assert "create_experiment" in stuck[0][1]
+
+
+def test_create_experiment_title_includes_idempotency_token(
+    durable_manager: JobManager,
+) -> None:
+    """The idempotency token is included in the experiment's
+    title so an operator auditing the eLabFTW experiments list
+    can identify the duplicate created by an ambiguous-success
+    window (round 5 blocker #1) and resolve it via
+    ``POST /writeback/{id}/resolve``.
+
+    Full reconciliation (find-by-external-id) is not
+    implemented because the eLabFTW API does not expose a
+    find-by-external-id endpoint in the version this bridge
+    targets. The token in the title is the best operator-forensic
+    hint we can offer without an API change.
+    """
+    elabftw = MockElabftwClient()
+    captured: dict[str, Any] = {}
+
+    def _capture(title: str, body: str = "") -> int:
+        captured["title"] = title
+        return 42
+
+    elabftw.create_experiment = _capture  # type: ignore[method-assign]
+    vm_agent = MockVmAgentClient()
+    executor = _build_executor(elabftw, vm_agent, durable=durable_manager)
+    job = _make_job("job-e2e-idem-title")
+    _durable_record_for(durable_manager, job)
+    executor._durable_writeback(job, CANNED_WELLS, "well,value\nA1,0.078\n")
+    dispatcher = WritebackDispatcher(durable_manager, elabftw)
+    worker = WritebackWorker(
+        durable_manager.conn,
+        on_step=dispatcher.dispatch,
+        interval_seconds=0.0,
+    )
+    worker.run_once()
+    assert "title" in captured
+    assert "[idem:" in captured["title"]
+    # The token in the title is the step's idempotency value
+    # (truncated to 16 chars).
+    step = durable_manager.conn.execute(
+        "SELECT idempotency FROM writeback_steps WHERE job_id = ? AND action = 'create_experiment'",
+        (job.job_id,),
+    ).fetchone()
+    assert step["idempotency"][:16] in captured["title"]

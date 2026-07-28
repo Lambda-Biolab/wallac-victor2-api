@@ -271,6 +271,25 @@ class WritebackDispatcher:
             return
         title = f"Wallac Victor2 — {job.title}"
         body = f"<p>Results from job <code>{job.job_id}</code></p>"
+        # Re-review round 5 blocker #1: a process crash between
+        # the remote ``create_experiment`` succeeding and the
+        # local ``update_experiment_id`` call landing leaves the
+        # durable record's ``elabftw_experiment_id`` at 0. The
+        # next attempt will create a *second* experiment on the
+        # remote (the local check sees exp_id=0 and calls
+        # ``create_experiment`` again). The eLabFTW API does not
+        # have a find-by-external-id endpoint in the version this
+        # bridge targets, so full reconciliation is a known
+        # limitation. The idempotency token is included in the
+        # title as a forensic marker so an operator auditing the
+        # eLabFTW experiments list can spot the duplicate and
+        # resolve via ``POST /writeback/{id}/resolve``. The
+        # recovery bundle endpoint exposes the durable row
+        # state so the operator can see ``elabftw_experiment_id
+        # == 0`` + ``create_experiment == done`` as a sign of a
+        # crash window.
+        if action.idempotency:
+            title = f"{title} [idem:{action.idempotency[:16]}]"
         try:
             exp_id = self.elabftw.create_experiment(title, body)
         except BaseException as exc:
@@ -339,20 +358,47 @@ class WritebackDispatcher:
         # local ``uploaded=1`` flag was lost on crash / network
         # blip). When found, repair the local flag and skip — the
         # remote already has the bytes.
+        #
+        # Re-review round 5 blocker #2: a failure to list the
+        # remote uploads (network / TLS / auth) MUST NOT fall
+        # through to a fresh upload — the previous upload may
+        # have succeeded and the listing failure is not evidence
+        # that it didn't. Classify the listing failure through the
+        # same bounded retry / TLS-permanent policy and return
+        # without uploading.
         if action.idempotency:
             try:
                 remote_uploads = self.elabftw.get_experiment_uploads(exp_id)
             except _TRANSIENT_EXC as exc:
-                # Listing the uploads also failed (network / TLS).
-                # Fall through to the actual upload attempt; the
-                # transport-failure classification handles retries
-                # exactly as it does for the upload itself.
-                logger.warning("could not list remote uploads for exp %s: %r", exp_id, exc)
+                outcome = self._record_transport_outcome(
+                    action, exc, f"{kind} reconciliation listing"
+                )
+                if outcome == "permanent":
+                    self._cascade_pause_dependents(
+                        action.job_id,
+                        reason=f"{kind} reconciliation listing permanently failed",
+                    )
+                self._maybe_finish(action.job_id)
+                return
             else:
-                if any(
-                    (u.get("metadata") or {}).get("wallac.bridge.idempotency") == action.idempotency
-                    for u in remote_uploads
-                ):
+                # Re-review round 5 blocker #3: the real eLabFTW
+                # API can return the per-upload ``metadata`` field
+                # as a JSON-encoded string OR as a double-encoded
+                # string. ``bridge.elabftw.normalize_metadata``
+                # decodes both shapes. Without normalisation,
+                # ``u.get("metadata")`` returns a string and the
+                # subsequent ``.get(...)`` raises ``AttributeError``,
+                # which the worker treats as a permanent dispatcher
+                # bug. The dispatcher now normalises per upload.
+                from bridge.elabftw import normalize_metadata as _norm
+
+                def _idempotency_of(upload: dict[str, Any]) -> str | None:
+                    meta = _norm(upload.get("metadata"))
+                    if not isinstance(meta, dict):
+                        return None
+                    return meta.get("wallac.bridge.idempotency")
+
+                if any(_idempotency_of(u) == action.idempotency for u in remote_uploads):
                     logger.info(
                         "skip %s for job %s: remote already has upload with idempotency %s",
                         action.action,
