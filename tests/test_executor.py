@@ -35,6 +35,7 @@ class MockElabftwClient:
         self._experiments: dict[int, dict[str, Any]] = {}
         self._next_exp_id = 1
         self.fail_upload = False
+        self._last_metadata: dict[str, str] | None = None
         self.preflight_error: Exception | None = None
         self.preflight_calls = 0
         self.uploaded_files: list[str] = []
@@ -66,11 +67,21 @@ class MockElabftwClient:
         return record
 
     def upload_experiment_file(
-        self, exp_id: int, filename: str, content: bytes, comment: str = ""
+        self,
+        exp_id: int,
+        filename: str,
+        content: bytes,
+        comment: str = "",
+        *,
+        metadata: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if self.fail_upload:
             raise RuntimeError("upload unavailable")
         self.uploaded_files.append(filename)
+        # Record the metadata so the integration test can assert
+        # the idempotency token is on the wire.
+        if metadata is not None:
+            self._last_metadata = dict(metadata)
         return {"id": exp_id, "real_name": filename}
 
     def patch_experiment(self, exp_id: int, data: dict[str, Any]) -> None:

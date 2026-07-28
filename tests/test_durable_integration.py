@@ -263,6 +263,8 @@ def test_max_attempts_pauses_step_instead_of_looping_forever(
             filename: str,
             content: bytes,
             comment: str = "",
+            *,
+            metadata: dict[str, str] | None = None,
         ) -> dict[str, Any]:
             raise urllib.error.HTTPError(
                 url=f"http://elabftw/experiments/{exp_id}/uploads",
@@ -763,3 +765,262 @@ def test_transport_error_classified_as_transient(
         assert row["attempts"] >= 8
     finally:
         durable2.close()
+
+
+# --- Re-review round 3 ---------------------------------------------------
+
+
+def test_active_states_blocks_dedup_during_writeback_pending() -> None:
+    """A re-submit of the same spec must be rejected while the
+    durable worker is still processing the previous one.
+
+    Re-review blocker #1: the in-memory dedup used
+    ``status not in TERMINAL_STATES`` (true for an ``accepted`` /
+    ``running`` job → rejected, true for a ``writeback_pending``
+    job under the old TERMINAL_STATES → also rejected because
+    WRITEBACK_PENDING was added to TERMINAL_STATES — but that
+    ALSO makes the job "terminal" for the in-memory worker,
+    which is the right behaviour here only for that one purpose).
+    The fix is to give the dedup check its own set,
+    ``ACTIVE_STATES = {accepted, running, writeback_pending}``,
+    and re-route the dedup check through it.
+    """
+    from bridge.jobs import ACTIVE_STATES, WRITEBACK_PENDING
+    from bridge.jobs import JobManager as IM
+
+    assert WRITEBACK_PENDING in ACTIVE_STATES
+    # COMPLETED / FAILED / ABORTED / UNKNOWN are NOT in
+    # ACTIVE_STATES — a fresh submission of the same dedup key
+    # against a terminal job is allowed (different from a
+    # writeback-pending job where the durable worker is still
+    # processing).
+    assert "completed" not in ACTIVE_STATES
+    assert "failed" not in ACTIVE_STATES
+    assert "aborted" not in ACTIVE_STATES
+    assert "unknown_requires_operator_review" not in ACTIVE_STATES
+    # And the in-memory manager rejects a duplicate while a job
+    # is in WRITEBACK_PENDING.
+    in_mem = IM()
+    job = in_mem.submit_job(
+        {
+            "title": "active states test",
+            "execution_mode": "existing_protocol",
+            "protocol_id": 1001,
+        }
+    )
+    job.status = WRITEBACK_PENDING
+    from bridge.jobs import DuplicateJobError
+
+    with pytest.raises(DuplicateJobError):
+        in_mem.submit_job(
+            {
+                "title": "active states test",
+                "execution_mode": "existing_protocol",
+                "protocol_id": 1001,
+            }
+        )
+
+
+def test_post_jobs_durable_insert_runs_before_in_memory_queue(
+    durable_manager: JobManager,
+) -> None:
+    """POST /jobs must commit the durable row before the in-memory
+    submit_job enqueues the job for the worker thread.
+
+    Re-review blocker #2: previously the in-memory submit_job ran
+    first and the worker could dequeue + start physical execution
+    before the durable insert committed, so ``_durable_writeback``
+    would fail with "no durable record". The fix is to
+    pre-generate the job id and call the durable ``submit_job``
+    before the in-memory one (both synchronous on the request
+    thread).
+    """
+    from fastapi.testclient import TestClient
+
+    from bridge.bridge_app import create_bridge_app
+    from bridge.config import BridgeConfig
+
+    config = BridgeConfig(
+        elabftw_url="https://localhost:3148",
+        elabftw_api_key="5-key",
+        elabftw_verify_tls=False,
+        elabftw_ca_bundle=None,
+        wallac_env="dev",
+        vm_agent_url="http://127.0.0.1:8420",
+        vm_agent_token="",
+        dry_run=False,
+        bridge_state_dir=str(durable_manager.state_dir),
+    )
+    app = create_bridge_app(config=config)
+    client = TestClient(app)
+    client.headers["Authorization"] = "Bearer "
+    resp = client.post(
+        "/jobs",
+        json={
+            "title": "post /jobs ordering",
+            "execution_mode": "existing_protocol",
+            "protocol_name": "Absorbance @ 610 (1.0s)",
+            "protocol_id": 2000008,
+            "wells_spec": {"wells": ["A1", "A2"]},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    job_id = resp.json()["job_id"]
+    # The durable row was committed by the time the request returned.
+    assert durable_manager.get_job(job_id) is not None
+
+
+def test_paused_step_transitions_job_to_operator_review(
+    durable_manager: JobManager,
+) -> None:
+    """When a step is paused (permanent error or max_attempts
+    exhausted) and no other step is ``pending``, the dispatcher's
+    ``on_job_stuck`` hook fires. The bridge's hook transitions
+    both ledgers to ``unknown_requires_operator_review``.
+
+    Re-review blocker #3: previously the only hook handled the
+    all-successful case, so a paused step left the job in
+    ``writeback_pending`` forever.
+    """
+    from bridge.jobs import UNKNOWN
+
+    elabftw = MockElabftwClient()
+    vm_agent = MockVmAgentClient()
+    executor = _build_executor(elabftw, vm_agent, durable=durable_manager)
+    job = _make_job("job-e2e-stuck")
+    _durable_record_for(durable_manager, job)
+    executor._durable_writeback(job, CANNED_WELLS, "well,value\nA1,0.078\n")
+
+    stuck_jobs: list[tuple[str, list[str]]] = []
+
+    def _on_stuck(job_id: str, paused_actions: list[str]) -> None:
+        stuck_jobs.append((job_id, list(paused_actions)))
+        durable_manager.mark_status(
+            job_id, UNKNOWN, error="; ".join(f"step {a} paused" for a in paused_actions)
+        )
+
+    dispatcher = WritebackDispatcher(durable_manager, elabftw, on_job_stuck=_on_stuck)
+
+    # Manually transition the create_experiment step to ``paused``
+    # (e.g., the dispatcher raised). The remaining steps are
+    # ``pending``. The hook should NOT fire yet.
+    durable_manager.conn.execute(
+        "UPDATE writeback_steps SET status = 'paused', attempts = 8, "
+        "detail = 'simulated permanent error' "
+        "WHERE job_id = ? AND action = 'create_experiment'",
+        (job.job_id,),
+    )
+    dispatcher._maybe_finish(job.job_id)
+    assert stuck_jobs == [], "hook should not fire while other steps are still pending"
+
+    # Now mark the remaining steps ``paused`` too — the writeback
+    # cannot make further progress. The hook should fire.
+    durable_manager.conn.execute(
+        "UPDATE writeback_steps SET status = 'paused' "
+        "WHERE job_id = ? AND action != 'create_experiment'",
+        (job.job_id,),
+    )
+    dispatcher._maybe_finish(job.job_id)
+    assert len(stuck_jobs) == 1
+    assert stuck_jobs[0][0] == job.job_id
+    assert "create_experiment" in stuck_jobs[0][1]
+    # The durable job is now ``unknown_requires_operator_review``.
+    assert durable_manager.get_job(job.job_id).status == UNKNOWN
+
+
+def test_ssl_certificate_failure_classified_as_permanent(
+    durable_manager: JobManager,
+) -> None:
+    """A TLS / certificate failure (URLError with
+    ``.reason`` = ``ssl.SSLCertVerificationError``) is classified
+    as permanent, not transient.
+
+    Re-review blocker #4: previously every non-HTTPError URLError
+    was transient, so a broken CA bundle would loop the worker
+    until ``max_attempts`` exhausted instead of pausing on the
+    first failure. Retrying a TLS failure is futile — the CA
+    bundle is operator-controlled; issue #44 §"Retry policy"
+    mandates permanent.
+    """
+    import ssl
+    import urllib.error
+
+    class TlsFailElabftw(MockElabftwClient):
+        def create_experiment(  # type: ignore[override]
+            self, title: str, body: str = ""
+        ) -> int:
+            # Simulate the urllib chain: URLError wraps an
+            # SSLCertVerificationError as its ``.reason``.
+            raise urllib.error.URLError(
+                ssl.SSLCertVerificationError("hostname 'elabftw' doesn't match 'localhost'")
+            )
+
+    elabftw = TlsFailElabftw()
+    vm_agent = MockVmAgentClient()
+    executor = _build_executor(elabftw, vm_agent, durable=durable_manager)
+    job = _make_job("job-e2e-tls")
+    _durable_record_for(durable_manager, job)
+    executor._durable_writeback(job, CANNED_WELLS, "well,value\nA1,0.078\n")
+    dispatcher = WritebackDispatcher(durable_manager, elabftw)
+    worker = WritebackWorker(
+        durable_manager.conn,
+        on_step=dispatcher.dispatch,
+        interval_seconds=0.0,
+    )
+    worker.run_once()
+
+    row = durable_manager.conn.execute(
+        "SELECT status, attempts, detail FROM writeback_steps "
+        "WHERE job_id = ? AND action = 'create_experiment'",
+        (job.job_id,),
+    ).fetchone()
+    # TLS errors are permanent on the first failure — the worker
+    # pauses immediately rather than looping until max_attempts.
+    assert row["status"] == "paused", (
+        f"TLS error should be permanent on first failure, got "
+        f"status={row['status']!r} attempts={row['attempts']!r}"
+    )
+    assert row["attempts"] == 1, (
+        f"TLS error should pause on the first attempt, got attempts={row['attempts']!r}"
+    )
+    assert "TLS error" in row["detail"]
+
+
+def test_idempotency_token_passed_to_elabftw_upload(
+    durable_manager: JobManager,
+) -> None:
+    """The dispatcher passes the durable step's idempotency token
+    to ``ElabftwClient.upload_experiment_file`` as the
+    ``metadata`` field.
+
+    Re-review blocker #5: previously the dispatcher did not
+    pass the idempotency token, so a retry after a partial
+    failure (remote succeeded, local ``uploaded=1`` flag lost)
+    could not be reconciled. The token is now on the wire as
+    ``metadata.wallac.bridge.idempotency``. Full reconciliation
+    still requires a "list uploads and skip if token present"
+    pass on retry (documented as a known limitation; the
+    primary defense remains the ``uploaded=1`` flag).
+    """
+    elabftw = MockElabftwClient()
+    vm_agent = MockVmAgentClient()
+    executor = _build_executor(elabftw, vm_agent, durable=durable_manager)
+    job = _make_job("job-e2e-idem")
+    _durable_record_for(durable_manager, job)
+    executor._durable_writeback(job, CANNED_WELLS, "well,value\nA1,0.078\n")
+    dispatcher = WritebackDispatcher(durable_manager, elabftw)
+    worker = WritebackWorker(
+        durable_manager.conn,
+        on_step=dispatcher.dispatch,
+        interval_seconds=0.0,
+    )
+    for _ in range(8):
+        worker.run_once()
+
+    # The mock records the most-recent metadata on every upload.
+    assert elabftw._last_metadata is not None, (
+        "expected the dispatcher to pass metadata to upload_experiment_file"
+    )
+    assert "wallac.bridge.idempotency" in elabftw._last_metadata
+    # The token is the step's ``idempotency`` column from SQLite.
+    assert elabftw._last_metadata["wallac.bridge.idempotency"].startswith(f"{job.job_id}:upload_")

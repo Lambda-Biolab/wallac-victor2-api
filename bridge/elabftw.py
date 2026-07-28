@@ -388,9 +388,34 @@ class ElabftwClient:
         return self._request("GET", f"/experiments/{experiment_id}")
 
     def upload_experiment_file(
-        self, experiment_id: int, filename: str, content: bytes, comment: str = ""
+        self,
+        experiment_id: int,
+        filename: str,
+        content: bytes,
+        comment: str = "",
+        *,
+        metadata: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Upload a file attachment to an experiment."""
+        """Upload a file attachment to an experiment.
+
+        ``metadata`` is the eLabFTW per-upload metadata dictionary
+        (separate from the experiment's ``extra_fields``). The
+        durable writeback dispatcher passes the bridge's
+        ``idempotency`` token here so a remote eLabFTW operator can
+        see which bridge upload owns a given attachment, and so a
+        future "list uploads and skip if idempotency-token already
+        present" can reconcile a partial-failure window where the
+        remote succeeded but the local ``uploaded=1`` flag was
+        lost.
+
+        The current dispatcher does NOT do the listing-and-skip
+        reconciliation (issue #44 re-review blocker #5 is partially
+        addressed: the token is on the wire, but full idempotency
+        reconciliation requires either an eLabFTW server change
+        or an extra GET on every retry). The ``uploaded=1`` flag
+        is the primary defense; the metadata token is for
+        forensics and forward-compat.
+        """
         import uuid
 
         boundary = uuid.uuid4().hex
@@ -408,6 +433,19 @@ class ElabftwClient:
         body_parts.append(
             (f'Content-Disposition: form-data; name="comment"\r\n\r\n{comment}\r\n').encode()
         )
+        if metadata:
+            # eLabFTW accepts a per-upload ``metadata`` field as a
+            # JSON-encoded object in the multipart body. We only
+            # forward string values to keep the wire format simple.
+            import json as _json
+
+            body_parts.append(
+                (
+                    f'Content-Disposition: form-data; name="metadata"\r\n'
+                    f"Content-Type: application/json\r\n\r\n"
+                    f"{_json.dumps(metadata, sort_keys=True)}\r\n"
+                ).encode()
+            )
         body_parts.append(f"--{boundary}--\r\n".encode())
         data = b"".join(body_parts)
 

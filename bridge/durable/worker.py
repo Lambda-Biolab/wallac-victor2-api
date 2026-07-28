@@ -49,12 +49,21 @@ class RetryAction:
 
     The executor's ``enqueue_step`` callback turns this into the
     actual HTTP call. The worker is intentionally transport-free.
+
+    ``idempotency`` is the planner's stable token (issue #44 §"Retry
+    policy"). The dispatcher passes it to eLabFTW as a per-upload
+    ``metadata`` field so a remote operator can identify which
+    bridge upload owns a given attachment, and so a future
+    reconciliation pass can detect partial-failure windows where
+    the remote succeeded but the local ``uploaded=1`` flag was
+    lost.
     """
 
     step_id: str
     job_id: str
     action: str
     attempts: int
+    idempotency: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +177,7 @@ class StepLedger:
         return list(
             self.conn.execute(
                 """
-                SELECT step_id, job_id, action, attempts
+                SELECT step_id, job_id, action, attempts, idempotency
                   FROM writeback_steps
                   WHERE status = 'pending'
                     AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
@@ -295,6 +304,7 @@ class WritebackWorker:
                 job_id=row["job_id"],
                 action=row["action"],
                 attempts=int(row["attempts"]),
+                idempotency=row["idempotency"],
             )
             try:
                 self._on_step(action)
@@ -355,9 +365,18 @@ def record_step_outcome(
     http_status: int | None,
     detail: str,
     tls_error: bool = False,
+    error_kind: str | None = None,
 ) -> tuple[str, str | None]:
-    """Convenience wrapper for the executor's per-step result handler."""
-    outcome = classify_status(http_status, tls_error=tls_error)
+    """Convenience wrapper for the executor's per-step result handler.
+
+    ``error_kind`` (``"tls"``, ``"ca_bundle"``, ``"auth"``,
+    ``"schema"``, ``"payload"``) is forwarded to
+    :func:`bridge.durable.retry.classify_status` so a non-HTTP
+    transport failure (e.g. URLError with .reason = ssl.SSLError)
+    can be classified as permanent without an HTTP status to
+    look at. Issue #44 re-review blocker #4.
+    """
+    outcome = classify_status(http_status, tls_error=tls_error, error_kind=error_kind)
     return ledger.record_outcome(step_id, outcome=outcome, http_status=http_status, detail=detail)
 
 

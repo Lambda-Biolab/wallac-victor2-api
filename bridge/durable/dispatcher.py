@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import socket
+import ssl
 import threading
 import urllib.error
 from collections.abc import Callable
@@ -93,6 +94,30 @@ _TRANSIENT_EXC: tuple[type[BaseException], ...] = (
 )
 
 
+def _is_ssl_or_cert_failure(exc: BaseException) -> bool:
+    """Return ``True`` when ``exc`` represents a TLS / certificate failure.
+
+    Issue #44 (re-review blocker #4): ``urllib.request`` raises
+    :class:`urllib.error.URLError` for any URL-level failure. For
+    DNS, connection refused, timeout, etc. the ``.reason`` is a
+    ``socket.gaierror`` / ``ConnectionRefusedError`` (transient —
+    retry with bounded backoff). For TLS chain / hostname /
+    certificate failures the ``.reason`` is an
+    :class:`ssl.SSLCertVerificationError` or :class:`ssl.SSLError`
+    (permanent — must NOT retry; the bridge would loop forever
+    on a CA trust issue). The dispatcher must distinguish.
+    """
+    # Walk the chain. ``URLError.reason`` can be any of the above.
+    cur: Any = getattr(exc, "reason", exc)
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, (ssl.SSLCertVerificationError, ssl.SSLError)):
+            return True
+        cur = getattr(cur, "reason", None)
+    return False
+
+
 class _ElabftwLike(Protocol):
     """Minimal eLabFTW surface used by the dispatcher.
 
@@ -112,6 +137,8 @@ class _ElabftwLike(Protocol):
         filename: str,
         content: bytes,
         comment: str = "",
+        *,
+        metadata: dict[str, str] | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -163,11 +190,36 @@ class WritebackDispatcher:
         *,
         on_step_complete: Callable[[str, str, str], None] | None = None,
         on_all_steps_done: Callable[[str], None] | None = None,
+        on_job_stuck: Callable[[str, list[str]], None] | None = None,
     ) -> None:
+        """Construct the dispatcher.
+
+        Constructor args:
+
+        * ``manager`` — the durable :class:`bridge.durable.manager.JobManager`
+          the worker reads steps from and writes outcomes to.
+        * ``elabftw`` — the eLabFTW client (or a test double) used to
+          actually perform the four writeback stages.
+        * ``on_step_complete`` — optional ``Callable[[str, str, str], None]``
+          invoked after each successful step with ``(job_id, action, exp_id)``.
+        * ``on_all_steps_done`` — optional ``Callable[[str], None]``
+          invoked once after the last writeback step for a job
+          successfully completes. The dispatcher does NOT mark the durable
+          job ``completed`` itself; the caller decides the final status.
+        * ``on_job_stuck`` — optional ``Callable[[str, list[str]], None]``
+          invoked when a job's writeback cannot make further progress
+          (at least one step is ``paused`` AND no step is ``pending``).
+          The list argument is the action names of the paused steps
+          so the operator can see which stages failed. The hook is
+          the right place to transition the in-memory and durable
+          ledgers to ``unknown_requires_operator_review`` (issue
+          #44 re-review blocker #3).
+        """
         self.manager = manager
         self.elabftw = elabftw
         self._on_step_complete = on_step_complete
         self._on_all_steps_done = on_all_steps_done
+        self._on_job_stuck = on_job_stuck
         self._ledger = StepLedger(manager.conn)
         self._body_locks: dict[int, threading.Lock] = {}
         self._body_locks_guard = threading.Lock()
@@ -270,6 +322,11 @@ class WritebackDispatcher:
                 filename,
                 data,
                 comment=f"{kind} results from Wallac Victor2 (job {job.job_id})",
+                metadata=(
+                    {"wallac.bridge.idempotency": action.idempotency}
+                    if action.idempotency
+                    else None
+                ),
             )
         except BaseException as exc:
             self._record_transport_outcome(action, exc, f"{kind} upload")
@@ -324,20 +381,32 @@ class WritebackDispatcher:
 
         * ``HTTPError`` (with a status code) → ``classify_status`` →
           transient or permanent based on the code.
+        * TLS / certificate failures (``urllib.URLError`` whose
+          ``.reason`` chain ends at ``ssl.SSLCertVerificationError``
+          or ``ssl.SSLError``) → permanent via
+          ``classify_status(error_kind="tls")``. Retrying would
+          loop forever; the operator must fix the CA bundle
+          (issue #44 §"Retry policy": TLS failures are permanent).
         * ``URLError`` / ``OSError`` / ``socket.timeout`` /
-          ``ConnectionError`` / ``TimeoutError`` → transient (issue
-          #44 §"Retry policy": transport failures retry with
-          bounded backoff; the worker will pause the step once the
-          attempt budget is exhausted).
+          ``ConnectionError`` / ``TimeoutError`` (non-SSL) →
+          transient (issue #44 §"Retry policy": transport
+          failures retry with bounded backoff; the worker will
+          pause the step once the attempt budget is exhausted).
         * Anything else → re-raise so the worker treats it as a
           permanent dispatcher bug (the existing exception handler
           in ``WritebackWorker.run_once`` pauses the step without
           incrementing the retry count further).
         """
         if isinstance(exc, _TRANSIENT_EXC):
-            if isinstance(exc, _HTTPError):
+            if _is_ssl_or_cert_failure(exc):
+                outcome = classify_status(None, error_kind="tls")
+                detail = f"{what} TLS error: {exc!r}"
+                status = 0
+                error_kind = "tls"
+            elif isinstance(exc, _HTTPError):
                 outcome, detail = _classify_http_error(exc, what)
                 status = int(getattr(exc, "code", 0) or 0)
+                error_kind = None
             else:
                 # Non-HTTPError transport failure: DNS, connection
                 # refused, timeout, etc. Classify as transient so the
@@ -345,11 +414,13 @@ class WritebackDispatcher:
                 outcome = "transient"
                 detail = f"{what} transport error: {exc!r}"
                 status = 0
+                error_kind = None
             record_step_outcome(
                 self._ledger,
                 step_id=action.step_id,
                 http_status=status,
                 detail=detail,
+                error_kind=error_kind,
             )
             logger.warning(
                 "%s %s for job %s (status=%s): %s",
@@ -372,22 +443,45 @@ class WritebackDispatcher:
                 logger.exception("on_step_complete hook raised for %s/%s", job_id, action)
 
     def _maybe_finish(self, job_id: str) -> None:
-        """Notify the caller if every step for the job is now ``done``.
+        """Notify the caller about terminal writeback progress.
+
+        Two cases:
+
+        * Every step is ``done`` — the caller's ``on_all_steps_done``
+          hook fires (the in-memory + durable ledgers transition
+          to ``completed``).
+        * No step is ``pending`` AND at least one is ``paused`` —
+          the writeback cannot make further progress without
+          operator action (a permanent error exhausted the retry
+          budget, or a step's prerequisite was never satisfied).
+          The caller's ``on_job_stuck`` hook fires with the list
+          of paused step actions so the ledgers can transition to
+          ``unknown_requires_operator_review`` (issue #44 re-review
+          blocker #3: the original PR only handled the
+          all-successful case, so a paused step left the job in
+          ``writeback_pending`` forever).
 
         The dispatcher intentionally does NOT mark the durable job
-        ``completed`` — the caller owns the final state machine
-        transition so it can also update the in-memory ``Job`` and
-        emit the ``writeback_completed`` event the same way the
-        legacy path did.
+        ``completed`` or ``unknown`` itself — the caller owns the
+        final state machine transition so it can also update the
+        in-memory ``Job`` and emit the public events.
         """
         rows = self._ledger.snapshot(job_id)
         if not rows:
             return
-        if all(r["status"] == "done" for r in rows) and self._on_all_steps_done is not None:
+        statuses = [r["status"] for r in rows]
+        if all(s == "done" for s in statuses) and self._on_all_steps_done is not None:
             try:
                 self._on_all_steps_done(job_id)
             except Exception:
                 logger.exception("on_all_steps_done hook raised for %s", job_id)
+            return
+        if "pending" not in statuses and "paused" in statuses and self._on_job_stuck is not None:
+            paused_actions = [r["action"] for r in rows if r["status"] == "paused"]
+            try:
+                self._on_job_stuck(job_id, paused_actions)
+            except Exception:
+                logger.exception("on_job_stuck hook raised for %s", job_id)
 
 
 __all__ = ["WritebackDispatcher"]

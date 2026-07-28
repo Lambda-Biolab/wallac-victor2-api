@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -530,16 +531,39 @@ def _register_routes(
         req: JobSubmitRequest, authorization: str | None = Header(default=None)
     ) -> JobResponse:
         _check_auth(token, authorization)
+        # Reason: WellsSpec is a typed Pydantic model so default
+        # ``model_dump`` includes all three sibling keys with Nones.
+        # Normalize to the slim form so the stored Job.wells_spec
+        # matches what the caller submitted — keeps the public
+        # contract stable and prevents accidental garbage reaching
+        # the executor / vm-agent.
+        payload = req.model_dump()
+        payload["wells_spec"] = req.wells_spec.to_slim_dict()
+        # Issue #44 (re-review blocker #2): the durable record must
+        # be inserted BEFORE the in-memory submission so the
+        # in-memory worker thread cannot start physical execution
+        # against a job that has no durable row. The in-memory
+        # ``submit_job`` appends the job to the execution queue
+        # synchronously, and the worker thread polls the queue on
+        # the next tick — that tick happens after both inserts
+        # have committed (the request handler is single-threaded
+        # for the in-memory manager). The durable insert is
+        # synchronous on SQLite (no commit ordering hazard).
+        #
+        # Pre-generate the job id so both ledgers agree on it.
+        pre_job_id = f"job-{uuid.uuid4().hex[:16]}"
+        if durable_manager is not None:
+            durable_manager.submit_job(
+                job_id=pre_job_id,
+                title=payload.get("title", "Untitled"),
+                execution_mode=payload.get("execution_mode", "existing_protocol"),
+                protocol_name=payload.get("protocol_name", ""),
+                protocol_id=payload.get("protocol_id", 0),
+                elabftw_experiment_id=payload.get("elabftw_experiment_id", 0),
+                wells_spec=payload.get("wells_spec", {}),
+            )
         try:
-            # Reason: WellsSpec is a typed Pydantic model so default
-            # ``model_dump`` includes all three sibling keys with Nones.
-            # Normalize to the slim form so the stored Job.wells_spec
-            # matches what the caller submitted — keeps the public
-            # contract stable and prevents accidental garbage reaching
-            # the executor / vm-agent.
-            payload = req.model_dump()
-            payload["wells_spec"] = req.wells_spec.to_slim_dict()
-            job = manager.submit_job(payload)
+            job = manager.submit_job(payload, job_id=pre_job_id)
         except DuplicateJobError as e:
             existing = manager.get_job(e.existing_job_id)
             detail: dict[str, Any] = {
@@ -552,20 +576,6 @@ def _register_routes(
                     existing_status=existing.status,
                 )
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail) from e
-        # Issue #44: also seed the durable ledger so the
-        # ``BridgeExecutor._durable_writeback`` path has a row to
-        # spool against. The durable ``submit_job`` is idempotent
-        # (INSERT OR IGNORE) so a partial-failure retry is safe.
-        if durable_manager is not None:
-            durable_manager.submit_job(
-                job_id=job.job_id,
-                title=job.title,
-                execution_mode=job.execution_mode,
-                protocol_name=job.protocol_name,
-                protocol_id=job.protocol_id,
-                elabftw_experiment_id=job.elabftw_experiment_id,
-                wells_spec=job.wells_spec,
-            )
         return _job_to_response(job)
 
     @app.get("/jobs", response_model=list[JobResponse])
@@ -675,11 +685,40 @@ def _start_durable_worker(
         durable_manager.mark_status(job_id, "completed", completed_at=_now())
         durable_manager.record_event(job_id, "writeback_completed", "all 4 stages done")
 
+    def _on_job_stuck(job_id: str, paused_actions: list[str]) -> None:
+        # Re-review blocker #3: when no step can make further
+        # progress (at least one paused, no pending), transition
+        # both ledgers to operator review so the existing
+        # /jobs/{id} endpoint reflects the failure state. The
+        # recovery bundle endpoint exposes the paused step list
+        # so the operator can decide whether to /retry, /resolve,
+        # or fix the underlying issue and let the worker resume.
+        from bridge.jobs import UNKNOWN as _UNKNOWN
+
+        mem_job = in_memory_manager.get_job(job_id)
+        if mem_job is not None and mem_job.status not in ("failed", "aborted", _UNKNOWN):
+            mem_job.status = _UNKNOWN
+            mem_job.add_event(
+                "writeback_stuck",
+                f"paused steps: {','.join(paused_actions)}",
+            )
+        durable_manager.mark_status(
+            job_id,
+            _UNKNOWN,
+            error="; ".join(f"step {a} paused" for a in paused_actions),
+        )
+        durable_manager.record_event(
+            job_id,
+            "writeback_stuck",
+            f"paused steps: {','.join(paused_actions)}",
+        )
+
     dispatcher = WritebackDispatcher(
         durable_manager,
         elabftw,
         on_step_complete=_on_step_complete,
         on_all_steps_done=_on_all_steps_done,
+        on_job_stuck=_on_job_stuck,
     )
     worker = WritebackWorker(
         durable_manager.conn,
