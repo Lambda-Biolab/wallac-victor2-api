@@ -41,6 +41,7 @@ ENV_CORS_ORIGINS = "WALLAC_CORS_ORIGINS"
 # Strict-auth mode. When set to 1/true/yes, the bridge/designer
 # services refuse to start with empty bearer tokens.
 ENV_REQUIRE_AUTH = "WALLAC_REQUIRE_AUTH"
+ENV_BRIDGE_STATE_DIR = "WALLAC_BRIDGE_STATE_DIR"
 
 # --- Defaults ---------------------------------------------------------------
 
@@ -77,6 +78,7 @@ class BridgeConfig:
     dry_run: bool = False
     cors_origins: list[str] = field(default_factory=list)
     require_auth: bool = False
+    bridge_state_dir: str | None = None
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> BridgeConfig:
@@ -140,6 +142,7 @@ class BridgeConfig:
             dry_run=_parse_bool(e.get(ENV_DRY_RUN, ""), False, ENV_DRY_RUN),
             cors_origins=cors_origins,
             require_auth=_parse_bool(e.get(ENV_REQUIRE_AUTH, ""), False, ENV_REQUIRE_AUTH),
+            bridge_state_dir=(e.get(ENV_BRIDGE_STATE_DIR, "").strip() or None),
         )
 
 

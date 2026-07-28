@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hmac
 import os
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Response, status
@@ -28,6 +29,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 
 from .config import BridgeConfig
+from .durable.endpoints import register_writeback_routes
+from .durable.manager import JobManager as DurableJobManager
 from .elabftw import ElabftwClient
 from .executor import BridgeExecutor
 from .jobs import DuplicateJobError, Job, JobManager
@@ -609,6 +612,11 @@ def create_bridge_app(
         executor: Optional executor to wire when ``config`` is None (the
             test-only path). Lets unit tests drive the retry-writeback
             endpoint without booting the production wiring.
+
+    On the production path (``config is not None``), the bridge also
+    opens a durable :class:`bridge.durable.manager.JobManager` against
+    ``config.bridge_state_dir`` and wires the operator recovery
+    endpoints (issue #44).
     """
     if config is None and job_manager is None:
         config = BridgeConfig.from_env()
@@ -616,6 +624,21 @@ def create_bridge_app(
     token = _bridge_token(config)
     if config is not None:
         executor = _wire_executor(config, manager)
+
+    durable_manager: DurableJobManager | None = None
+    durable_factory: Callable[[], DurableJobManager] | None = None
+    if config is not None and config.bridge_state_dir:
+        # Tests that build the app with config=None (or without
+        # bridge_state_dir set) never touch the durable manager.
+        from pathlib import Path
+
+        state_path = Path(config.bridge_state_dir)
+        durable_manager = DurableJobManager(state_path)
+
+        def make_durable_manager() -> DurableJobManager:
+            return DurableJobManager(state_path)
+
+        durable_factory = make_durable_manager
     # else: ``executor`` is whatever the caller supplied (or None).
 
     app = FastAPI(
@@ -627,4 +650,17 @@ def create_bridge_app(
     install_security_headers(app)
     _configure_cors(app, config)
     _register_routes(app, manager, token, executor)
+
+    if durable_factory is not None and config is not None:
+        register_writeback_routes(
+            app,
+            manager_factory=durable_factory,
+            token=token or None,
+        )
+
+        @app.on_event("shutdown")
+        def _close_durable() -> None:  # pragma: no cover (FastAPI lifespan)
+            if durable_manager is not None:
+                durable_manager.close()
+
     return app
