@@ -20,6 +20,7 @@ If unset, auth is disabled (dev mode only).
 from __future__ import annotations
 
 import hmac
+import logging
 import os
 import uuid
 from collections.abc import Callable
@@ -37,6 +38,8 @@ from .executor import BridgeExecutor
 from .jobs import DuplicateJobError, Job, JobManager
 from .security_headers import install_security_headers
 from .vm_agent_client import VmAgentClient
+
+logger = logging.getLogger(__name__)
 
 # --- Pydantic models ---
 
@@ -514,6 +517,52 @@ def _build_retry_writeback_response(
     )
 
 
+def _submit_job_to_both_ledgers(
+    in_memory: JobManager,
+    durable: Any | None,
+    payload: dict[str, Any],
+) -> Any:
+    """Submit a job to both the in-memory and durable ledgers.
+
+    The durable insert runs first (so the in-memory worker cannot
+    dequeue + start physical execution before the durable row is
+    committed) and the in-memory ``submit_job`` follows. If the
+    in-memory submission raises ``DuplicateJobError``, the durable
+    row is deleted (compensating action — re-review round 4
+    blocker #1) so the recovery bundle does not show an orphan.
+    """
+    pre_job_id = f"job-{uuid.uuid4().hex[:16]}"
+    if durable is not None:
+        durable.submit_job(
+            job_id=pre_job_id,
+            title=payload.get("title", "Untitled"),
+            execution_mode=payload.get("execution_mode", "existing_protocol"),
+            protocol_name=payload.get("protocol_name", ""),
+            protocol_id=payload.get("protocol_id", 0),
+            elabftw_experiment_id=payload.get("elabftw_experiment_id", 0),
+            wells_spec=payload.get("wells_spec", {}),
+        )
+    try:
+        return in_memory.submit_job(payload, job_id=pre_job_id)
+    except DuplicateJobError as exc:
+        if durable is not None:
+            try:
+                durable.delete_orphan(pre_job_id)
+            except Exception:
+                logger.exception("failed to delete orphan durable row %s", pre_job_id)
+        existing = in_memory.get_job(exc.existing_job_id)
+        detail: dict[str, Any] = {
+            "message": "Duplicate job",
+            "existing_job_id": exc.existing_job_id,
+        }
+        if existing is not None:
+            detail.update(
+                message="A job with the same spec is already active",
+                existing_status=existing.status,
+            )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail) from exc
+
+
 def _register_routes(
     app: FastAPI,
     manager: JobManager,
@@ -539,44 +588,7 @@ def _register_routes(
         # the executor / vm-agent.
         payload = req.model_dump()
         payload["wells_spec"] = req.wells_spec.to_slim_dict()
-        # Issue #44 (re-review blocker #2): the durable record must
-        # be inserted BEFORE the in-memory submission so the
-        # in-memory worker thread cannot start physical execution
-        # against a job that has no durable row. The in-memory
-        # ``submit_job`` appends the job to the execution queue
-        # synchronously, and the worker thread polls the queue on
-        # the next tick — that tick happens after both inserts
-        # have committed (the request handler is single-threaded
-        # for the in-memory manager). The durable insert is
-        # synchronous on SQLite (no commit ordering hazard).
-        #
-        # Pre-generate the job id so both ledgers agree on it.
-        pre_job_id = f"job-{uuid.uuid4().hex[:16]}"
-        if durable_manager is not None:
-            durable_manager.submit_job(
-                job_id=pre_job_id,
-                title=payload.get("title", "Untitled"),
-                execution_mode=payload.get("execution_mode", "existing_protocol"),
-                protocol_name=payload.get("protocol_name", ""),
-                protocol_id=payload.get("protocol_id", 0),
-                elabftw_experiment_id=payload.get("elabftw_experiment_id", 0),
-                wells_spec=payload.get("wells_spec", {}),
-            )
-        try:
-            job = manager.submit_job(payload, job_id=pre_job_id)
-        except DuplicateJobError as e:
-            existing = manager.get_job(e.existing_job_id)
-            detail: dict[str, Any] = {
-                "message": "Duplicate job",
-                "existing_job_id": e.existing_job_id,
-            }
-            if existing is not None:
-                detail.update(
-                    message="A job with the same spec is already active",
-                    existing_status=existing.status,
-                )
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail) from e
-        return _job_to_response(job)
+        return _job_to_response(_submit_job_to_both_ledgers(manager, durable_manager, payload))
 
     @app.get("/jobs", response_model=list[JobResponse])
     def list_jobs(authorization: str | None = Header(default=None)) -> list[JobResponse]:

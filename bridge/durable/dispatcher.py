@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from bridge.durable.planner import merge_results_section
 from bridge.durable.retry import classify_status
+from bridge.durable.schema import transaction
 from bridge.durable.worker import (
     RetryAction,
     StepLedger,
@@ -140,6 +141,8 @@ class _ElabftwLike(Protocol):
         *,
         metadata: dict[str, str] | None = None,
     ) -> dict[str, Any]: ...
+
+    def get_experiment_uploads(self, experiment_id: int) -> list[dict[str, Any]]: ...
 
 
 if TYPE_CHECKING:
@@ -271,7 +274,25 @@ class WritebackDispatcher:
         try:
             exp_id = self.elabftw.create_experiment(title, body)
         except BaseException as exc:
-            self._record_transport_outcome(action, exc, "create_experiment")
+            outcome = self._record_transport_outcome(action, exc, "create_experiment")
+            # Re-review round 4 blocker #2b: when ``create_experiment``
+            # fails permanently, the dependent steps
+            # (upload_raw, upload_analyzed, patch_body) keep
+            # deferring because exp_id stays 0. Cascade-pause
+            # them so the worker stops re-trying and
+            # ``_maybe_finish`` can fire ``on_job_stuck``.
+            if outcome == "permanent":
+                self._cascade_pause_dependents(
+                    action.job_id,
+                    reason="create_experiment permanently failed",
+                )
+            # Re-review round 4 blocker #2a: a permanent
+            # ``create_experiment`` failure leaves the dependent
+            # steps with exp_id=0 forever. ``_maybe_finish`` does
+            # not help yet (dependent steps are still ``pending``)
+            # but it IS the right hook point for the cascade-pause
+            # path in blocker #2b.
+            self._maybe_finish(action.job_id)
             return
         self.manager.update_experiment_id(job.job_id, exp_id)
         record_step_outcome(
@@ -311,6 +332,45 @@ class WritebackDispatcher:
             self._maybe_finish(action.job_id)
             return
         data = Path(artifact.path).read_bytes()
+        # Re-review round 4 blocker #3: before re-uploading, check
+        # the remote eLabFTW for an existing upload with the same
+        # idempotency token in metadata. This catches the
+        # ambiguous-success window (remote upload succeeded but the
+        # local ``uploaded=1`` flag was lost on crash / network
+        # blip). When found, repair the local flag and skip — the
+        # remote already has the bytes.
+        if action.idempotency:
+            try:
+                remote_uploads = self.elabftw.get_experiment_uploads(exp_id)
+            except _TRANSIENT_EXC as exc:
+                # Listing the uploads also failed (network / TLS).
+                # Fall through to the actual upload attempt; the
+                # transport-failure classification handles retries
+                # exactly as it does for the upload itself.
+                logger.warning("could not list remote uploads for exp %s: %r", exp_id, exc)
+            else:
+                if any(
+                    (u.get("metadata") or {}).get("wallac.bridge.idempotency") == action.idempotency
+                    for u in remote_uploads
+                ):
+                    logger.info(
+                        "skip %s for job %s: remote already has upload with idempotency %s",
+                        action.action,
+                        action.job_id,
+                        action.idempotency,
+                    )
+                    self.manager.mark_artifact_uploaded(job.job_id, artifact.sha256)
+                    record_step_outcome(
+                        self._ledger,
+                        step_id=action.step_id,
+                        http_status=200,
+                        detail=(
+                            f"{kind} already on remote (idempotency={action.idempotency[:24]})"
+                        ),
+                    )
+                    self._after_step(action.job_id, action.action, str(exp_id))
+                    self._maybe_finish(action.job_id)
+                    return
         # ``elabftw.upload_experiment_file`` raises ``HTTPError`` for
         # non-2xx responses, and ``URLError``/``OSError``/``socket.timeout``
         # for transport-level failures. Catch the full transient set,
@@ -330,6 +390,7 @@ class WritebackDispatcher:
             )
         except BaseException as exc:
             self._record_transport_outcome(action, exc, f"{kind} upload")
+            self._maybe_finish(action.job_id)
             return
         self.manager.mark_artifact_uploaded(job.job_id, artifact.sha256)
         record_step_outcome(
@@ -356,6 +417,7 @@ class WritebackDispatcher:
                 existing = self.elabftw.get_experiment(exp_id)
             except BaseException as exc:
                 self._record_transport_outcome(action, exc, "get_experiment")
+                self._maybe_finish(action.job_id)
                 return
             existing_body = existing.get("body") or ""
             merged = merge_results_section(existing_body, section_html, job_id=job.job_id)
@@ -363,6 +425,7 @@ class WritebackDispatcher:
                 self.elabftw.patch_experiment(exp_id, {"body": merged})
             except BaseException as exc:
                 self._record_transport_outcome(action, exc, "patch_experiment")
+                self._maybe_finish(action.job_id)
                 return
         record_step_outcome(
             self._ledger,
@@ -375,9 +438,17 @@ class WritebackDispatcher:
 
     # --- hooks ----------------------------------------------------------
 
-    def _record_transport_outcome(self, action: RetryAction, exc: BaseException, what: str) -> None:
+    def _record_transport_outcome(self, action: RetryAction, exc: BaseException, what: str) -> str:
         """Classify any exception raised by an eLabFTW call and record
         the outcome through the normal ledger path.
+
+        Returns:
+            The outcome string (``"transient"``, ``"permanent"``,
+            or ``"success"``) so the caller can react — e.g. the
+            ``create_experiment`` permanent path cascades a pause
+            to its dependent steps (re-review round 4 blocker #2b).
+
+        Classification rules:
 
         * ``HTTPError`` (with a status code) → ``classify_status`` →
           transient or permanent based on the code.
@@ -430,10 +501,36 @@ class WritebackDispatcher:
                 status,
                 detail,
             )
-            return
+            return outcome
         # Unknown exception type — let the worker treat it as a
         # permanent dispatcher bug.
         raise exc
+
+    def _cascade_pause_dependents(self, job_id: str, *, reason: str) -> None:
+        """Mark every still-pending dependent step of ``job_id`` paused.
+
+        Re-review round 4 blocker #2b: when ``create_experiment`` is
+        permanently failed, the dependent steps
+        (``upload_raw``, ``upload_analyzed``, ``patch_body``) keep
+        re-trying forever because their prerequisite (the
+        experiment id) never materialises. This helper is the
+        cascade: pause every step whose action is in
+        ``_PREREQUISITE_ACTIONS`` and whose status is still
+        ``pending``. The next ``_maybe_finish`` call then sees
+        ``no pending + at least one paused`` and fires
+        ``on_job_stuck`` so the operator can intervene.
+        """
+        # ``_PREREQUISITE_ACTIONS`` is a fixed set of literal
+        # action names — not user input — so the f-string is safe.
+        # See S608.
+        actions_sql = ",".join("?" for _ in _PREREQUISITE_ACTIONS)
+        with transaction(self.manager.conn):
+            self.manager.conn.execute(
+                f"UPDATE writeback_steps SET status = 'paused', "  # noqa: S608
+                f"detail = ? WHERE job_id = ? AND action IN ({actions_sql}) "
+                f"AND status = 'pending'",
+                (f"cascaded: {reason}", job_id, *_PREREQUISITE_ACTIONS),
+            )
 
     def _after_step(self, job_id: str, action: str, exp_id: str) -> None:
         if self._on_step_complete is not None:

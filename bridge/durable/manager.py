@@ -308,6 +308,25 @@ class JobManager:
                 (exp_id, job_id),
             )
 
+    def delete_orphan(self, job_id: str) -> None:
+        """Remove a durable row whose corresponding in-memory job
+        was never created (rejected by dedup).
+
+        Re-review round 4 blocker #1: ``POST /jobs`` now inserts
+        the durable row before the in-memory submit_job (so the
+        in-memory worker cannot dequeue + start physical execution
+        before the durable row is committed). If the in-memory
+        ``submit_job`` raises ``DuplicateJobError`` the durable row
+        is an orphan — a row that has no in-memory counterpart and
+        would show up in the recovery bundle forever. This helper
+        is the compensating delete called by the route on the
+        duplicate path. ON DELETE CASCADE on the FKs cleans up
+        the dependent events / artifacts / writeback_steps /
+        writeback_attempts rows.
+        """
+        with transaction(self.conn):
+            self.conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+
     def mark_artifact_uploaded(self, job_id: str, sha256: str) -> None:
         with transaction(self.conn):
             self.conn.execute(

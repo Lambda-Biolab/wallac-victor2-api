@@ -387,6 +387,35 @@ class ElabftwClient:
         """
         return self._request("GET", f"/experiments/{experiment_id}")
 
+    def get_experiment_uploads(self, experiment_id: int) -> list[dict[str, Any]]:
+        """Return the list of uploads for ``experiment_id``.
+
+        Re-review round 4 blocker #3: the durable dispatcher uses
+        this to reconcile the ambiguous-success window where the
+        remote ``upload_experiment_file`` succeeded but the local
+        ``uploaded=1`` flag was lost (process crash, network blip
+        between the remote response and the local SQLite write).
+        Before re-uploading, the dispatcher lists the experiment's
+        uploads and checks the ``metadata.wallac.bridge.idempotency``
+        field for a match. If found, the local flag is repaired and
+        the upload is skipped (the remote already has it).
+
+        Returns:
+            A list of upload dicts, each with at least ``id``,
+            ``real_name``, and (when present) ``metadata``. The
+            exact schema is the eLabFTW v5 uploads array; the
+            dispatcher is defensive about missing fields.
+        """
+        result = self._request("GET", f"/experiments/{experiment_id}/uploads")
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            # Some eLabFTW versions wrap the array under a key.
+            for key in ("uploads", "items", "data"):
+                if key in result and isinstance(result[key], list):
+                    return result[key]
+        return []
+
     def upload_experiment_file(
         self,
         experiment_id: int,

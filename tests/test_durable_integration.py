@@ -274,6 +274,11 @@ def test_max_attempts_pauses_step_instead_of_looping_forever(
                 fp=None,
             )
 
+        def get_experiment_uploads(  # type: ignore[override]
+            self, exp_id: int
+        ) -> list[dict[str, Any]]:
+            return []
+
     elabftw = Transient503Elabftw()
     vm_agent = MockVmAgentClient()
     executor = _build_executor(elabftw, vm_agent, durable=durable_manager)
@@ -1024,3 +1029,200 @@ def test_idempotency_token_passed_to_elabftw_upload(
     assert "wallac.bridge.idempotency" in elabftw._last_metadata
     # The token is the step's ``idempotency`` column from SQLite.
     assert elabftw._last_metadata["wallac.bridge.idempotency"].startswith(f"{job.job_id}:upload_")
+
+
+# --- Re-review round 4 ---------------------------------------------------
+
+
+def test_post_jobs_duplicate_does_not_leave_orphan_durable(
+    durable_manager: JobManager,
+) -> None:
+    """A duplicate POST /jobs (same dedup key) must not leave a
+    durable row behind.
+
+    Re-review round 4 blocker #1: the durable insert runs first
+    (so the in-memory worker cannot start before the durable row
+    is committed). If the in-memory ``submit_job`` then raises
+    ``DuplicateJobError``, the durable row is an orphan — a row
+    that has no in-memory counterpart and would show up in the
+    recovery bundle forever. The compensating delete
+    (``durable.delete_orphan(pre_job_id)``) on the duplicate
+    path handles this.
+    """
+    from fastapi.testclient import TestClient
+
+    from bridge.bridge_app import create_bridge_app
+    from bridge.config import BridgeConfig
+
+    config = BridgeConfig(
+        elabftw_url="https://localhost:3148",
+        elabftw_api_key="5-key",
+        elabftw_verify_tls=False,
+        elabftw_ca_bundle=None,
+        wallac_env="dev",
+        vm_agent_url="http://127.0.0.1:8420",
+        vm_agent_token="",
+        dry_run=False,
+        bridge_state_dir=str(durable_manager.state_dir),
+    )
+    app = create_bridge_app(config=config)
+    client = TestClient(app)
+    client.headers["Authorization"] = "Bearer "
+    spec = {
+        "title": "duplicate /jobs",
+        "execution_mode": "existing_protocol",
+        "protocol_name": "Absorbance @ 610 (1.0s)",
+        "protocol_id": 2000008,
+        "wells_spec": {"wells": ["A1", "A2"]},
+    }
+    first = client.post("/jobs", json=spec)
+    assert first.status_code == 201, first.text
+    # Same spec → DuplicateJobError → 409.
+    second = client.post("/jobs", json=spec)
+    assert second.status_code == 409, second.text
+    # The durable ledger has exactly one row (the first one).
+    rows = list(durable_manager.conn.execute("SELECT job_id FROM jobs").fetchall())
+    assert len(rows) == 1, (
+        f"durable ledger should have one row (the first job_id); "
+        f"got {len(rows)} — orphan rows from the duplicate path?"
+    )
+
+
+def test_permanent_create_experiment_cascades_pause_and_fires_stuck(
+    durable_manager: JobManager,
+) -> None:
+    """A permanent ``create_experiment`` failure cascade-pauses
+    the dependent steps and fires ``on_job_stuck``.
+
+    Re-review round 4 blockers #2a and #2b: previously a
+    permanent ``create_experiment`` failure left the dependent
+    steps with ``exp_id=0`` forever. The dispatcher's exception
+    handler recorded the create_experiment step as paused, but
+    the dependent steps kept deferring (the worker re-picked
+    them up, the dispatcher raised ``_PrerequisiteNotMet``, the
+    worker deferred them again — infinite loop). The
+    ``_maybe_finish`` hook could never fire ``on_job_stuck``
+    because the dependent steps were still ``pending``.
+
+    The fix: when ``create_experiment`` is permanently failed,
+    cascade-pause every dependent step in
+    ``_PREREQUISITE_ACTIONS`` whose status is still
+    ``pending``. ``_maybe_finish`` then sees
+    ``no pending + at least one paused`` and fires the hook.
+    """
+    import urllib.error
+
+    class PermanentCreate(MockElabftwClient):
+        def create_experiment(  # type: ignore[override]
+            self, title: str, body: str = ""
+        ) -> int:
+            # 410 Gone is permanent per the policy.
+            raise urllib.error.HTTPError(
+                url="http://elabftw/experiments",
+                code=410,
+                msg="Gone",
+                hdrs={},  # type: ignore[arg-type]
+                fp=None,
+            )
+
+    elabftw = PermanentCreate()
+    vm_agent = MockVmAgentClient()
+    executor = _build_executor(elabftw, vm_agent, durable=durable_manager)
+    job = _make_job("job-e2e-cascade")
+    _durable_record_for(durable_manager, job)
+    executor._durable_writeback(job, CANNED_WELLS, "well,value\nA1,0.078\n")
+
+    stuck: list[tuple[str, list[str]]] = []
+
+    def _on_stuck(job_id: str, paused_actions: list[str]) -> None:
+        stuck.append((job_id, list(paused_actions)))
+
+    dispatcher = WritebackDispatcher(durable_manager, elabftw, on_job_stuck=_on_stuck)
+    worker = WritebackWorker(
+        durable_manager.conn,
+        on_step=dispatcher.dispatch,
+        interval_seconds=0.0,
+    )
+    worker.run_once()
+
+    rows = list(
+        durable_manager.conn.execute(
+            "SELECT step_id, action, status FROM writeback_steps WHERE job_id = ? ORDER BY step_id",
+            (job.job_id,),
+        )
+    )
+    create = next(r for r in rows if r["action"] == "create_experiment")
+    assert create["status"] == "paused", create
+    for action in ("upload_raw", "upload_analyzed", "patch_body"):
+        step = next(r for r in rows if r["action"] == action)
+        assert step["status"] == "paused", (
+            f"{action} should be cascaded to paused, got {step['status']!r}"
+        )
+    assert len(stuck) == 1
+    assert stuck[0][0] == job.job_id
+    assert set(stuck[0][1]) >= {
+        "create_experiment",
+        "upload_raw",
+        "upload_analyzed",
+        "patch_body",
+    }
+
+
+def test_dispatcher_skips_upload_when_remote_has_matching_idempotency(
+    durable_manager: JobManager,
+) -> None:
+    """Before re-uploading, the dispatcher checks the remote
+    eLabFTW for an existing upload with the same idempotency
+    token in metadata. If found, the local ``uploaded=1`` flag
+    is repaired and the upload is skipped (the remote already
+    has the bytes — re-uploading would create a duplicate).
+
+    Re-review round 4 blocker #3: the previous round put the
+    idempotency token on the wire (round 3 fix) but did NOT
+    reconcile the ambiguous-success window (remote upload
+    succeeded but local ``uploaded=1`` flag was lost). The new
+    ``get_experiment_uploads`` reconciliation pass closes that
+    gap.
+    """
+    elabftw = MockElabftwClient()
+    vm_agent = MockVmAgentClient()
+    executor = _build_executor(elabftw, vm_agent, durable=durable_manager)
+    job = _make_job("job-e2e-remote-idem")
+    _durable_record_for(durable_manager, job)
+    executor._durable_writeback(job, CANNED_WELLS, "well,value\nA1,0.078\n")
+    dispatcher = WritebackDispatcher(durable_manager, elabftw)
+    worker = WritebackWorker(
+        durable_manager.conn,
+        on_step=dispatcher.dispatch,
+        interval_seconds=0.0,
+    )
+    # First pass: dispatches all four stages; mock records the
+    # uploads with their idempotency metadata.
+    for _ in range(8):
+        worker.run_once()
+    assert elabftw._uploads, "expected at least one recorded upload"
+    # Pretend the local ``uploaded=1`` flag was lost on a
+    # process crash. Reset both flags in the durable ledger.
+    durable_manager.conn.execute("UPDATE artifacts SET uploaded = 0")
+    durable_manager.conn.execute(
+        "UPDATE writeback_steps SET status = 'pending', attempts = 0 "
+        "WHERE action IN ('upload_raw', 'upload_analyzed')"
+    )
+    # Re-run the worker. The dispatcher calls
+    # ``get_experiment_uploads``, finds the existing upload
+    # with the matching idempotency token, repairs the local
+    # flag, and skips. The mock should NOT receive a second
+    # upload for the same filename.
+    before = list(elabftw.uploaded_files)
+    for _ in range(8):
+        worker.run_once()
+    after = list(elabftw.uploaded_files)
+    assert after == before, (
+        f"dispatcher should have skipped the re-upload; before={before!r} after={after!r}"
+    )
+    for kind in ("raw", "analyzed"):
+        artifact = durable_manager.find_artifact(job.job_id, kind)
+        assert artifact is not None
+        assert artifact.uploaded, (
+            f"durable ledger should mark {kind} as uploaded after the remote-side idempotency check"
+        )
