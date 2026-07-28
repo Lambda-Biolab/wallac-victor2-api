@@ -134,8 +134,27 @@ class StepLedger:
                 )
                 return ("paused", None)
 
-            # transient: schedule next attempt
+            # transient: schedule next attempt — but if the attempt
+            # budget is exhausted, pause so the worker stops retrying
+            # forever. The operator can explicitly /retry from the
+            # recovery bundle to resume.
             backoff = Backoff()
+            if attempts >= backoff.max_attempts:
+                self.conn.execute(
+                    "UPDATE writeback_steps SET status = 'paused', "
+                    "attempts = ?, detail = ? WHERE step_id = ?",
+                    (
+                        attempts,
+                        f"{detail}; attempt budget exhausted ({attempts}/{backoff.max_attempts})",
+                        step_id,
+                    ),
+                )
+                logger.warning(
+                    "step %s paused after %d attempts (budget exhausted)",
+                    step_id,
+                    attempts,
+                )
+                return ("paused", None)
             wait = backoff.wait_seconds(attempts - 1)
             self.conn.execute(
                 "UPDATE writeback_steps SET status = 'pending', "
@@ -249,14 +268,24 @@ class WritebackWorker:
             try:
                 self._on_step(action)
                 dispatched += 1
-            except Exception:
-                # The step stays ``pending`` in the ledger and the next
-                # tick re-attempts. Log so operators can diagnose
-                # persistent dispatch failures.
-                logger.exception(
-                    "writeback dispatch failed for step_id=%s job_id=%s",
+            except Exception as exc:
+                # A dispatcher exception is a bug, not a transient
+                # network failure. Mark the step as a permanent
+                # dispatcher failure so the next tick does not
+                # re-attempt it every ``interval_seconds`` (the
+                # previous behaviour looped the same exception
+                # indefinitely, hiding the bug from operators). The
+                # operator can /retry from the recovery bundle once
+                # the underlying bug is fixed.
+                self.ledger.record_outcome(
                     action.step_id,
-                    action.job_id,
+                    outcome="permanent",
+                    http_status=None,
+                    detail=f"dispatcher raised: {exc!r}",
+                )
+                logger.exception(
+                    "writeback dispatch raised; step %s paused",
+                    action.step_id,
                 )
         return dispatched
 

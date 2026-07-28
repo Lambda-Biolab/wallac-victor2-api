@@ -39,6 +39,16 @@ def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f%z")
 
 
+def now_iso() -> str:
+    """Public ISO-8601 timestamp helper.
+
+    Exposed for callers (e.g. ``bridge_app.create_bridge_app``) that
+    need the same clock as the manager without poking at the
+    private ``_now_iso``.
+    """
+    return _now_iso()
+
+
 @dataclass
 class Artifact:
     kind: str  # raw | analyzed | meta
@@ -250,6 +260,40 @@ class JobManager:
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (job_id, kind, path, sha256, 1 if uploaded else 0),
+            )
+
+    def find_artifact(self, job_id: str, kind: str) -> Artifact | None:
+        """Return the artifact for ``(job_id, kind)`` or ``None`` if missing.
+
+        Used by the worker's dispatcher to read the bytes that the
+        executor spooled to disk before enqueuing the writeback steps.
+        """
+        row = self.conn.execute(
+            "SELECT kind, path, sha256, uploaded FROM artifacts "
+            "WHERE job_id = ? AND kind = ? ORDER BY artifact_id LIMIT 1",
+            (job_id, kind),
+        ).fetchone()
+        if row is None:
+            return None
+        return Artifact(
+            kind=row["kind"],
+            path=row["path"],
+            sha256=row["sha256"],
+            uploaded=bool(row["uploaded"]),
+        )
+
+    def update_experiment_id(self, job_id: str, exp_id: int) -> None:
+        """Persist the eLabFTW experiment id assigned to ``job_id``.
+
+        The executor's ``create_experiment`` step runs in the writeback
+        worker (async). When it succeeds, the dispatcher calls this so
+        subsequent steps (``upload_raw``, ``patch_body``) can resolve
+        the experiment id without re-deriving it.
+        """
+        with transaction(self.conn):
+            self.conn.execute(
+                "UPDATE jobs SET elabftw_experiment_id = ? WHERE job_id = ?",
+                (exp_id, job_id),
             )
 
     def mark_artifact_uploaded(self, job_id: str, sha256: str) -> None:

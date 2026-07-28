@@ -405,11 +405,23 @@ class BridgeExecutor:
         vm_agent: VmAgentClient,
         elabftw: ElabftwClient,
         dry_run: bool = False,
+        *,
+        durable_manager: Any | None = None,
+        durable_ledger: Any | None = None,
     ) -> None:
         self.vm_agent = vm_agent
         self.elabftw = elabftw
         self.dry_run = dry_run
         self.analysis = AnalysisPipeline()
+        # Optional durable spool collaborators (issue #44). When both
+        # are set, ``_writeback`` spools artifacts to disk and enqueues
+        # four writeback steps in the durable ledger; the
+        # ``WritebackWorker`` (driven by ``WritebackDispatcher``) is
+        # the only path that actually talks to eLabFTW. When unset,
+        # the executor performs the four eLabFTW operations
+        # synchronously in-process — the original Stage 6/7 path.
+        self.durable_manager = durable_manager
+        self.durable_ledger = durable_ledger
         # Per-experiment writeback lock (review concern 2). The bridge
         # worker thread is already serialized (one job at a time), but
         # retry-writeback calls come in from the request thread and
@@ -1522,6 +1534,28 @@ class BridgeExecutor:
     def _writeback(self, job: Job, raw_wells: list[dict[str, Any]], analyzed_csv: str) -> bool:
         """Write results back to eLabFTW as an experiment.
 
+        When the executor was constructed with a ``durable_manager``
+        and ``durable_ledger`` (issue #44), this method takes the
+        *durable* branch: it spools raw/analyzed/body artifacts to
+        ``${STATE_DIR}/spool/<job_id>/``, records them in the durable
+        ledger, plans the four canonical writeback steps, and enqueues
+        them. The actual eLabFTW operations are then performed by the
+        ``WritebackWorker`` running in the background; on a restart
+        mid-writeback, the worker re-reads the durable ledger and
+        resumes from the next pending step. Returns ``True`` once the
+        durable handoff is complete (the eLabFTW side has NOT
+        necessarily finished yet — use ``/writeback/<job_id>`` to poll
+        progress).
+
+        When the durable collaborators are absent, the legacy
+        synchronous path runs: create-or-append the experiment, upload
+        raw, upload analyzed, and PATCH the merged body in one
+        function call. See slice 4 of
+        ``docs/plans/wallac-existing-protocol-writeback-repair.md``.
+
+        Two writeback shapes exist (slice 4 of
+        ``docs/plans/wallac-existing-protocol-writeback-repair.md``):
+
         Two writeback shapes exist (slice 4 of
         ``docs/plans/wallac-existing-protocol-writeback-repair.md``):
 
@@ -1549,6 +1583,18 @@ class BridgeExecutor:
             made every retry look successful because the
             ``elabftw_writeback_failed`` event never re-raised.
         """
+        # Durable branch (issue #44): when the executor was wired with
+        # a durable manager + ledger, the executor does NOT perform the
+        # eLabFTW operations itself. Instead it spools raw + analyzed +
+        # body to the durable spool directory, records the artifacts,
+        # plans the four canonical writeback stages, and enqueues them
+        # for the ``WritebackWorker`` to dispatch. The eLabFTW calls
+        # therefore survive a process restart: the worker re-reads the
+        # ledger on boot and resumes from the next pending step. See
+        # ``bridge/durable/dispatcher.py``.
+        if self.durable_manager is not None and self.durable_ledger is not None:
+            return self._durable_writeback(job, raw_wells, analyzed_csv)
+
         job.add_event("writeback_started", "")
 
         # Create or use existing experiment
@@ -1620,6 +1666,132 @@ class BridgeExecutor:
             job.add_event("elabftw_writeback_failed", str(e))
             logger.exception("Write-back failed for job %s", job.job_id)
             return False
+
+    # --- Durable writeback (issue #44) ----------------------------------
+
+    def _durable_writeback(
+        self,
+        job: Job,
+        raw_wells: list[dict[str, Any]],
+        analyzed_csv: str,
+    ) -> bool:
+        """Spool artifacts to disk and enqueue four writeback steps.
+
+        Called by :meth:`_writeback` when the executor was constructed
+        with a durable manager + ledger. Returns ``True`` once the
+        durable handoff is complete; the eLabFTW operations are
+        performed by the background ``WritebackWorker`` (see
+        ``bridge/durable/dispatcher.py``).
+
+        The body HTML is the same as the legacy path: bracketed by
+        the per-job sentinel markers, contains the heatmap + results
+        table, and is what the worker will PATCH back into the
+        experiment after merging with the existing body.
+
+        On disk the spool layout is::
+
+            ${STATE_DIR}/spool/<job_id>/raw.json
+            ${STATE_DIR}/spool/<job_id>/analyzed.csv
+            ${STATE_DIR}/spool/<job_id>/body.html
+
+        Each file is recorded as an :class:`Artifact` in the durable
+        ledger so the worker can resolve it by ``(job_id, kind)``.
+        """
+        from bridge.durable.idempotency import sha256_hex
+        from bridge.durable.planner import plan_writeback
+        from bridge.durable.worker import PendingStep as _PendingStep
+
+        manager = self.durable_manager
+        ledger = self.durable_ledger
+        if manager is None or ledger is None:  # pragma: no cover (defensive)
+            raise RuntimeError("durable_writeback called without collaborators")
+
+        # Sanity: the durable record must exist by the time we get
+        # here. ``submit_job`` is called from the request thread when
+        # the job enters the in-memory queue; if it's missing, the
+        # in-memory and durable paths are out of sync.
+        durable_job = manager.get_job(job.job_id)
+        if durable_job is None:
+            job.add_event(
+                "durable_writeback_failed",
+                f"no durable record for job {job.job_id!r}",
+            )
+            logger.error("Durable record missing for job %s", job.job_id)
+            return False
+
+        job.add_event("writeback_started", "durable handoff; spooling artifacts")
+
+        spool_dir = manager.state_dir / "spool" / job.job_id
+        spool_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Spool raw.json
+        raw_path = spool_dir / "raw.json"
+        raw_bytes = json.dumps(raw_wells, indent=2, default=str).encode()
+        raw_path.write_bytes(raw_bytes)
+        manager.record_artifact(job.job_id, "raw", str(raw_path), sha256_hex(raw_bytes))
+        job.artifacts.append({"name": "raw_results.json", "type": "raw", "uploaded": False})
+
+        # 2. Spool analyzed.csv (may be empty if the requested
+        #    analysis failed; the worker still records the upload step
+        #    as a no-op so the durable ledger reflects the full plan).
+        analyzed_path = spool_dir / "analyzed.csv"
+        analyzed_bytes = analyzed_csv.encode() if analyzed_csv else b""
+        analyzed_path.write_bytes(analyzed_bytes)
+        manager.record_artifact(
+            job.job_id,
+            "analyzed",
+            str(analyzed_path),
+            sha256_hex(analyzed_bytes),
+        )
+        if analyzed_bytes:
+            job.artifacts.append({"name": "analyzed.csv", "type": "analyzed", "uploaded": False})
+
+        # 3. Build + spool the body HTML (brackets + heatmap + table).
+        body_html = self._build_results_section(job, raw_wells)
+        body_path = spool_dir / "body.html"
+        body_path.write_text(body_html, encoding="utf-8")
+        manager.record_artifact(job.job_id, "body", str(body_path), sha256_hex(body_html.encode()))
+
+        # 4. Plan and enqueue the four canonical writeback steps.
+        #    The ``body_html`` we pass to the planner is the *raw*
+        #    section (no experiment body) — the dispatcher's
+        #    ``patch_body`` handler performs the GET-merge-PATCH cycle
+        #    at dispatch time so a concurrent write to the same
+        #    experiment cannot be clobbered.
+        try:
+            stages = plan_writeback(
+                job_id=job.job_id,
+                elabftw_experiment_id=job.elabftw_experiment_id,
+                raw_bytes=raw_bytes,
+                analyzed_bytes=analyzed_bytes or None,
+                body_html=body_html,
+                metadata_keys={"wallac.bridge.job_id": job.job_id},
+            )
+        except Exception as exc:  # pragma: no cover (defensive)
+            job.add_event("durable_writeback_failed", f"plan_writeback raised: {exc!r}")
+            logger.exception("plan_writeback failed for job %s", job.job_id)
+            return False
+        pending = [
+            _PendingStep(
+                step_id=s.step_id,
+                job_id=s.job_id,
+                action=s.action,
+                idempotency=s.idempotency,
+            )
+            for s in stages
+        ]
+        ledger.enqueue(pending)
+        manager.mark_status(job.job_id, "writeback_pending")
+        manager.record_event(
+            job.job_id,
+            "durable_writeback_enqueued",
+            f"steps={[s.action for s in stages]}",
+        )
+        job.add_event(
+            "durable_writeback_enqueued",
+            f"steps={[s.action for s in stages]}",
+        )
+        return True
 
     def retry_writeback(self, job: Job) -> bool:
         """Re-run writeback for a job whose hardware run already completed.

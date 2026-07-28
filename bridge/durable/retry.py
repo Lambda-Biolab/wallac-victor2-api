@@ -14,7 +14,7 @@ Permanent-failure classes (issue #44 §"Retry policy"):
 
 TLS verification must never be disabled by retry logic; this helper
 takes a permanent-failure tag explicitly so the call site can flag
-auth/TLS errors as permanent.
+auth/TLS / CA / schema errors as permanent.
 """
 
 from __future__ import annotations
@@ -50,14 +50,29 @@ class Backoff:
         return random.uniform(0.0, upper)  # noqa: S311
 
 
-def classify_status(http_status: int | None, *, tls_error: bool = False) -> str:
+# Error kinds the call site can pass to mark a step permanent
+# without having to map every failure mode to an HTTP status. See
+# ``classify_status`` / issue #44.
+PERMANENT_ERROR_KINDS = frozenset({"tls", "ca_bundle", "auth", "schema", "payload"})
+
+
+def classify_status(
+    http_status: int | None,
+    *,
+    tls_error: bool = False,
+    error_kind: str | None = None,
+) -> str:
     """Return ``transient``, ``permanent``, or ``success`` for a writeback step.
 
     ``tls_error`` overrides the status check so callers that catch a
     TLS error before they ever get an HTTP response still mark the
-    step permanent (per issue #44).
+    step permanent (per issue #44). ``error_kind`` is the structured
+    classification: ``"tls"``, ``"ca_bundle"``, ``"auth"``,
+    ``"schema"``, ``"payload"`` always mean permanent regardless of
+    HTTP status (the eLabFTW server may return a generic 4xx for any
+    of them).
     """
-    if tls_error:
+    if tls_error or (error_kind and error_kind in PERMANENT_ERROR_KINDS):
         return "permanent"
     if http_status is None:
         return "transient"

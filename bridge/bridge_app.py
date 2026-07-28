@@ -310,8 +310,28 @@ def _bridge_token(config: BridgeConfig | None) -> str:
     return token
 
 
-def _wire_executor(config: BridgeConfig, job_manager: JobManager) -> BridgeExecutor:
-    """Connect the job manager to configured adapters and return the executor."""
+def _wire_executor(
+    config: BridgeConfig,
+    job_manager: JobManager,
+    *,
+    durable_manager: Any | None = None,
+    durable_ledger: Any | None = None,
+) -> tuple[BridgeExecutor, ElabftwClient]:
+    """Connect the job manager to configured adapters and return them.
+
+    When ``durable_manager`` and ``durable_ledger`` are supplied, the
+    executor takes the durable writeback path (issue #44): it spools
+    raw/analyzed/body artifacts to ``${STATE_DIR}/spool/<job_id>/``
+    and enqueues the four canonical writeback steps. The actual
+    eLabFTW operations are then performed by the ``WritebackWorker``
+    driven by the ``WritebackDispatcher`` (constructed in
+    ``create_bridge_app`` after this returns).
+
+    The returned :class:`ElabftwClient` is the same instance the
+    executor uses so the dispatcher and the executor share a single
+    HTTP client (and any per-instance state — connection pool, retry
+    config).
+    """
     vm_agent = VmAgentClient(base_url=config.vm_agent_url, token=config.vm_agent_token)
     elabftw = ElabftwClient(
         base_url=config.elabftw_url,
@@ -319,10 +339,16 @@ def _wire_executor(config: BridgeConfig, job_manager: JobManager) -> BridgeExecu
         verify_tls=config.elabftw_verify_tls,
         ca_bundle=config.elabftw_ca_bundle,
     )
-    executor = BridgeExecutor(vm_agent=vm_agent, elabftw=elabftw, dry_run=config.dry_run)
+    executor = BridgeExecutor(
+        vm_agent=vm_agent,
+        elabftw=elabftw,
+        dry_run=config.dry_run,
+        durable_manager=durable_manager,
+        durable_ledger=durable_ledger,
+    )
     job_manager.set_executor(executor)
     job_manager.start_worker()
-    return executor
+    return executor, elabftw
 
 
 def _configure_cors(app: FastAPI, config: BridgeConfig | None) -> None:
@@ -595,6 +621,59 @@ def _register_routes(
         return _build_retry_writeback_response(job_id, job, success=True)
 
 
+def _start_durable_worker(
+    in_memory_manager: JobManager,
+    durable_manager: Any,
+    elabftw: Any,
+) -> Any:
+    """Build + start the durable ``WritebackWorker`` and return it.
+
+    Mirrors the dispatcher's eLabFTW operations to the in-memory
+    ``Job`` so legacy event observers (``writeback_completed``,
+    ``execution_completed``) fire the same way they do on the
+    synchronous path. Returns the running ``WritebackWorker``;
+    callers are responsible for stopping it on app shutdown.
+    """
+    from bridge.durable.dispatcher import WritebackDispatcher
+    from bridge.durable.manager import now_iso as _now
+    from bridge.durable.worker import WritebackWorker
+
+    def _on_step_complete(job_id: str, action: str, exp_id: str) -> None:
+        mem_job = in_memory_manager.get_job(job_id)
+        if mem_job is None:
+            return
+        if action == "create_experiment" and mem_job.elabftw_experiment_id == 0:
+            mem_job.elabftw_experiment_id = int(exp_id)
+            mem_job.add_event("experiment_created", exp_id)
+        elif action == "upload_raw":
+            mem_job.add_event("raw_results_uploaded", "")
+        elif action == "upload_analyzed":
+            mem_job.add_event("analyzed_results_uploaded", "")
+
+    def _on_all_steps_done(job_id: str) -> None:
+        mem_job = in_memory_manager.get_job(job_id)
+        if mem_job is not None and mem_job.status not in ("failed", "aborted"):
+            mem_job.status = "completed"
+            mem_job.add_event("writeback_completed", "durable")
+            mem_job.add_event("execution_completed", "")
+        durable_manager.mark_status(job_id, "completed", completed_at=_now())
+        durable_manager.record_event(job_id, "writeback_completed", "all 4 stages done")
+
+    dispatcher = WritebackDispatcher(
+        durable_manager,
+        elabftw,
+        on_step_complete=_on_step_complete,
+        on_all_steps_done=_on_all_steps_done,
+    )
+    worker = WritebackWorker(
+        durable_manager.conn,
+        on_step=dispatcher.dispatch,
+        interval_seconds=15.0,
+    )
+    worker.start()
+    return worker
+
+
 # --- App factory ---
 
 
@@ -622,24 +701,48 @@ def create_bridge_app(
         config = BridgeConfig.from_env()
     manager = job_manager or JobManager()
     token = _bridge_token(config)
-    if config is not None:
-        executor = _wire_executor(config, manager)
 
+    # Open the durable ledger first so the executor can be wired with
+    # the manager + step ledger (issue #44). The factory captured below
+    # is also used by ``register_writeback_routes`` to mint a fresh
+    # per-request manager (each route handler opens and closes its
+    # own connection; the request thread does not share the worker's
+    # connection to keep WAL contention out of the request hot path).
     durable_manager: DurableJobManager | None = None
+    durable_ledger: Any | None = None
     durable_factory: Callable[[], DurableJobManager] | None = None
     if config is not None and config.bridge_state_dir:
-        # Tests that build the app with config=None (or without
-        # bridge_state_dir set) never touch the durable manager.
         from pathlib import Path
+
+        from bridge.durable.worker import StepLedger as _StepLedger
 
         state_path = Path(config.bridge_state_dir)
         durable_manager = DurableJobManager(state_path)
+        durable_ledger = _StepLedger(durable_manager.conn)
 
         def make_durable_manager() -> DurableJobManager:
             return DurableJobManager(state_path)
 
         durable_factory = make_durable_manager
-    # else: ``executor`` is whatever the caller supplied (or None).
+
+    bridge_executor: BridgeExecutor | None = executor
+    elabftw_client: ElabftwClient | None = None
+    if config is not None:
+        bridge_executor, elabftw_client = _wire_executor(
+            config,
+            manager,
+            durable_manager=durable_manager,
+            durable_ledger=durable_ledger,
+        )
+
+    # Start the durable writeback worker (issue #44) when configured.
+    # The worker reads pending steps from the durable ledger and calls
+    # the dispatcher's eLabFTW operations. Idempotency tokens +
+    # per-artifact ``uploaded`` flag make every dispatch safely
+    # retryable across a process restart.
+    durable_worker: Any | None = None
+    if durable_manager is not None and durable_ledger is not None and elabftw_client is not None:
+        durable_worker = _start_durable_worker(manager, durable_manager, elabftw_client)
 
     app = FastAPI(
         title="Wallac Victor2 Bridge",
@@ -649,7 +752,7 @@ def create_bridge_app(
 
     install_security_headers(app)
     _configure_cors(app, config)
-    _register_routes(app, manager, token, executor)
+    _register_routes(app, manager, token, bridge_executor)
 
     if durable_factory is not None and config is not None:
         register_writeback_routes(
@@ -660,6 +763,8 @@ def create_bridge_app(
 
         @app.on_event("shutdown")
         def _close_durable() -> None:  # pragma: no cover (FastAPI lifespan)
+            if durable_worker is not None:
+                durable_worker.stop()
             if durable_manager is not None:
                 durable_manager.close()
 
