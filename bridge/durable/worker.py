@@ -186,6 +186,26 @@ class StepLedger:
             )
         )
 
+    def defer_step(self, step_id: str, *, reason: str) -> None:
+        """Push ``next_attempt_at`` into the past without changing status.
+
+        Used by the worker when a dispatcher raises
+        :class:`_PrerequisiteNotMet`: the step stays ``pending`` so
+        the next tick re-picks it up, but ``attempts`` is NOT
+        incremented (deferral is not a retry) and the
+        ``next_attempt_at`` is set to one second in the past so
+        ``due_steps`` matches it on the very next tick.
+        """
+        with transaction(self.conn):
+            self.conn.execute(
+                "UPDATE writeback_steps SET next_attempt_at = ?, detail = ? WHERE step_id = ?",
+                (
+                    _in_future(-1.0),
+                    f"deferred: {reason}",
+                    step_id,
+                ),
+            )
+
 
 @dataclass(frozen=True)
 class PendingStep:
@@ -200,6 +220,17 @@ def _in_future(seconds: float) -> str:
 
     ts = datetime.now(UTC) + timedelta(seconds=seconds)
     return ts.strftime("%Y-%m-%dT%H:%M:%S.%f%z")
+
+
+class _PrerequisiteNotMet(Exception):
+    """Raised by a dispatcher step when its prerequisite is not done.
+
+    The worker catches this and defers the step (``pending``,
+    ``next_attempt_at`` in the past) so the next tick re-picks it
+    up after the prerequisite has completed. The canonical example:
+    ``upload_raw`` cannot run until ``create_experiment`` is
+    ``done`` because the experiment id is needed for the upload.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +299,19 @@ class WritebackWorker:
             try:
                 self._on_step(action)
                 dispatched += 1
+            except _PrerequisiteNotMet as exc:
+                # The step's prerequisite (e.g. ``create_experiment``
+                # must finish before ``upload_raw``) is not yet
+                # satisfied. Defer the step — leave it ``pending``,
+                # do not increment attempts, push ``next_attempt_at``
+                # into the past so the next tick re-picks it up
+                # after the prerequisite step is done.
+                self.ledger.defer_step(action.step_id, reason=str(exc))
+                logger.info(
+                    "step %s deferred (prerequisite not met: %s)",
+                    action.step_id,
+                    exc,
+                )
             except Exception as exc:
                 # A dispatcher exception is a bug, not a transient
                 # network failure. Mark the step as a permanent

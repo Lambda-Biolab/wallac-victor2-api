@@ -518,6 +518,8 @@ def _register_routes(
     manager: JobManager,
     token: str,
     executor: BridgeExecutor | None,
+    *,
+    durable_manager: Any | None = None,
 ) -> None:
     """Register the bridge HTTP contract against one job manager."""
 
@@ -550,6 +552,20 @@ def _register_routes(
                     existing_status=existing.status,
                 )
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail) from e
+        # Issue #44: also seed the durable ledger so the
+        # ``BridgeExecutor._durable_writeback`` path has a row to
+        # spool against. The durable ``submit_job`` is idempotent
+        # (INSERT OR IGNORE) so a partial-failure retry is safe.
+        if durable_manager is not None:
+            durable_manager.submit_job(
+                job_id=job.job_id,
+                title=job.title,
+                execution_mode=job.execution_mode,
+                protocol_name=job.protocol_name,
+                protocol_id=job.protocol_id,
+                elabftw_experiment_id=job.elabftw_experiment_id,
+                wells_spec=job.wells_spec,
+            )
         return _job_to_response(job)
 
     @app.get("/jobs", response_model=list[JobResponse])
@@ -752,7 +768,7 @@ def create_bridge_app(
 
     install_security_headers(app)
     _configure_cors(app, config)
-    _register_routes(app, manager, token, bridge_executor)
+    _register_routes(app, manager, token, bridge_executor, durable_manager=durable_manager)
 
     if durable_factory is not None and config is not None:
         register_writeback_routes(

@@ -141,11 +141,23 @@ class JobManager:
         wells_spec: dict[str, Any],
         expected_outputs: str = "",
     ) -> Job:
+        """Insert the durable job record. Idempotent: a re-submit of
+        an existing ``job_id`` is a no-op and returns the existing
+        record.
+
+        The in-memory ``JobManager`` is the primary dedup gate; this
+        method is called from the bridge's ``POST /jobs`` handler
+        after the in-memory dedup has already passed, so the
+        idempotency is defensive — it makes the API safe against
+        partial-failure paths (e.g. crash between in-memory and
+        durable submission) without forcing the caller to catch
+        ``IntegrityError``.
+        """
         now = _now_iso()
         with transaction(self.conn):
             self.conn.execute(
                 """
-                INSERT INTO jobs (
+                INSERT OR IGNORE INTO jobs (
                     job_id, title, execution_mode, protocol_name, protocol_id,
                     elabftw_experiment_id, wells_spec_json, status, created_at,
                     expected_outputs

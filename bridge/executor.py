@@ -1787,6 +1787,18 @@ class BridgeExecutor:
             "durable_writeback_enqueued",
             f"steps={[s.action for s in stages]}",
         )
+        # Hand off to the durable worker: the in-memory worker must
+        # NOT auto-promote this job to ``completed`` after the
+        # executor returns (otherwise ``/jobs`` reports success
+        # before the eLabFTW side has actually finished). Set the
+        # in-memory status to ``writeback_pending`` (terminal for
+        # the in-memory worker) and let the durable worker's
+        # ``on_all_steps_done`` hook transition to ``completed``
+        # once all four stages succeed.
+        from .jobs import WRITEBACK_PENDING as _WP
+
+        if job.status != _WP:
+            job.status = _WP
         job.add_event(
             "durable_writeback_enqueued",
             f"steps={[s.action for s in stages]}",

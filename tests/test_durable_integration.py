@@ -434,3 +434,332 @@ def test_dispatcher_no_op_when_experiment_already_exists(
     assert len(rows) == 1
     assert rows[0]["status"] == "done"
     assert "skipped create" in rows[0]["detail"]
+
+
+# --- Re-review blockers (round 2) -----------------------------------------
+
+
+def test_post_jobs_seeds_durable_record() -> None:
+    """POST /jobs must seed the durable ledger so ``_durable_writeback``
+    finds the row.
+
+    Review blocker (round 2) #1: the production path was creating
+    only the in-memory record, so the durable writeback always
+    failed with "no durable record".
+    """
+    from fastapi.testclient import TestClient
+
+    from bridge.bridge_app import create_bridge_app
+    from bridge.config import BridgeConfig
+
+    state_dir = Path(tempfile.mkdtemp(prefix="wallac-bridge-post-"))
+    try:
+        config = BridgeConfig(
+            elabftw_url="https://localhost:3148",
+            elabftw_api_key="5-key",
+            elabftw_verify_tls=False,
+            elabftw_ca_bundle=None,
+            wallac_env="dev",
+            vm_agent_url="http://127.0.0.1:8420",
+            vm_agent_token="",
+            dry_run=False,
+            bridge_state_dir=str(state_dir),
+        )
+        app = create_bridge_app(config=config)
+        client = TestClient(app)
+        # Auth is enabled by default; supply the (empty) bridge
+        # token header so the request does not 401 before we get
+        # to the body.
+        client.headers["Authorization"] = "Bearer "
+        resp = client.post(
+            "/jobs",
+            json={
+                "title": "post /jobs seeds durable",
+                "execution_mode": "existing_protocol",
+                "protocol_name": "Absorbance @ 610 (1.0s)",
+                "protocol_id": 2000008,
+                "wells_spec": {"wells": ["A1", "A2"]},
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        job_id = resp.json()["job_id"]
+        # The durable ledger has a matching row.
+        durable = JobManager(state_dir)
+        try:
+            row = durable.get_job(job_id)
+            assert row is not None, (
+                f"durable record missing for job_id={job_id!r} — "
+                "POST /jobs did not seed the durable ledger"
+            )
+            assert row.status == "accepted"
+        finally:
+            durable.close()
+    finally:
+        # Best-effort cleanup; the tempdir may already be gone if
+        # pyright was watching.
+        import shutil
+
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def test_durable_writeback_pending_status_blocks_auto_completion(
+    durable_manager: JobManager,
+) -> None:
+    """After ``_durable_writeback`` the in-memory job's status is
+    ``writeback_pending`` — the in-memory worker must NOT auto-promote
+    it to ``completed`` while the durable worker is still processing.
+
+    Review blocker (round 2) #2: previously the executor's durable
+    branch returned without changing the in-memory job's status, so
+    the in-memory worker thread's "if not terminal, set completed"
+    auto-promoted the job to ``completed`` before the eLabFTW side
+    had actually finished.
+    """
+    from bridge.jobs import WRITEBACK_PENDING
+
+    elabftw = MockElabftwClient()
+    vm_agent = MockVmAgentClient()
+    executor = _build_executor(elabftw, vm_agent, durable=durable_manager)
+    job = _make_job("job-e2e-pending")
+    _durable_record_for(durable_manager, job)
+
+    success = executor._durable_writeback(job, CANNED_WELLS, "well,value\nA1,0.078\n")
+    assert success is True
+    # The in-memory job is now in ``writeback_pending`` (not
+    # ``completed``) so the in-memory worker would not auto-promote
+    # it after the executor returns.
+    assert job.status == WRITEBACK_PENDING, (
+        f"in-memory job should be writeback_pending, got {job.status!r}"
+    )
+    # ``WRITEBACK_PENDING`` is in TERMINAL_STATES so the in-memory
+    # worker recognises the job as "done from its perspective"
+    # and skips the auto-promote-to-completed step.
+    from bridge.jobs import TERMINAL_STATES
+
+    assert WRITEBACK_PENDING in TERMINAL_STATES
+
+
+def test_step_prerequisite_deferred_not_failed(
+    durable_manager: JobManager,
+) -> None:
+    """If ``create_experiment`` is still pending, the upload /
+    patch steps must be DEFERRED (status stays ``pending``,
+    ``attempts`` unchanged) — not marked permanent.
+
+    Review blocker (round 2) #3: previously a transient failure on
+    ``create_experiment`` caused ``upload_*`` / ``patch_body`` to
+    raise ``RuntimeError("create_experiment must run first")`` and
+    the worker recorded them as permanent dispatcher bugs.
+
+    Setup: ``create_experiment`` raises HTTP 503 on the first call,
+    so the worker's first tick defers upload_* / patch_body
+    (exp_id still 0) and the create_experiment step is rescheduled
+    (transient). The second tick retries create_experiment (succeeds),
+    then the third tick finally dispatches upload_* / patch_body.
+    """
+    import urllib.error
+
+    class FlakyCreate(MockElabftwClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self._create_calls = 0
+
+        def create_experiment(  # type: ignore[override]
+            self, title: str, body: str = ""
+        ) -> int:
+            self._create_calls += 1
+            if self._create_calls == 1:
+                raise urllib.error.HTTPError(
+                    url="http://elabftw/experiments",
+                    code=503,
+                    msg="Service Unavailable",
+                    hdrs={},  # type: ignore[arg-type]
+                    fp=None,
+                )
+            return super().create_experiment(title, body)
+
+    elabftw = FlakyCreate()
+    vm_agent = MockVmAgentClient()
+    executor = _build_executor(elabftw, vm_agent, durable=durable_manager)
+    job = _make_job("job-e2e-prereq")
+    _durable_record_for(durable_manager, job)
+    executor._durable_writeback(job, CANNED_WELLS, "well,value\nA1,0.078\n")
+
+    dispatcher = WritebackDispatcher(durable_manager, elabftw)
+    worker = WritebackWorker(
+        durable_manager.conn,
+        on_step=dispatcher.dispatch,
+        interval_seconds=0.0,
+    )
+    # Patch Backoff to schedule the next attempt instantly so the
+    # first transient failure retries on the very next tick.
+    import bridge.durable.worker as _wmod
+
+    original = _wmod.Backoff.wait_seconds
+
+    def _inst(self: _wmod.Backoff, attempt: int) -> float:
+        return -1.0
+
+    _wmod.Backoff.wait_seconds = _inst  # type: ignore[method-assign]
+    try:
+        # First tick: create_experiment raises 503, classified as
+        # transient (next_attempt_at in the past). upload_* /
+        # patch_body see exp_id == 0 and raise
+        # ``_PrerequisiteNotMet``; the worker defers them
+        # (attempts unchanged, status still ``pending``).
+        worker.run_once()
+    finally:
+        _wmod.Backoff.wait_seconds = original  # type: ignore[method-assign]
+
+    prereq_steps = list(
+        durable_manager.conn.execute(
+            "SELECT step_id, action, status, attempts FROM writeback_steps "
+            "WHERE job_id = ? AND action IN "
+            "('upload_raw', 'upload_analyzed', 'patch_body')",
+            (job.job_id,),
+        )
+    )
+    assert prereq_steps, "prerequisite steps should exist in the ledger"
+    for step in prereq_steps:
+        assert step["status"] == "pending", (
+            f"step {step['step_id']!r} should be deferred (pending), got {step['status']!r}"
+        )
+        assert step["attempts"] == 0, (
+            f"step {step['step_id']!r} should have 0 attempts (defer is "
+            f"not a retry), got {step['attempts']!r}"
+        )
+
+
+def test_transport_error_classified_as_transient(
+    durable_manager: JobManager,
+) -> None:
+    """DNS / connection / timeout failures (URLError, OSError,
+    socket.timeout) must be classified as transient, not marked
+    permanent by the worker's exception handler.
+
+    Review blocker (round 2) #4: the dispatcher only caught
+    ``HTTPError`` (status-based). Any other exception type from
+    the real ``urllib.request`` client (DNS, connection refused,
+    timeout) was treated as a permanent dispatcher bug, so a
+    flapping network would pause a step on the first connection
+    failure rather than retrying through the bounded backoff.
+    """
+    import socket
+    import urllib.error
+
+    class FlakyElabftw(MockElabftwClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def create_experiment(  # type: ignore[override]
+            self, title: str, body: str = ""
+        ) -> int:
+            self.calls += 1
+            if self.calls < 3:
+                # First two calls: simulate a DNS / connection
+                # failure. The dispatcher must classify as
+                # transient, not permanent.
+                raise urllib.error.URLError("[Errno -2] Name or service not known")
+            return super().create_experiment(title, body)
+
+    elabftw = FlakyElabftw()
+    vm_agent = MockVmAgentClient()
+    executor = _build_executor(elabftw, vm_agent, durable=durable_manager)
+    job = _make_job("job-e2e-transport")
+    _durable_record_for(durable_manager, job)
+    executor._durable_writeback(job, CANNED_WELLS, "well,value\nA1,0.078\n")
+    dispatcher = WritebackDispatcher(durable_manager, elabftw)
+    worker = WritebackWorker(
+        durable_manager.conn,
+        on_step=dispatcher.dispatch,
+        interval_seconds=0.0,
+    )
+    # Force the backoff to schedule the next attempt in the past
+    # so the first transient failure retries on the very next tick.
+    import bridge.durable.worker as _wmod
+
+    original = _wmod.Backoff.wait_seconds
+
+    def _inst(self: _wmod.Backoff, attempt: int) -> float:
+        return -1.0
+
+    _wmod.Backoff.wait_seconds = _inst  # type: ignore[method-assign]
+    try:
+        # Three ticks: the first two ``create_experiment`` calls
+        # fail with URLError; the third call succeeds.
+        for _ in range(3):
+            worker.run_once()
+    finally:
+        _wmod.Backoff.wait_seconds = original  # type: ignore[method-assign]
+
+    row = durable_manager.conn.execute(
+        "SELECT status, attempts, detail FROM writeback_steps "
+        "WHERE job_id = ? AND action = 'create_experiment'",
+        (job.job_id,),
+    ).fetchone()
+    assert row["status"] == "done", (
+        f"create_experiment should have eventually succeeded, "
+        f"got status={row['status']!r} attempts={row['attempts']!r}"
+    )
+    assert row["attempts"] >= 3, (
+        f"create_experiment should have been retried after URLError, "
+        f"got attempts={row['attempts']!r}"
+    )
+
+    # And a ``socket.timeout`` should also be classified as transient.
+    class TimeoutElabftw(MockElabftwClient):
+        def create_experiment(  # type: ignore[override]
+            self, title: str, body: str = ""
+        ) -> int:
+            raise socket.timeout("read timed out")
+
+    elabftw2 = TimeoutElabftw()
+    durable2_path = durable_manager.state_dir.parent / "durable2"
+    durable2 = JobManager(durable2_path)
+    try:
+        executor2 = _build_executor(elabftw2, vm_agent, durable=durable2)
+        job2 = _make_job("job-e2e-timeout")
+        durable2.submit_job(
+            job_id=job2.job_id,
+            title=job2.title,
+            execution_mode=job2.execution_mode,
+            protocol_name=job2.protocol_name,
+            protocol_id=job2.protocol_id,
+            elabftw_experiment_id=job2.elabftw_experiment_id,
+            wells_spec={"wells": ["A1", "A2"]},
+        )
+        executor2._durable_writeback(job2, CANNED_WELLS, "well,value\nA1,0.078\n")
+        dispatcher2 = WritebackDispatcher(durable2, elabftw2)
+        worker2 = WritebackWorker(
+            durable2.conn,
+            on_step=dispatcher2.dispatch,
+            interval_seconds=0.0,
+        )
+        # Patch Backoff to schedule the next attempt instantly
+        # (so we exhaust the budget within a few ticks).
+        import bridge.durable.worker as _wmod
+
+        original = _wmod.Backoff.wait_seconds
+
+        def _inst(self: _wmod.Backoff, attempt: int) -> float:
+            return -1.0
+
+        _wmod.Backoff.wait_seconds = _inst  # type: ignore[method-assign]
+        try:
+            for _ in range(20):
+                worker2.run_once()
+        finally:
+            _wmod.Backoff.wait_seconds = original  # type: ignore[method-assign]
+        row = durable2.conn.execute(
+            "SELECT status, attempts FROM writeback_steps "
+            "WHERE job_id = ? AND action = 'create_experiment'",
+            (job2.job_id,),
+        ).fetchone()
+        assert row["status"] == "paused", (
+            f"socket.timeout must be transient; step should be paused "
+            f"(not failed dispatcher bug), got status={row['status']!r}"
+        )
+        assert row["attempts"] >= 8
+    finally:
+        durable2.close()

@@ -30,6 +30,7 @@ Everything after ``measured`` flows through this dispatcher.
 from __future__ import annotations
 
 import logging
+import socket
 import threading
 import urllib.error
 from collections.abc import Callable
@@ -38,9 +39,21 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from bridge.durable.planner import merge_results_section
 from bridge.durable.retry import classify_status
-from bridge.durable.worker import RetryAction, StepLedger, record_step_outcome
+from bridge.durable.worker import (
+    RetryAction,
+    StepLedger,
+    _PrerequisiteNotMet,
+    record_step_outcome,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# Actions whose execution depends on ``create_experiment`` finishing
+# first. The worker defers these steps (no retry, just push
+# ``next_attempt_at`` into the past) when the experiment id is still
+# zero, so they automatically pick up after the prerequisite is done.
+_PREREQUISITE_ACTIONS = frozenset({"upload_raw", "upload_analyzed", "patch_body"})
 
 
 # ``urllib.error.HTTPError`` is the canonical transient/permanent
@@ -62,6 +75,22 @@ def _classify_http_error(exc: BaseException, what: str) -> tuple[str, str]:
     reason = str(getattr(exc, "reason", exc))
     outcome = classify_status(code)
     return outcome, f"{what} returned HTTP {code} ({reason})"
+
+
+# Exception types that represent transient network conditions. The
+# real :class:`bridge.elabftw.ElabftwClient` uses ``urllib.request``
+# which surfaces DNS / connection / timeout errors through these
+# classes. All of them are transient per issue #44 §"Retry policy"
+# (5xx-equivalent — the eLabFTW server is unreachable, so the
+# outcome should be retried with bounded backoff, not paused).
+_TRANSIENT_EXC: tuple[type[BaseException], ...] = (
+    urllib.error.URLError,  # parent of HTTPError; covers bad URL / DNS
+    urllib.error.HTTPError,  # subclass handled separately for status
+    socket.timeout,
+    ConnectionError,  # base of ConnectionRefusedError, ConnectionResetError, etc.
+    TimeoutError,
+    OSError,  # parent of socket.gaierror, ConnectionRefusedError, etc.
+)
 
 
 class _ElabftwLike(Protocol):
@@ -189,21 +218,8 @@ class WritebackDispatcher:
         body = f"<p>Results from job <code>{job.job_id}</code></p>"
         try:
             exp_id = self.elabftw.create_experiment(title, body)
-        except _HTTPError as exc:
-            outcome, detail = _classify_http_error(exc, "create_experiment")
-            record_step_outcome(
-                self._ledger,
-                step_id=action.step_id,
-                http_status=int(getattr(exc, "code", 0) or 0),
-                detail=detail,
-            )
-            logger.warning(
-                "create_experiment %s for job %s (status=%s): %s",
-                outcome,
-                job.job_id,
-                getattr(exc, "code", "?"),
-                detail,
-            )
+        except BaseException as exc:
+            self._record_transport_outcome(action, exc, "create_experiment")
             return
         self.manager.update_experiment_id(job.job_id, exp_id)
         record_step_outcome(
@@ -218,8 +234,12 @@ class WritebackDispatcher:
     def _upload(self, action: RetryAction, job: Any, *, kind: str, filename: str) -> None:
         exp_id = job.elabftw_experiment_id
         if exp_id == 0:
-            raise RuntimeError(
-                f"{action.action}: create_experiment must run first for job {job.job_id}"
+            # Prerequisite not yet satisfied: ``create_experiment``
+            # is still pending. Defer this step (no retry, no
+            # attempt increment) so the next worker tick picks it
+            # up after the experiment exists.
+            raise _PrerequisiteNotMet(
+                f"{action.action}: create_experiment not yet done for job {job.job_id}"
             )
         artifact = self.manager.find_artifact(job.job_id, kind)
         if artifact is None:
@@ -240,11 +260,10 @@ class WritebackDispatcher:
             return
         data = Path(artifact.path).read_bytes()
         # ``elabftw.upload_experiment_file`` raises ``HTTPError`` for
-        # non-2xx responses; the worker treats any propagated
-        # exception as a permanent dispatcher bug, which is wrong
-        # for genuine transient 5xx / 429. Catch HTTPError here,
-        # classify, and let the worker advance the ledger through
-        # the normal outcome path so ``max_attempts`` is enforced.
+        # non-2xx responses, and ``URLError``/``OSError``/``socket.timeout``
+        # for transport-level failures. Catch the full transient set,
+        # classify, and let the worker advance the ledger through the
+        # normal outcome path so ``max_attempts`` is enforced.
         try:
             self.elabftw.upload_experiment_file(
                 exp_id,
@@ -252,22 +271,8 @@ class WritebackDispatcher:
                 data,
                 comment=f"{kind} results from Wallac Victor2 (job {job.job_id})",
             )
-        except _HTTPError as exc:
-            outcome, detail = _classify_http_error(exc, f"{kind} upload")
-            record_step_outcome(
-                self._ledger,
-                step_id=action.step_id,
-                http_status=int(getattr(exc, "code", 0) or 0),
-                detail=detail,
-            )
-            logger.warning(
-                "%s transient %s for job %s (status=%s): %s",
-                action.action,
-                outcome,
-                job.job_id,
-                getattr(exc, "code", "?"),
-                detail,
-            )
+        except BaseException as exc:
+            self._record_transport_outcome(action, exc, f"{kind} upload")
             return
         self.manager.mark_artifact_uploaded(job.job_id, artifact.sha256)
         record_step_outcome(
@@ -282,7 +287,9 @@ class WritebackDispatcher:
     def _patch_body(self, action: RetryAction, job: Any) -> None:
         exp_id = job.elabftw_experiment_id
         if exp_id == 0:
-            raise RuntimeError(f"patch_body: create_experiment must run first for job {job.job_id}")
+            raise _PrerequisiteNotMet(
+                f"patch_body: create_experiment not yet done for job {job.job_id}"
+            )
         body_artifact = self.manager.find_artifact(job.job_id, "body")
         if body_artifact is None:
             raise RuntimeError(f"patch_body: no body artifact spooled for job {job.job_id}")
@@ -290,41 +297,15 @@ class WritebackDispatcher:
         with _lock_for(self._body_locks, self._body_locks_guard, exp_id):
             try:
                 existing = self.elabftw.get_experiment(exp_id)
-            except _HTTPError as exc:
-                outcome, detail = _classify_http_error(exc, "get_experiment")
-                record_step_outcome(
-                    self._ledger,
-                    step_id=action.step_id,
-                    http_status=int(getattr(exc, "code", 0) or 0),
-                    detail=detail,
-                )
-                logger.warning(
-                    "patch_body get %s for job %s (status=%s): %s",
-                    outcome,
-                    job.job_id,
-                    getattr(exc, "code", "?"),
-                    detail,
-                )
+            except BaseException as exc:
+                self._record_transport_outcome(action, exc, "get_experiment")
                 return
             existing_body = existing.get("body") or ""
             merged = merge_results_section(existing_body, section_html, job_id=job.job_id)
             try:
                 self.elabftw.patch_experiment(exp_id, {"body": merged})
-            except _HTTPError as exc:
-                outcome, detail = _classify_http_error(exc, "patch_experiment")
-                record_step_outcome(
-                    self._ledger,
-                    step_id=action.step_id,
-                    http_status=int(getattr(exc, "code", 0) or 0),
-                    detail=detail,
-                )
-                logger.warning(
-                    "patch_body %s for job %s (status=%s): %s",
-                    outcome,
-                    job.job_id,
-                    getattr(exc, "code", "?"),
-                    detail,
-                )
+            except BaseException as exc:
+                self._record_transport_outcome(action, exc, "patch_experiment")
                 return
         record_step_outcome(
             self._ledger,
@@ -336,6 +317,52 @@ class WritebackDispatcher:
         self._maybe_finish(action.job_id)
 
     # --- hooks ----------------------------------------------------------
+
+    def _record_transport_outcome(self, action: RetryAction, exc: BaseException, what: str) -> None:
+        """Classify any exception raised by an eLabFTW call and record
+        the outcome through the normal ledger path.
+
+        * ``HTTPError`` (with a status code) → ``classify_status`` →
+          transient or permanent based on the code.
+        * ``URLError`` / ``OSError`` / ``socket.timeout`` /
+          ``ConnectionError`` / ``TimeoutError`` → transient (issue
+          #44 §"Retry policy": transport failures retry with
+          bounded backoff; the worker will pause the step once the
+          attempt budget is exhausted).
+        * Anything else → re-raise so the worker treats it as a
+          permanent dispatcher bug (the existing exception handler
+          in ``WritebackWorker.run_once`` pauses the step without
+          incrementing the retry count further).
+        """
+        if isinstance(exc, _TRANSIENT_EXC):
+            if isinstance(exc, _HTTPError):
+                outcome, detail = _classify_http_error(exc, what)
+                status = int(getattr(exc, "code", 0) or 0)
+            else:
+                # Non-HTTPError transport failure: DNS, connection
+                # refused, timeout, etc. Classify as transient so the
+                # bounded backoff handles it.
+                outcome = "transient"
+                detail = f"{what} transport error: {exc!r}"
+                status = 0
+            record_step_outcome(
+                self._ledger,
+                step_id=action.step_id,
+                http_status=status,
+                detail=detail,
+            )
+            logger.warning(
+                "%s %s for job %s (status=%s): %s",
+                action.action,
+                outcome,
+                action.job_id,
+                status,
+                detail,
+            )
+            return
+        # Unknown exception type — let the worker treat it as a
+        # permanent dispatcher bug.
+        raise exc
 
     def _after_step(self, job_id: str, action: str, exp_id: str) -> None:
         if self._on_step_complete is not None:

@@ -38,8 +38,21 @@ COMPLETED = "completed"
 FAILED = "failed"
 ABORTED = "aborted"
 UNKNOWN = "unknown_requires_operator_review"
+# Issue #44: a job whose hardware run finished and whose writeback
+# is in the durable spool is no longer under the in-memory worker's
+# control — the ``WritebackWorker`` is responsible for completing it.
+# The state is "terminal" from the in-memory worker's POV (it must
+# NOT auto-promote the job to ``completed``) but is treated as
+# "still active" by the dedup check (a re-submit of the same spec
+# must be rejected while the durable worker is still processing).
+WRITEBACK_PENDING = "writeback_pending"
 
-TERMINAL_STATES = {COMPLETED, FAILED, ABORTED, UNKNOWN}
+TERMINAL_STATES = {COMPLETED, FAILED, ABORTED, UNKNOWN, WRITEBACK_PENDING}
+# States that block a fresh submission of the same dedup key.
+# Identical to TERMINAL_STATES today, but kept separate so a future
+# "completed-after-rewrite" state can split the two without
+# rewriting every dedup call site.
+ACTIVE_STATES = TERMINAL_STATES
 
 
 # --- Duplicate detection ---
