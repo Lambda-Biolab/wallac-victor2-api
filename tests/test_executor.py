@@ -35,6 +35,8 @@ class MockElabftwClient:
         self._experiments: dict[int, dict[str, Any]] = {}
         self._next_exp_id = 1
         self.fail_upload = False
+        self._last_metadata: dict[str, str] | None = None
+        self._uploads: dict[int, list[dict[str, Any]]] = {}
         self.preflight_error: Exception | None = None
         self.preflight_calls = 0
         self.uploaded_files: list[str] = []
@@ -66,12 +68,44 @@ class MockElabftwClient:
         return record
 
     def upload_experiment_file(
-        self, exp_id: int, filename: str, content: bytes, comment: str = ""
+        self,
+        exp_id: int,
+        filename: str,
+        content: bytes,
+        comment: str = "",
+        *,
+        metadata: dict[str, str] | None = None,
+        metadata_encoding: str = "dict",
     ) -> dict[str, Any]:
         if self.fail_upload:
             raise RuntimeError("upload unavailable")
         self.uploaded_files.append(filename)
+        # Record the metadata so the integration test can assert
+        # the idempotency token is on the wire.
+        if metadata is not None:
+            self._last_metadata = dict(metadata)
+        # Track the upload so ``get_experiment_uploads`` can return
+        # it on a retry (re-review round 4 blocker #3). The mock
+        # supports two encodings so the test for round 5 blocker #3
+        # can drive the JSON-string / double-encoded paths the real
+        # eLabFTW API actually produces (``normalize_metadata``
+        # decodes both).
+        raw_meta = dict(metadata or {})
+        if metadata_encoding == "json":
+            import json as _json
+
+            wire_meta = _json.dumps(raw_meta, sort_keys=True)
+        elif metadata_encoding == "double_json":
+            import json as _json
+
+            wire_meta = _json.dumps(_json.dumps(raw_meta, sort_keys=True))
+        else:
+            wire_meta = raw_meta
+        self._uploads.setdefault(exp_id, []).append({"real_name": filename, "metadata": wire_meta})
         return {"id": exp_id, "real_name": filename}
+
+    def get_experiment_uploads(self, exp_id: int) -> list[dict[str, Any]]:
+        return list(self._uploads.get(exp_id, []))
 
     def patch_experiment(self, exp_id: int, data: dict[str, Any]) -> None:
         self._experiments[exp_id].update(data)

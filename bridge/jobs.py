@@ -38,8 +38,24 @@ COMPLETED = "completed"
 FAILED = "failed"
 ABORTED = "aborted"
 UNKNOWN = "unknown_requires_operator_review"
+# Issue #44: a job whose hardware run finished and whose writeback
+# is in the durable spool is no longer under the in-memory worker's
+# control — the ``WritebackWorker`` is responsible for completing it.
+# The state is "terminal" from the in-memory worker's POV (it must
+# NOT auto-promote the job to ``completed``) but is treated as
+# "still active" by the dedup check (a re-submit of the same spec
+# must be rejected while the durable worker is still processing).
+WRITEBACK_PENDING = "writeback_pending"
 
-TERMINAL_STATES = {COMPLETED, FAILED, ABORTED, UNKNOWN}
+# Terminal for the in-memory worker — the in-memory worker thread
+# must NOT auto-promote a job in this state to ``completed``.
+TERMINAL_STATES = {COMPLETED, FAILED, ABORTED, UNKNOWN, WRITEBACK_PENDING}
+# Active for the dedup check — a fresh submission of the same
+# dedup key MUST be rejected while the job is in one of these
+# states. WRITEBACK_PENDING is here (not just TERMINAL_STATES)
+# because the durable worker is still processing the job and a
+# re-submit would create a duplicate durable record.
+ACTIVE_STATES = {ACCEPTED, RUNNING, WRITEBACK_PENDING}
 
 
 # --- Duplicate detection ---
@@ -188,7 +204,7 @@ class JobManager:
         """Set the execution function: callable(job: Job) -> None."""
         self._executor = executor
 
-    def submit_job(self, job_spec: dict[str, Any]) -> Job:
+    def submit_job(self, job_spec: dict[str, Any], *, job_id: str | None = None) -> Job:
         """Accept a new job for execution.
 
         Rejects the submission if a non-terminal job with the same dedup key
@@ -198,6 +214,13 @@ class JobManager:
         Args:
             job_spec: Job specification dict with title, execution_mode,
                 protocol_name, etc.
+            job_id: Optional pre-generated job id. When ``None`` (the
+                default) the in-memory manager mints one with
+                ``uuid.uuid4().hex[:16]``. The handler in
+                ``create_bridge_app`` passes an explicit value so the
+                durable ledger and the in-memory ledger share the
+                same id (issue #44: the durable insert must commit
+                before the in-memory worker can dequeue the job).
 
         Returns:
             The created Job with job_id and status=accepted.
@@ -205,8 +228,9 @@ class JobManager:
         key = dedup_key(job_spec)
         # 16-hex prefix = 64 bits of entropy — comfortable margin against
         # bearer-token-aided enumeration of jobs in flight.
+        resolved_id = job_id or f"job-{uuid.uuid4().hex[:16]}"
         job = Job(
-            job_id=f"job-{uuid.uuid4().hex[:16]}",
+            job_id=resolved_id,
             title=job_spec.get("title", "Untitled"),
             execution_mode=job_spec.get("execution_mode", "existing_protocol"),
             protocol_name=job_spec.get("protocol_name", ""),
@@ -224,9 +248,14 @@ class JobManager:
         job.add_event("job_submitted")
 
         with self._lock:
-            # Reject duplicates: a non-terminal job with the same key exists.
+            # Reject duplicates: an active job with the same key exists.
+            # ``ACTIVE_STATES`` (not ``TERMINAL_STATES``) is the right
+            # set: a job in ``writeback_pending`` is terminal from the
+            # in-memory worker's POV but is still active — re-submitting
+            # would create a duplicate durable record and confuse the
+            # operator recovery endpoints.
             for existing in self._jobs.values():
-                if existing.dedup_key == key and existing.status not in TERMINAL_STATES:
+                if existing.dedup_key == key and existing.status in ACTIVE_STATES:
                     logger.warning(
                         "Duplicate job rejected: new %s matches active %s (key=%s)",
                         job.job_id,

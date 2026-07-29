@@ -1,0 +1,404 @@
+"""Background retry worker for paused writeback steps.
+
+The worker walks the durable ledger every tick, picks up stages whose
+``next_attempt_at`` is in the past, and re-enqueues them via the
+executor. Permanent failures are recorded as ``operator_review`` and
+never auto-retried. Transient failures follow the bounded exponential
+backoff from :mod:`.retry`.
+
+Issue #44 requires:
+
+* Pause, do not retry, on TLS chain / hostname failure.
+* Pause, do not retry, on invalid/unreadable CA bundle.
+* Pause, do not retry, on HTTP 401/403.
+* Pause, do not retry, on schema/payload errors.
+* Pause, do not retry, on conflicting remote state.
+* Bound retries on 408/425/429/5xx.
+
+The worker thread is small and tolerant of restarts: it reads the
+ledger each tick, so a process kill leaves the next attempt's
+``next_attempt_at`` value unchanged and the next process picks up
+where it stopped.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+import sqlite3
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
+
+from bridge.durable.planner import WRITEBACK_ACTIONS
+from bridge.durable.retry import Backoff, classify_status
+from bridge.durable.schema import transaction
+
+logger = logging.getLogger(__name__)
+
+
+def _now_iso() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f%z")
+
+
+@dataclass(frozen=True)
+class RetryAction:
+    """What the worker hands back to the executor.
+
+    The executor's ``enqueue_step`` callback turns this into the
+    actual HTTP call. The worker is intentionally transport-free.
+
+    ``idempotency`` is the planner's stable token (issue #44 §"Retry
+    policy"). The dispatcher passes it to eLabFTW as a per-upload
+    ``metadata`` field so a remote operator can identify which
+    bridge upload owns a given attachment, and so a future
+    reconciliation pass can detect partial-failure windows where
+    the remote succeeded but the local ``uploaded=1`` flag was
+    lost.
+    """
+
+    step_id: str
+    job_id: str
+    action: str
+    attempts: int
+    idempotency: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Writeback steps ledger helpers
+# ---------------------------------------------------------------------------
+
+
+class StepLedger:
+    """SQLite-backed writeback-step ledger.
+
+    Splits out from :class:`JobManager` so the worker only opens the
+    rows it needs (steps + attempts) and avoids contention with the
+    request thread on the jobs table.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+
+    def enqueue(self, steps: list[PendingStep]) -> None:
+        """Insert each step as ``pending``. Idempotent on step_id."""
+        with transaction(self.conn):
+            for step in steps:
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO writeback_steps
+                      (step_id, job_id, action, idempotency, status)
+                    VALUES (?, ?, ?, ?, 'pending')
+                    """,
+                    (step.step_id, step.job_id, step.action, step.idempotency),
+                )
+
+    def mark_done(self, step_id: str) -> None:
+        with transaction(self.conn):
+            self.conn.execute(
+                "UPDATE writeback_steps SET status = 'done', completed_at = ? WHERE step_id = ?",
+                (_now_iso(), step_id),
+            )
+
+    def record_outcome(
+        self,
+        step_id: str,
+        *,
+        outcome: str,
+        http_status: int | None,
+        detail: str,
+    ) -> tuple[str, str | None]:
+        """Record an attempt outcome, return ``(status, next_attempt_at)``.
+
+        ``status`` is one of: ``done``, ``transient``, ``permanent``.
+        ``next_attempt_at`` is ISO-8601 UTC or ``None`` (no retry).
+        """
+        with transaction(self.conn):
+            row = self.conn.execute(
+                "SELECT attempts FROM writeback_steps WHERE step_id = ?",
+                (step_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown step_id: {step_id!r}")
+            attempts = int(row["attempts"]) + 1
+            self.conn.execute(
+                "INSERT INTO writeback_attempts "
+                "(step_id, ts, http_status, outcome, detail) VALUES (?, ?, ?, ?, ?)",
+                (step_id, _now_iso(), http_status, outcome, detail),
+            )
+            if outcome == "success":
+                self.conn.execute(
+                    "UPDATE writeback_steps SET status = 'done', "
+                    "completed_at = ?, attempts = ?, detail = ? WHERE step_id = ?",
+                    (_now_iso(), attempts, detail, step_id),
+                )
+                return ("done", None)
+            if outcome == "permanent":
+                self.conn.execute(
+                    "UPDATE writeback_steps SET status = 'paused', "
+                    "attempts = ?, detail = ? WHERE step_id = ?",
+                    (attempts, detail, step_id),
+                )
+                return ("paused", None)
+
+            # transient: schedule next attempt — but if the attempt
+            # budget is exhausted, pause so the worker stops retrying
+            # forever. The operator can explicitly /retry from the
+            # recovery bundle to resume.
+            backoff = Backoff()
+            if attempts >= backoff.max_attempts:
+                self.conn.execute(
+                    "UPDATE writeback_steps SET status = 'paused', "
+                    "attempts = ?, detail = ? WHERE step_id = ?",
+                    (
+                        attempts,
+                        f"{detail}; attempt budget exhausted ({attempts}/{backoff.max_attempts})",
+                        step_id,
+                    ),
+                )
+                logger.warning(
+                    "step %s paused after %d attempts (budget exhausted)",
+                    step_id,
+                    attempts,
+                )
+                return ("paused", None)
+            wait = backoff.wait_seconds(attempts - 1)
+            self.conn.execute(
+                "UPDATE writeback_steps SET status = 'pending', "
+                "attempts = ?, next_attempt_at = ?, detail = ? "
+                "WHERE step_id = ?",
+                (attempts, _in_future(wait), detail, step_id),
+            )
+            return ("pending", _in_future(wait))
+
+    def due_steps(self, now_iso: str) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                """
+                SELECT step_id, job_id, action, attempts, idempotency
+                  FROM writeback_steps
+                  WHERE status = 'pending'
+                    AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                  ORDER BY COALESCE(next_attempt_at, '') ASC
+                """,
+                (now_iso,),
+            )
+        )
+
+    def snapshot(self, job_id: str) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                "SELECT * FROM writeback_steps WHERE job_id = ? ORDER BY step_id",
+                (job_id,),
+            )
+        )
+
+    def defer_step(self, step_id: str, *, reason: str) -> None:
+        """Push ``next_attempt_at`` into the past without changing status.
+
+        Used by the worker when a dispatcher raises
+        :class:`_PrerequisiteNotMet`: the step stays ``pending`` so
+        the next tick re-picks it up, but ``attempts`` is NOT
+        incremented (deferral is not a retry) and the
+        ``next_attempt_at`` is set to one second in the past so
+        ``due_steps`` matches it on the very next tick.
+        """
+        with transaction(self.conn):
+            self.conn.execute(
+                "UPDATE writeback_steps SET next_attempt_at = ?, detail = ? WHERE step_id = ?",
+                (
+                    _in_future(-1.0),
+                    f"deferred: {reason}",
+                    step_id,
+                ),
+            )
+
+
+@dataclass(frozen=True)
+class PendingStep:
+    step_id: str
+    job_id: str
+    action: str
+    idempotency: str
+
+
+def _in_future(seconds: float) -> str:
+    from datetime import timedelta
+
+    ts = datetime.now(UTC) + timedelta(seconds=seconds)
+    return ts.strftime("%Y-%m-%dT%H:%M:%S.%f%z")
+
+
+class _PrerequisiteNotMet(Exception):
+    """Raised by a dispatcher step when its prerequisite is not done.
+
+    The worker catches this and defers the step (``pending``,
+    ``next_attempt_at`` in the past) so the next tick re-picks it
+    up after the prerequisite has completed. The canonical example:
+    ``upload_raw`` cannot run until ``create_experiment`` is
+    ``done`` because the experiment id is needed for the upload.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Worker loop
+# ---------------------------------------------------------------------------
+
+
+class WritebackWorker:
+    """Background retry loop.
+
+    Usage::
+
+        worker = WritebackWorker(
+            conn=manager.conn,
+            on_step=lambda action: executor.execute_step(action),
+            interval_seconds=15,
+        )
+        worker.start()
+        ...
+        worker.stop()
+
+    ``on_step`` is the bridge-specific dispatcher. The worker itself
+    does not know how to perform a writeback step — it only knows how
+    to retry the dispatch.
+    """
+
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        on_step: Callable[[RetryAction], Any],
+        on_step_paused: Callable[[str, str], None] | None = None,
+        interval_seconds: float = 15.0,
+    ) -> None:
+        self.ledger = StepLedger(conn)
+        self._on_step = on_step
+        self._on_step_paused = on_step_paused
+        self._interval = interval_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="wallac-bridge-writeback-worker", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self, *, join: bool = True) -> None:
+        self._stop.set()
+        if join and self._thread is not None:
+            self._thread.join(timeout=self._interval + 5)
+            self._thread = None
+
+    def run_once(self) -> int:
+        """Process one batch of due steps. Returns count dispatched."""
+        now = _now_iso()
+        rows = self.ledger.due_steps(now)
+        dispatched = 0
+        for row in rows:
+            action = RetryAction(
+                step_id=row["step_id"],
+                job_id=row["job_id"],
+                action=row["action"],
+                attempts=int(row["attempts"]),
+                idempotency=row["idempotency"],
+            )
+            try:
+                self._on_step(action)
+                dispatched += 1
+            except _PrerequisiteNotMet as exc:
+                # The step's prerequisite (e.g. ``create_experiment``
+                # must finish before ``upload_raw``) is not yet
+                # satisfied. Defer the step — leave it ``pending``,
+                # do not increment attempts, push ``next_attempt_at``
+                # into the past so the next tick re-picks it up
+                # after the prerequisite step is done.
+                self.ledger.defer_step(action.step_id, reason=str(exc))
+                logger.info(
+                    "step %s deferred (prerequisite not met: %s)",
+                    action.step_id,
+                    exc,
+                )
+            except Exception as exc:
+                # A dispatcher exception is a bug, not a transient
+                # network failure. Mark the step as a permanent
+                # dispatcher failure so the next tick does not
+                # re-attempt it every ``interval_seconds`` (the
+                # previous behaviour looped the same exception
+                # indefinitely, hiding the bug from operators). The
+                # operator can /retry from the recovery bundle once
+                # the underlying bug is fixed.
+                self.ledger.record_outcome(
+                    action.step_id,
+                    outcome="permanent",
+                    http_status=None,
+                    detail=f"dispatcher raised: {exc!r}",
+                )
+                logger.exception(
+                    "writeback dispatch raised; step %s paused",
+                    action.step_id,
+                )
+                # Re-review round 5 blocker #4: an unknown
+                # exception during create_experiment recreates the
+                # previous deadlock (create paused, dependent steps
+                # pending forever). Fire the on_step_paused hook so
+                # the bridge can cascade-pause the dependents and
+                # call _maybe_finish, transitioning the job to
+                # operator review.
+                if self._on_step_paused is not None:
+                    try:
+                        self._on_step_paused(action.job_id, action.action)
+                    except Exception:
+                        logger.exception("on_step_paused hook raised")
+        return dispatched
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            # The loop must never die on transient errors. ``run_once``
+            # already catches per-step exceptions, so this only fires
+            # on a ledger-level error (e.g., DB locked).
+            with contextlib.suppress(Exception):
+                self.run_once()
+            self._stop.wait(self._interval)
+
+
+# ---------------------------------------------------------------------------
+# Outcome classifier for the executor's dispatcher
+# ---------------------------------------------------------------------------
+
+
+def record_step_outcome(
+    ledger: StepLedger,
+    *,
+    step_id: str,
+    http_status: int | None,
+    detail: str,
+    tls_error: bool = False,
+    error_kind: str | None = None,
+) -> tuple[str, str | None]:
+    """Convenience wrapper for the executor's per-step result handler.
+
+    ``error_kind`` (``"tls"``, ``"ca_bundle"``, ``"auth"``,
+    ``"schema"``, ``"payload"``) is forwarded to
+    :func:`bridge.durable.retry.classify_status` so a non-HTTP
+    transport failure (e.g. URLError with .reason = ssl.SSLError)
+    can be classified as permanent without an HTTP status to
+    look at. Issue #44 re-review blocker #4.
+    """
+    outcome = classify_status(http_status, tls_error=tls_error, error_kind=error_kind)
+    return ledger.record_outcome(step_id, outcome=outcome, http_status=http_status, detail=detail)
+
+
+__all__ = [
+    "WRITEBACK_ACTIONS",
+    "PendingStep",
+    "RetryAction",
+    "StepLedger",
+    "WritebackWorker",
+    "record_step_outcome",
+]
