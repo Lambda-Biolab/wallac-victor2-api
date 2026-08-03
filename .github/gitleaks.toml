@@ -3,9 +3,11 @@
 [extend]
 useDefault = true
 
+# Allowlist the detect-secrets baseline file (contains high-entropy hashes
+# by design) and any test fixtures staged with fake secrets.
 [allowlist]
-description = "Known scanner output and test fixtures"
+description = "False-positive file paths (detect-secrets baseline, test fixtures)"
 paths = [
-  '(^|.*/)\\.secrets\\.baseline(\\.new)?$',
+  '(^|.*/)\.secrets\.baseline(\.new)?$',
   '^tests/fixtures/.*',
 ]

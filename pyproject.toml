@@ -48,11 +48,12 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = [
-    "S101",
-    "S104",
-    "S105",
-    "S106",
-    "S108",
+    "S101",  # pytest uses assert for behavioral checks
+    "S104",  # test-only bind addresses
+    "S105",  # fixture tokens and pass/fail labels
+    "S106",  # fixture token arguments
+    "S108",  # test-only temporary paths
+    "S310",  # mocked or local test URLs
     "S608",  # SQL identifiers come from fixed internal mappings.
 ]
 
@@ -67,6 +68,7 @@ quote-style = "double"
 [tool.complexipy]
 max_complexity_allowed = 15
 
+[tool.coverage.run]
 branch = true
 source = ["bridge"]
 omit = ["bridge/elabftw.py", "bridge/vm_agent_client.py"]

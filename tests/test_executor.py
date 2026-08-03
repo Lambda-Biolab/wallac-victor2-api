@@ -36,6 +36,11 @@ class MockElabftwClient:
         self.fail_upload = False
         self._last_metadata: dict[str, str] | None = None
         self._uploads: dict[int, list[dict[str, Any]]] = {}
+        # Legacy per-(item, upload) bytes map used by the
+        # ``add_upload`` / ``download_upload`` API (BridgeExecutor's
+        # reference-download path). Kept separate from ``_uploads`` to
+        # avoid cross-contamination of the two key namespaces.
+        self._legacy_uploads: dict[tuple[int, int], bytes] = {}
         self.preflight_error: Exception | None = None
         self.preflight_calls = 0
         self.uploaded_files: list[str] = []
@@ -47,10 +52,10 @@ class MockElabftwClient:
         return []
 
     def add_upload(self, item_id: int, upload_id: int, content: bytes) -> None:
-        self._uploads[(item_id, upload_id)] = content  # pyright: ignore[reportArgumentType]
+        self._legacy_uploads[(item_id, upload_id)] = content
 
     def download_upload(self, item_id: int, upload_id: int) -> bytes:
-        return self._uploads.get((item_id, upload_id), b"")  # pyright: ignore[reportCallIssue, reportArgumentType]
+        return self._legacy_uploads.get((item_id, upload_id), b"")
 
     def create_experiment(self, title: str, body: str = "") -> int:
         eid = self._next_exp_id
