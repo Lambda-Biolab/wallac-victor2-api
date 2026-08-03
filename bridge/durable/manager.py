@@ -249,7 +249,7 @@ class JobManager:
             # ``sets`` is built only from hardcoded column names; values
             # are bound via the ``?`` placeholders.
             self.conn.execute(
-                f"UPDATE jobs SET {', '.join(sets)} WHERE job_id = ?",  # noqa: S608
+                f"UPDATE jobs SET {', '.join(sets)} WHERE job_id = ?",  # nosec B608 — SQL assignments are built from validated internal fields.
                 tuple(params),
             )
 

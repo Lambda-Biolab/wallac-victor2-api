@@ -17,7 +17,7 @@ because it normalizes through ``ntpath``. These tests run on Linux.
 
 import os
 
-import agent
+import agent  # pyright: ignore[reportMissingImports]
 import pytest
 
 # Linux-path test fixtures. Built from ``chr()`` fragments so the

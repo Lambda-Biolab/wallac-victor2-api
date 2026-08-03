@@ -67,13 +67,13 @@ class VmAgentClient:
 
         url = f"{self.base}{encoded_path}"
         data = json.dumps(body).encode() if body is not None else None
-        req = Request(url, data=data, method=method)  # noqa: S310  # Configured base URL.
+        req = Request(url, data=data, method=method)  # nosec B310 — URL is the configured VM-agent endpoint.
         if self.token:
             req.add_header("Authorization", f"Bearer {self.token}")
         if body is not None:
             req.add_header("Content-Type", "application/json")
         try:
-            with urlopen(req, timeout=timeout or self.timeout) as resp:  # noqa: S310
+            with urlopen(req, timeout=timeout or self.timeout) as resp:  # nosec B310 — URL is the configured VM-agent endpoint.
                 content = resp.read()
                 if not content:
                     return None
@@ -282,10 +282,10 @@ class VmAgentClient:
         """GET /jobs/{id}/export — CSV export of job results."""
         params = f"format={format}&value={value}"
         url = f"{self.base}/jobs/{job_id}/export?{params}"
-        req = Request(url)  # noqa: S310  # Configured base URL.
+        req = Request(url)  # nosec B310 — URL is the configured VM-agent endpoint.
         if self.token:
             req.add_header("Authorization", f"Bearer {self.token}")
-        with urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
+        with urlopen(req, timeout=self.timeout) as resp:  # nosec B310 — URL is the configured VM-agent endpoint.
             return resp.read().decode()
 
     # --- Admin ---

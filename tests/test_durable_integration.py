@@ -101,8 +101,8 @@ def _build_executor(
     elabftw: MockElabftwClient, vm_agent: MockVmAgentClient, *, durable: JobManager
 ) -> BridgeExecutor:
     return BridgeExecutor(
-        vm_agent=vm_agent,
-        elabftw=elabftw,
+        vm_agent=vm_agent,  # pyright: ignore[reportArgumentType]
+        elabftw=elabftw,  # pyright: ignore[reportArgumentType]
         dry_run=False,
         durable_manager=durable,
         durable_ledger=StepLedger(durable.conn),
@@ -152,7 +152,7 @@ def test_durable_writeback_full_flow(durable_manager: JobManager) -> None:
     assert body_artifact is not None and Path(body_artifact.path).exists()
 
     # The durable job is now ``writeback_pending``.
-    assert durable_manager.get_job(job.job_id).status == "writeback_pending"
+    assert durable_manager.get_job(job.job_id).status == "writeback_pending"  # pyright: ignore[reportOptionalMemberAccess]
 
     # Dispatcher + worker. Single-pass: one ``run_once`` per step.
     completed: list[str] = []
@@ -188,7 +188,7 @@ def test_durable_writeback_full_flow(durable_manager: JobManager) -> None:
     )
     assert all(s["status"] == "done" for s in final)
     assert completed == [job.job_id]
-    assert durable_manager.get_job(job.job_id).status == "completed"
+    assert durable_manager.get_job(job.job_id).status == "completed"  # pyright: ignore[reportOptionalMemberAccess]
 
 
 def test_durable_writeback_is_idempotent_on_replay(
@@ -259,7 +259,7 @@ def test_max_attempts_pauses_step_instead_of_looping_forever(
     class Transient503Elabftw(MockElabftwClient):
         def upload_experiment_file(  # type: ignore[override]
             self,
-            exp_id: int,
+            experiment_id: int,
             filename: str,
             content: bytes,
             comment: str = "",
@@ -267,7 +267,7 @@ def test_max_attempts_pauses_step_instead_of_looping_forever(
             metadata: dict[str, str] | None = None,
         ) -> dict[str, Any]:
             raise urllib.error.HTTPError(
-                url=f"http://elabftw/experiments/{exp_id}/uploads",
+                url=f"http://elabftw/experiments/{experiment_id}/uploads",
                 code=503,
                 msg="Service Unavailable",
                 hdrs={},  # type: ignore[arg-type]
@@ -275,7 +275,7 @@ def test_max_attempts_pauses_step_instead_of_looping_forever(
             )
 
         def get_experiment_uploads(  # type: ignore[override]
-            self, exp_id: int
+            self, experiment_id: int
         ) -> list[dict[str, Any]]:
             return []
 
@@ -930,7 +930,7 @@ def test_paused_step_transitions_job_to_operator_review(
     assert stuck_jobs[0][0] == job.job_id
     assert "create_experiment" in stuck_jobs[0][1]
     # The durable job is now ``unknown_requires_operator_review``.
-    assert durable_manager.get_job(job.job_id).status == UNKNOWN
+    assert durable_manager.get_job(job.job_id).status == UNKNOWN  # pyright: ignore[reportOptionalMemberAccess]
 
 
 def test_ssl_certificate_failure_classified_as_permanent(
@@ -1255,11 +1255,11 @@ def test_reconciliation_listing_failure_does_not_fall_through(
             self.listing_calls = 0
 
         def get_experiment_uploads(  # type: ignore[override]
-            self, exp_id: int
+            self, experiment_id: int
         ) -> list[dict[str, Any]]:
             self.listing_calls += 1
             raise urllib.error.HTTPError(
-                url=f"http://elabftw/experiments/{exp_id}/uploads",
+                url=f"http://elabftw/experiments/{experiment_id}/uploads",
                 code=410,
                 msg="Gone",
                 hdrs={},  # type: ignore[arg-type]
@@ -1336,8 +1336,8 @@ def test_reconciliation_handles_encoded_metadata() -> None:
 
             vm_agent = MockVmAgentClient()
             executor = BridgeExecutor(
-                vm_agent=vm_agent,
-                elabftw=elabftw,
+                vm_agent=vm_agent,  # pyright: ignore[reportArgumentType]
+                elabftw=elabftw,  # pyright: ignore[reportArgumentType]
                 dry_run=False,
                 durable_manager=durable,
                 durable_ledger=StepLedger(durable.conn),

@@ -4,7 +4,7 @@ COM/HTTP paths need Windows + the instrument and are not covered here."""
 
 import math
 
-import agent
+import agent  # pyright: ignore[reportMissingImports]
 import pytest
 
 

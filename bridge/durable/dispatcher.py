@@ -572,7 +572,7 @@ class WritebackDispatcher:
         actions_sql = ",".join("?" for _ in _PREREQUISITE_ACTIONS)
         with transaction(self.manager.conn):
             self.manager.conn.execute(
-                f"UPDATE writeback_steps SET status = 'paused', "  # noqa: S608
+                f"UPDATE writeback_steps SET status = 'paused', "  # nosec B608 — SQL column names are selected from a fixed internal mapping.
                 f"detail = ? WHERE job_id = ? AND action IN ({actions_sql}) "
                 f"AND status = 'pending'",
                 (f"cascaded: {reason}", job_id, *_PREREQUISITE_ACTIONS),

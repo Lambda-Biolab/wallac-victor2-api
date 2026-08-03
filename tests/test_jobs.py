@@ -497,7 +497,7 @@ class TestReadinessResponse:
             elabftw=SimpleNamespace(check_connection=lambda **_: []),
             vm_agent=SimpleNamespace(get_health=lambda **_: {"status": "ok"}),
         )
-        body, ready = _health_ready_response(self._manager(), executor)
+        body, ready = _health_ready_response(self._manager(), executor)  # pyright: ignore[reportArgumentType]
         assert ready is True
         assert body["issues"] == []
         assert body["status"] == "ready"
@@ -520,7 +520,7 @@ class TestReadinessResponse:
                 get_health=fail if dependency == "vm_agent" else lambda **_: {"status": "ok"}
             ),
         )
-        body, ready = _health_ready_response(self._manager(), executor)
+        body, ready = _health_ready_response(self._manager(), executor)  # pyright: ignore[reportArgumentType]
         assert ready is False
         assert expected_issue in body["issues"]
 
@@ -850,7 +850,7 @@ class TestRetryWriteback:
     data, and 409 otherwise."""
 
     @staticmethod
-    def _build_app_and_client(executor) -> tuple[Any, TestClient]:
+    def _build_app_and_client(executor: Any) -> tuple[Any, TestClient, JobManager]:
         """Create a bridge app whose JobManager is shared with the test.
 
         Returning both lets the caller populate ``manager._jobs`` with

@@ -31,12 +31,16 @@ class MockElabftwClient:
     """In-memory mock for eLabFTW client in executor tests."""
 
     def __init__(self) -> None:
-        self._uploads: dict[tuple[int, int], bytes] = {}
         self._experiments: dict[int, dict[str, Any]] = {}
         self._next_exp_id = 1
         self.fail_upload = False
         self._last_metadata: dict[str, str] | None = None
         self._uploads: dict[int, list[dict[str, Any]]] = {}
+        # Legacy per-(item, upload) bytes map used by the
+        # ``add_upload`` / ``download_upload`` API (BridgeExecutor's
+        # reference-download path). Kept separate from ``_uploads`` to
+        # avoid cross-contamination of the two key namespaces.
+        self._legacy_uploads: dict[tuple[int, int], bytes] = {}
         self.preflight_error: Exception | None = None
         self.preflight_calls = 0
         self.uploaded_files: list[str] = []
@@ -48,10 +52,10 @@ class MockElabftwClient:
         return []
 
     def add_upload(self, item_id: int, upload_id: int, content: bytes) -> None:
-        self._uploads[(item_id, upload_id)] = content
+        self._legacy_uploads[(item_id, upload_id)] = content
 
     def download_upload(self, item_id: int, upload_id: int) -> bytes:
-        return self._uploads.get((item_id, upload_id), b"")
+        return self._legacy_uploads.get((item_id, upload_id), b"")
 
     def create_experiment(self, title: str, body: str = "") -> int:
         eid = self._next_exp_id
@@ -59,17 +63,17 @@ class MockElabftwClient:
         self._experiments[eid] = {"title": title, "body": body}
         return eid
 
-    def get_experiment(self, exp_id: int) -> dict[str, Any]:
+    def get_experiment(self, experiment_id: int) -> dict[str, Any]:
         """Mirror ElabftwClient.get_experiment for upsert tests."""
-        if exp_id not in self._experiments:
-            return {"id": exp_id, "title": "", "body": ""}
-        record = dict(self._experiments[exp_id])
-        record.setdefault("id", exp_id)
+        if experiment_id not in self._experiments:
+            return {"id": experiment_id, "title": "", "body": ""}
+        record = dict(self._experiments[experiment_id])
+        record.setdefault("id", experiment_id)
         return record
 
     def upload_experiment_file(
         self,
-        exp_id: int,
+        experiment_id: int,
         filename: str,
         content: bytes,
         comment: str = "",
@@ -101,14 +105,16 @@ class MockElabftwClient:
             wire_meta = _json.dumps(_json.dumps(raw_meta, sort_keys=True))
         else:
             wire_meta = raw_meta
-        self._uploads.setdefault(exp_id, []).append({"real_name": filename, "metadata": wire_meta})
-        return {"id": exp_id, "real_name": filename}
+        self._uploads.setdefault(experiment_id, []).append(
+            {"real_name": filename, "metadata": wire_meta}
+        )
+        return {"id": experiment_id, "real_name": filename}
 
-    def get_experiment_uploads(self, exp_id: int) -> list[dict[str, Any]]:
-        return list(self._uploads.get(exp_id, []))
+    def get_experiment_uploads(self, experiment_id: int) -> list[dict[str, Any]]:
+        return list(self._uploads.get(experiment_id, []))
 
-    def patch_experiment(self, exp_id: int, data: dict[str, Any]) -> None:
-        self._experiments[exp_id].update(data)
+    def patch_experiment(self, experiment_id: int, fields: dict[str, Any]) -> None:
+        self._experiments[experiment_id].update(fields)
 
 
 class MockVmAgentClient:
@@ -272,8 +278,8 @@ def vm_agent() -> MockVmAgentClient:
 @pytest.fixture
 def executor(elabftw: MockElabftwClient, vm_agent: MockVmAgentClient) -> BridgeExecutor:
     return BridgeExecutor(
-        vm_agent=vm_agent,
-        elabftw=elabftw,
+        vm_agent=vm_agent,  # pyright: ignore[reportArgumentType]
+        elabftw=elabftw,  # pyright: ignore[reportArgumentType]
         dry_run=True,  # default to dry-run so we only test validation
     )
 
@@ -282,8 +288,8 @@ def executor(elabftw: MockElabftwClient, vm_agent: MockVmAgentClient) -> BridgeE
 def executor_wet(elabftw: MockElabftwClient, vm_agent: MockVmAgentClient) -> BridgeExecutor:
     """Executor with dry_run=False for full execution path tests."""
     return BridgeExecutor(
-        vm_agent=vm_agent,
-        elabftw=elabftw,
+        vm_agent=vm_agent,  # pyright: ignore[reportArgumentType]
+        elabftw=elabftw,  # pyright: ignore[reportArgumentType]
         dry_run=False,
     )
 
@@ -327,7 +333,11 @@ class TestElabftwPreflight:
         elabftw: MockElabftwClient,
     ) -> None:
         elabftw.preflight_error = urllib.error.HTTPError(
-            "https://elab/api/v2/experiments", 401, "Unauthorized", {}, None
+            "https://elab/api/v2/experiments",
+            401,
+            "Unauthorized",
+            {},  # pyright: ignore[reportArgumentType]
+            None,  # pyright: ignore[reportArgumentType]
         )
         job = Job(
             job_id="preflight-auth",
@@ -1542,7 +1552,7 @@ class TestResultsContractForOperatorReview:
         ``test_zero_reading_is_preserved_in_results_html``.
         """
         job = self._make_full_job(elabftw)
-        executor_wet.vm_agent.job_wells = [
+        executor_wet.vm_agent.job_wells = [  # pyright: ignore[reportAttributeAccessIssue]
             {"well": "A01", "primary_value": "", "od": 0.0, "counts": 999}
         ]
 
@@ -2624,7 +2634,7 @@ class TestExistingProtocolIdAssayLookup:
 
         agent = _AssayVmAgent()
         agent.add_protocol({"id": 1001, "name": renamed_name, "factory_preset": True})
-        executor_wet.vm_agent = agent
+        executor_wet.vm_agent = agent  # pyright: ignore[reportAttributeAccessIssue]
 
         job = Job(
             job_id="test-existing-id-stale-name",

@@ -283,11 +283,11 @@ def _register_elabftw_proxy(
             query["end"] = end
 
         url = f"{config.elabftw_url}/api/v2/events?{urllib.parse.urlencode(query)}"
-        req = urllib.request.Request(url)  # noqa: S310  # Base URL is server config.
+        req = urllib.request.Request(url)  # nosec B310 — URL is the server-configured endpoint.
         req.add_header("Authorization", config.elabftw_api_key)
 
         try:
-            with urllib.request.urlopen(req, context=ctx) as resp:  # noqa: S310
+            with urllib.request.urlopen(req, context=ctx) as resp:  # nosec B310 — URL is server-configured.
                 return _json.loads(resp.read())
         except urllib.error.HTTPError as e:
             raise HTTPException(status_code=e.code, detail=str(e.read().decode()[:200])) from e
