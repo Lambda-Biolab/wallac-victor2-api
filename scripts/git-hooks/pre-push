@@ -1,0 +1,13 @@
+# Local pre-push hook: project quality gates first, then organization scanners.
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+if [ -f "$REPO_ROOT/Makefile" ]; then
+  (cd "$REPO_ROOT" && make pre-push-validate)
+fi
+
+GLOBAL_HOOK="$HOME/.git-templates/hooks/pre-push"
+if [ -x "$GLOBAL_HOOK" ] && [ "$(readlink -f "$GLOBAL_HOOK")" != "$(readlink -f "$0")" ]; then
+  exec "$GLOBAL_HOOK" "$@"
+fi

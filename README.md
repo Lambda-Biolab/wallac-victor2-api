@@ -199,7 +199,7 @@ make format      # auto-fix lint + format
 make test        # fast suite — unit tests only
 make coverage    # pytest with the bridge coverage gate (>=80%)
 make complexity  # cognitive complexity check (max 15 per function)
-make setup_dev   # create environment + install pre-commit hooks
+make setup_dev   # create environment + install pre-commit, commit-msg, and pre-push hooks
 ```
 
 The unit tests cover pure data-shaping helpers in both stacks: vm-agent

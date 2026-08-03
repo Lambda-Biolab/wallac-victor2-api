@@ -30,6 +30,14 @@ import pytest
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 _VM_AGENT = _REPO_ROOT / "vm-agent"
 
+# mutmut copies tests/ into mutants/tests/ but does not copy vm-agent/, so
+# __file__ resolves to <cwd>/mutants/tests/test_protocol_name_normalization.py
+# and _VM_AGENT points at the non-existent mutants/vm-agent/.  Walk up one
+# level when the marker is missing so the real vm-agent/ is reachable.
+if not _VM_AGENT.is_dir():
+    _REPO_ROOT = _REPO_ROOT.parent
+    _VM_AGENT = _REPO_ROOT / "vm-agent"
+
 
 @pytest.fixture(scope="module")
 def vm_agent_module() -> types.ModuleType:
@@ -51,8 +59,8 @@ def vm_agent_module() -> types.ModuleType:
         def __call__(self, *args: Any, **kwargs: Any) -> _Dummy:
             return self
 
-    comtypes_stub.client = _Dummy()
-    comtypes_stub.GUID = _Dummy
+    comtypes_stub.client = _Dummy()  # pyright: ignore[reportAttributeAccessIssue]
+    comtypes_stub.GUID = _Dummy  # pyright: ignore[reportAttributeAccessIssue]
     sys.modules.setdefault("comtypes", comtypes_stub)
     spec = importlib.util.spec_from_file_location("vm_agent_under_test", _VM_AGENT / "agent.py")
     assert spec and spec.loader, "could not load vm-agent/agent.py"
@@ -207,7 +215,7 @@ class TestBridgeExecutorFindProtocolByName:
 
     def test_exact_match_wins_over_normalized_match(self) -> None:
         executor, VmAgentCls = self._make_executor()
-        executor.vm_agent = VmAgentCls(
+        executor.vm_agent = VmAgentCls(  # pyright: ignore[reportAttributeAccessIssue]
             [
                 {"id": 1, "name": "Absorbance @ 610 (1.0 s)"},  # exact
                 {"id": 2, "name": "Absorbance @ 610 (1.0s)"},  # normalized
@@ -219,7 +227,7 @@ class TestBridgeExecutorFindProtocolByName:
 
     def test_normalized_match_used_when_exact_absent(self) -> None:
         executor, VmAgentCls = self._make_executor()
-        executor.vm_agent = VmAgentCls(
+        executor.vm_agent = VmAgentCls(  # pyright: ignore[reportAttributeAccessIssue]
             [
                 {"id": 2000008, "name": "Absorbance @ 610 (1.0s)"},
                 {"id": 2000009, "name": "Absorbance @ 610 (0.1s)"},
@@ -231,7 +239,7 @@ class TestBridgeExecutorFindProtocolByName:
 
     def test_returns_none_when_no_match(self) -> None:
         executor, VmAgentCls = self._make_executor()
-        executor.vm_agent = VmAgentCls(
+        executor.vm_agent = VmAgentCls(  # pyright: ignore[reportAttributeAccessIssue]
             [
                 {"id": 2000008, "name": "Absorbance @ 610 (1.0s)"},
             ]
@@ -243,7 +251,7 @@ class TestBridgeExecutorFindProtocolByName:
         """The bridge fallback only matches names — ID resolution is
         handled in ``_resolve_existing_protocol`` before this is called."""
         executor, VmAgentCls = self._make_executor()
-        executor.vm_agent = VmAgentCls(
+        executor.vm_agent = VmAgentCls(  # pyright: ignore[reportAttributeAccessIssue]
             [
                 {"id": 2000008, "name": "Absorbance @ 610 (1.0s)"},
             ]
@@ -263,7 +271,7 @@ class TestBridgeExecutorFindProtocolByName:
         the caller fail the job with a 404, matching the vm-agent's
         409 ambiguity behavior."""
         executor, VmAgentCls = self._make_executor()
-        executor.vm_agent = VmAgentCls(
+        executor.vm_agent = VmAgentCls(  # pyright: ignore[reportAttributeAccessIssue]
             [
                 {"id": 1, "name": "Absorbance @ 600 (1.0s)"},
                 {"id": 2, "name": "Absorbance @ 600 (1.0 s)"},
@@ -275,7 +283,7 @@ class TestBridgeExecutorFindProtocolByName:
         # the query does NOT exactly match either raw name.
         assert result is not None  # exact match wins for raw query
 
-        executor.vm_agent = VmAgentCls(
+        executor.vm_agent = VmAgentCls(  # pyright: ignore[reportAttributeAccessIssue]
             [
                 {"id": 1, "name": "Absorbance @ 600 (1.0s)"},
                 {"id": 2, "name": "Absorbance @ 600 (1.0 s)"},

@@ -27,6 +27,8 @@ _VM_AGENT = pathlib.Path(__file__).resolve().parent.parent / "vm-agent"
 
 def _load(name: str):
     spec = importlib.util.spec_from_file_location(name, _VM_AGENT / f"{name}.py")
+    assert spec is not None, f"could not find vm-agent/{name}.py"
+    assert spec.loader is not None, f"no loader for vm-agent/{name}.py"
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -39,7 +41,7 @@ def test_launch_as_user_imports_and_defines_wintypes_structures():
     # STARTUPINFOW.cb is ctypes.wintypes.DWORD == c_ulong.
     cb_name, cb_type = mod.STARTUPINFOW._fields_[0]
     assert cb_name == "cb"
-    assert cb_type is ctypes.wintypes.DWORD  # equals ctypes.c_ulong
+    assert cb_type is ctypes.wintypes.DWORD  # pyright: ignore[reportAttributeAccessIssue]
 
     # PROCESS_INFORMATION fields all derive from wintypes (HANDLE/DWORD).
     pi_names = [n for n, _ in mod.PROCESS_INFORMATION._fields_]
@@ -77,8 +79,8 @@ def test_lid_watcher_module_body_resolves_wintypes(monkeypatch):
     mod = _load("lid_watcher")
 
     # SendMessageW.argtypes was assigned from ctypes.wintypes.* references.
-    assert mod.u.SendMessageW.argtypes[0] is ctypes.wintypes.HWND
-    assert mod.u.SendMessageW.restype is ctypes.wintypes.LPARAM
+    assert mod.u.SendMessageW.argtypes[0] is ctypes.wintypes.HWND  # pyright: ignore[reportAttributeAccessIssue]
+    assert mod.u.SendMessageW.restype is ctypes.wintypes.LPARAM  # pyright: ignore[reportAttributeAccessIssue]
     # EnumProc = ctypes.WINFUNCTYPE(...) executed using the wintypes types.
     assert mod.EnumProc is not None
 

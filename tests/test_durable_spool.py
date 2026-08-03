@@ -75,7 +75,7 @@ def _submit(manager: JobManager, **overrides) -> str:
         wells_spec={"wells": ["A1", "A2"]},
     )
     spec.update(overrides)
-    manager.submit_job(**spec)
+    manager.submit_job(**spec)  # pyright: ignore[reportArgumentType]
     return job_id
 
 
@@ -123,6 +123,7 @@ def test_artifact_persistence_is_atomic(manager: JobManager) -> None:
     fresh = JobManager(manager.state_dir)
     try:
         job = fresh.get_job(job_id)
+        assert job is not None
         kinds = {a.kind for a in job.artifacts}
         assert kinds == {"raw", "analyzed"}
     finally:

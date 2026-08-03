@@ -145,7 +145,7 @@ class ElabftwClient:
     ) -> Any:
         url = f"{self.base}{path}"
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(  # noqa: S310  # Base URL is operator config.
+        req = urllib.request.Request(  # nosec B310 — URL is the operator-configured eLabFTW endpoint.
             url, data=data, method=method
         )
         req.add_header("Authorization", self.api_key)
@@ -154,7 +154,7 @@ class ElabftwClient:
         if body is not None:
             req.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(  # noqa: S310  # Base URL is operator config.
+            with urllib.request.urlopen(  # nosec B310 — URL is the operator-configured eLabFTW endpoint.
                 req, context=self._ssl_ctx, timeout=timeout or self.timeout
             ) as resp:
                 return self._parse_response(resp, url, expected_status)
@@ -183,9 +183,9 @@ class ElabftwClient:
         Uses ``?format=binary`` because the default response is JSON metadata.
         """
         url = f"{self.base}/items/{item_id}/uploads/{upload_id}?format=binary"
-        req = urllib.request.Request(url)  # noqa: S310  # Base URL is operator config.
+        req = urllib.request.Request(url)  # nosec B310 — URL is the operator-configured eLabFTW endpoint.
         req.add_header("Authorization", self.api_key)
-        with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=self.timeout) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=self.timeout) as resp:  # nosec B310 — URL is operator-configured.
             return resp.read()
 
     def patch_metadata(self, item_id: int, extra_fields: dict[str, Any]) -> None:
@@ -229,13 +229,13 @@ class ElabftwClient:
         data = b"".join(body_parts)
 
         url = f"{self.base}/items/{item_id}/uploads"
-        req = urllib.request.Request(  # noqa: S310  # Base URL is operator config.
+        req = urllib.request.Request(  # nosec B310 — URL is the operator-configured eLabFTW endpoint.
             url, data=data, method="POST"
         )
         req.add_header("Authorization", self.api_key)
         req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
         try:
-            with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=self.timeout) as resp:  # noqa: S310
+            with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=self.timeout) as resp:  # nosec B310 — URL is operator-configured.
                 content_resp = resp.read()
                 if content_resp:
                     return json.loads(content_resp)
@@ -479,13 +479,13 @@ class ElabftwClient:
         data = b"".join(body_parts)
 
         url = f"{self.base}/experiments/{experiment_id}/uploads"
-        req = urllib.request.Request(  # noqa: S310  # Base URL is operator config.
+        req = urllib.request.Request(  # nosec B310 — URL is the operator-configured eLabFTW endpoint.
             url, data=data, method="POST"
         )
         req.add_header("Authorization", self.api_key)
         req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
         try:
-            with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=self.timeout) as resp:  # noqa: S310
+            with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=self.timeout) as resp:  # nosec B310 — URL is operator-configured.
                 content_resp = resp.read()
                 if content_resp:
                     return json.loads(content_resp)
