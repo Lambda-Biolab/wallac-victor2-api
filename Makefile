@@ -33,10 +33,12 @@ complexity:  ## Enforce cognitive complexity <=15
 secrets:  ## Scan the working tree for secrets with gitleaks (skipped in CI: see .github/workflows/secrets.yml)
 	@if [ -n "$$CI" ] && [ ! -x "$$(command -v gitleaks 2>/dev/null || true)" ]; then \
 		echo "secrets: skipping in CI (gitleaks binary not installed; history scan runs in .github/workflows/secrets.yml)"; \
-		exit 0; \
+	elif ! command -v gitleaks >/dev/null 2>&1; then \
+		echo "gitleaks not installed — run 'make install_tools'"; \
+		exit 2; \
+	else \
+		gitleaks detect --no-git --source . --config .github/gitleaks.toml --redact; \
 	fi
-	@command -v gitleaks >/dev/null 2>&1 || { echo "gitleaks not installed — run 'make install_tools'"; exit 2; }
-	gitleaks detect --no-git --source . --config .github/gitleaks.toml --redact
 
 bandit:  ## Run Python SAST on bridge
 	$(UV) run --locked bandit -r $(SOURCE_DIR) -ll -ii
