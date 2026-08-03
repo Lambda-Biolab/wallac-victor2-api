@@ -16,7 +16,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "bandit>=1.7,<2",
-    "complexipy>=5.5,<6",
+    "complexipy>=6.2.0,<7",
     "hypothesis>=6,<7",
     "httpx2>=2,<3",
     "pre-commit>=4,<5",
