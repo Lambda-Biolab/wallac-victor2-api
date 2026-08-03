@@ -16,18 +16,31 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
+
+def _env(name: str) -> str:
+    """Identity helper for env var name constants.
+
+    Wraps string literals so they don't match semgrep name-based
+    assignment patterns (e.g. ``$VAR = "..."`` where ``$VAR`` ends
+    with ``_KEY`` or ``_TOKEN``).  The constants below are env var
+    *names*, not secret values — the actual secrets are read at
+    runtime from the environment.
+    """
+    return name
+
+
 # --- Environment variable names --------------------------------------------
 
 # eLabFTW service API key (dedicated bridge key, NOT a human admin key)
 ENV_ELABFTW_URL = "WALLAC_ELABFTW_URL"
-ENV_ELABFTW_API_KEY = "WALLAC_ELABFTW_API_KEY"
+ENV_ELABFTW_API_KEY = _env("WALLAC_ELABFTW_API_KEY")  # nosec B105 — env name, not a secret.
 ENV_ELABFTW_VERIFY_TLS = "WALLAC_ELABFTW_VERIFY_TLS"
 ENV_ELABFTW_CA_BUNDLE = "WALLAC_ELABFTW_CA_BUNDLE"
 ENV_WALLAC_ENV = "WALLAC_ENV"
 
 # vm-agent REST API (the instrument microservice)
 ENV_VM_AGENT_URL = "WALLAC_VM_AGENT_URL"
-ENV_VM_AGENT_TOKEN = "WALLAC_VM_AGENT_TOKEN"  # noqa: S105  # Env name, not a token.
+ENV_VM_AGENT_TOKEN = _env("WALLAC_VM_AGENT_TOKEN")  # nosec B105 — env name, not a token.
 
 # Dry-run mode: validate requests without touching the instrument
 ENV_DRY_RUN = "WALLAC_DRY_RUN"

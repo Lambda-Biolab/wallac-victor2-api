@@ -1,33 +1,81 @@
-.PHONY: validate format test coverage typecheck complexity setup setup_dev setup_prod
+# Makefile — repeatable development and quality gates for the maintained stacks.
 
-validate:  ## lint + typecheck + format-check + tests
-	uv run --locked ruff check .
-	uv run --locked pyright bridge/
-	uv run --locked ruff format --check .
-	uv run --locked pytest -q --cov=bridge --cov-report=term-missing --cov-fail-under=80
-	uv run --locked complexipy bridge/ -mx 15
+.PHONY: validate format test coverage typecheck complexity secrets bandit mutate mutate-stats install_tools \
+	validate-branch pre-push-validate setup setup_dev setup_prod clean
 
-format:  ## auto-fix lint + format
-	uv run --locked ruff check . --fix
-	uv run --locked ruff format .
+UV := uv
+SOURCE_DIR := bridge
+TEST_DIR := tests
+COMPLEXITY_MAX ?= 15
 
-test:  ## run the unit tests
-	uv run --locked pytest -q
+validate: lint typecheck complexity coverage secrets bandit  ## Run the full CI quality gate
 
-coverage:  ## run tests with the bridge coverage gate
-	uv run --locked pytest -q --cov=bridge --cov-report=term-missing --cov-fail-under=80
+lint:  ## Run Ruff lint and format checks
+	$(UV) run --locked ruff check $(SOURCE_DIR) $(TEST_DIR)
+	$(UV) run --locked ruff format --check $(SOURCE_DIR) $(TEST_DIR)
 
-typecheck:  ## static type check (pyright, bridge/ only — vm-agent is Windows/comtypes)
-	uv run --locked pyright bridge/
+format:  ## Auto-fix Ruff lint and formatting
+	$(UV) run --locked ruff check $(SOURCE_DIR) $(TEST_DIR) --fix
+	$(UV) run --locked ruff format $(SOURCE_DIR) $(TEST_DIR)
 
-complexity:  ## enforce cognitive complexity <=15 for bridge functions
-	uv run --locked complexipy bridge/ -mx 15
+test:  ## Run the unit test suite
+	$(UV) run --locked pytest -q
 
-setup:  ## create/update the locked project environment
-	uv sync --locked
+coverage:  ## Run tests with the bridge coverage gate
+	$(UV) run --locked pytest -q --cov=$(SOURCE_DIR) --cov-report=term-missing --cov-fail-under=80
 
-setup_dev: setup  ## create the environment and install pre-commit hooks
-	uv run --locked pre-commit install --hook-type pre-commit --hook-type commit-msg
+typecheck:  ## Type-check bridge and tests
+	$(UV) run --locked pyright $(SOURCE_DIR)/ $(TEST_DIR)/
 
-setup_prod:  ## install only locked bridge runtime dependencies
-	uv sync --locked --no-default-groups
+complexity:  ## Enforce cognitive complexity <=15
+	$(UV) run --locked complexipy $(SOURCE_DIR)/ -mx $(COMPLEXITY_MAX)
+
+secrets:  ## Scan the working tree for secrets with gitleaks
+	@command -v gitleaks >/dev/null 2>&1 || { echo "gitleaks not installed — run 'make install_tools'"; exit 2; }
+	gitleaks detect --no-git --source . --config .github/gitleaks.toml --redact
+
+bandit:  ## Run Python SAST on bridge
+	$(UV) run --locked bandit -r $(SOURCE_DIR) -ll -ii
+
+mutate:  ## Run mutation tests locally (not part of CI)
+	@find bridge tests -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+	$(UV) run --locked mutmut run
+
+mutate-stats:  ## Show mutation-testing results
+	$(UV) run --locked mutmut results
+
+install_tools:  ## Install the pinned gitleaks binary
+	@echo "Installing gitleaks 8.30.1..."
+	@if ! command -v gitleaks >/dev/null 2>&1; then \
+		mkdir -p $(HOME)/.local/bin; \
+		curl -sL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+			| tar -xz -C $(HOME)/.local/bin gitleaks; \
+		chmod +x $(HOME)/.local/bin/gitleaks; \
+		echo "installed to $(HOME)/.local/bin/gitleaks"; \
+	else \
+		echo "gitleaks already present at $$(command -v gitleaks)"; \
+	fi
+
+validate-branch:  ## Enforce branch coverage on changed bridge files
+	@CHANGED=$$(git diff --name-only --diff-filter=ACMR origin/main 2>/dev/null | grep -E '^$(SOURCE_DIR)/.*\.py$$' || true); \
+	if [ -n "$$CHANGED" ]; then \
+		echo "Changed bridge files:"; echo "$$CHANGED"; \
+		$(UV) run --locked pytest tests/ -q --cov=$(SOURCE_DIR) --cov-branch --cov-fail-under=80; \
+	else \
+		echo "No changed bridge files; skipping branch coverage check"; \
+	fi
+
+pre-push-validate: validate validate-branch mutate
+
+setup:  ## Create/update the locked project environment
+	$(UV) sync --locked
+
+setup_dev: setup  ## Install pre-commit hooks
+	$(UV) run --locked pre-commit install --hook-type pre-commit --hook-type commit-msg --hook-type pre-push
+
+setup_prod:  ## Install only locked runtime dependencies
+	$(UV) sync --locked --no-default-groups
+
+clean:  ## Remove generated caches and reports
+	rm -rf .pytest_cache .ruff_cache .complexipy_cache .coverage htmlcov .pyright
+	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

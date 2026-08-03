@@ -1,0 +1,5 @@
+# Conventional Commits
+# <type>(<scope>): <imperative summary>
+#
+# Types: feat, fix, docs, refactor, test, chore, ci, build, perf
+# Keep the subject concise and explain the user-visible reason in the body.

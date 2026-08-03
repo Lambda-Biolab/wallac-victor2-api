@@ -207,7 +207,7 @@ def test_designer_rejects_invalid_ca_bundle_at_startup(tmp_path) -> None:
         }
     )
     with pytest.raises(ConfigError, match="Invalid eLabFTW CA bundle"):
-        create_designer_app(config=config, service=object())
+        create_designer_app(config=config, service=object())  # pyright: ignore[reportArgumentType]
 
 
 def test_config_cors_origins_defaults_empty() -> None:
@@ -248,13 +248,13 @@ def test_designer_require_auth_rejects_empty_token(monkeypatch: pytest.MonkeyPat
     config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key", "WALLAC_REQUIRE_AUTH": "1"})
 
     with pytest.raises(RuntimeError, match="WALLAC_DESIGNER_TOKEN is empty"):
-        create_designer_app(config=config, service=object())
+        create_designer_app(config=config, service=object())  # pyright: ignore[reportArgumentType]
 
 
 def test_designer_events_proxy_requires_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WALLAC_DESIGNER_TOKEN", "designer-token")
     config = BridgeConfig.from_env(env={ENV_ELABFTW_API_KEY: "5-key"})
-    app = create_designer_app(config=config, service=object())
+    app = create_designer_app(config=config, service=object())  # pyright: ignore[reportArgumentType]
 
     response = TestClient(app).get("/elabftw/events?items_id=1")
 

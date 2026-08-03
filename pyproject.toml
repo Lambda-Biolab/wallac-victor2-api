@@ -2,10 +2,6 @@
 # Windows-only) and the eLabFTW bridge (bridge/, Linux-side). The uv project
 # manages the Linux bridge and development dependencies without packaging the
 # repository itself. The Windows agent keeps its separate Python 3.8 runtime.
-# Quality gates apply to the maintained stacks.
-# The COM-introspection diagnostics (vm-agent/probe.py, dump_*.py) are research
-# tools and are excluded. Pyright checks bridge/ only — the vm-agent uses
-# Windows/comtypes which false-positives on a Linux host/CI.
 
 [project]
 name = "wallac-victor2-api"
@@ -19,6 +15,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "bandit>=1.7,<2",
     "complexipy>=5.5,<6",
     "hypothesis>=6,<7",
     "httpx2>=2,<3",
@@ -28,6 +25,7 @@ dev = [
     "pytest-cov>=7,<8",
     "pytest-timeout>=2.4,<3",
     "ruff==0.15.15",
+    "mutmut>=3,<4",
 ]
 
 [tool.uv]
@@ -36,7 +34,7 @@ default-groups = ["dev"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py38"  # the agent runs on Python 3.8 (Windows 7)
+target-version = "py38"
 extend-exclude = [
     "vm-agent/probe.py",
     "vm-agent/dump_tlb.py",
@@ -46,16 +44,21 @@ extend-exclude = [
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "UP", "SIM", "S", "RUF"]
-ignore = ["E501"]  # line length handled by the formatter
+ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = [
-    "S101",  # pytest uses assert for behavioral checks
-    "S104",  # test-only bind addresses
-    "S105",  # fixture tokens and pass/fail labels
-    "S106",  # fixture token arguments
-    "S108",  # test-only temporary paths
-    "S310",  # mocked or local test URLs
+    "S101",
+    "S104",
+    "S105",
+    "S106",
+    "S108",
+    "S608",  # SQL identifiers come from fixed internal mappings.
+]
+
+"bridge/**/*.py" = [
+    "S310",  # URLs are restricted by service configuration.
+    "S608",  # SQL identifiers come from fixed internal mappings.
 ]
 
 [tool.ruff.format]
@@ -64,11 +67,8 @@ quote-style = "double"
 [tool.complexipy]
 max_complexity_allowed = 15
 
-[tool.coverage.run]
 branch = true
 source = ["bridge"]
-# Network adapters are exercised by hardware/integration tests. The unit gate
-# measures the pure orchestration and domain logic that runs in Linux CI.
 omit = ["bridge/elabftw.py", "bridge/vm_agent_client.py"]
 
 [tool.coverage.report]
@@ -82,11 +82,14 @@ python_files = ["test_*.py"]
 addopts = ["-ra", "--strict-markers", "--timeout=30"]
 
 [tool.pyright]
-include = ["bridge"]
+include = ["bridge", "tests"]
 exclude = ["vm-agent"]
-# Bridge supports Python 3.11+; production currently runs Python 3.13.
-# vm-agent (Python 3.8 on Windows 7) is excluded above.
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
+reportUntypedFunctionDecorator = false
 venvPath = "."
 venv = ".venv"
+
+[tool.mutmut]
+source_paths = ["bridge"]
+pytest_add_cli_args_test_selection = ["tests/test_analysis.py", "tests/test_bridge_hardening.py", "tests/test_canonical.py", "tests/test_designer.py", "tests/test_durable_endpoints.py", "tests/test_durable_integration.py", "tests/test_durable_spool.py", "tests/test_executor.py", "tests/test_jobs.py", "tests/test_properties.py", "tests/test_security_fixes.py", "tests/test_well_utils.py"]

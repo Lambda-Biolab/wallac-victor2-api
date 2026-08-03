@@ -20,7 +20,11 @@ import uuid
 from typing import Any
 
 import pytest
-from agent import ApiError, sanitize_backup_filename, validate_readonly_sql
+from agent import (  # pyright: ignore[reportMissingImports]
+    ApiError,
+    sanitize_backup_filename,
+    validate_readonly_sql,
+)
 from fastapi.testclient import TestClient
 
 from bridge.bridge_app import create_bridge_app

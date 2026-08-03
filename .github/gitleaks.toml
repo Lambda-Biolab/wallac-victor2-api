@@ -1,0 +1,11 @@
+# Gitleaks configuration — extend the default rules for CI and local scans.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known scanner output and test fixtures"
+paths = [
+  '(^|.*/)\\.secrets\\.baseline(\\.new)?$',
+  '^tests/fixtures/.*',
+]
