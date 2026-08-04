@@ -1,0 +1,26 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "commitMessagePrefix": "chore(pre-commit)",
+  "labels": [
+    "dependencies"
+  ],
+  "schedule": [
+    "before 6am on monday"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track pre-commit-hooks and conventional-pre-commit revs in .pre-commit-config.yaml",
+      "fileMatch": [
+        "(^|/).pre-commit-config\\.yaml$"
+      ],
+      "matchStrings": [
+        "repo:\\s+https://github\\.com/(?<depName>[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)\\s+rev:\\s+(?<currentValue>v?[0-9]+\\.[0-9]+\\.[0-9]+[^\"\\'\\s]*)"
+      ],
+      "datasourceTemplate": "github-tags"
+    }
+  ]
+}
